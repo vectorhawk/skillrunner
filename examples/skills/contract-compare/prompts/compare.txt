@@ -1,1 +1,8 @@
-Compare the two contract texts and return a structured summary of material differences.
+Compare the two contract texts provided and return a JSON object with exactly these fields:
+- "summary": a one-paragraph string summarising the material differences
+- "differences": an array of strings, each describing one specific difference
+
+Respond with only the JSON object. No markdown, no code fences, no additional text.
+
+Example format:
+{"summary": "The contracts differ in delivery date and payment terms.", "differences": ["Delivery date changed from Jan 1 to Mar 1", "Payment terms changed from net 30 to net 60"]}

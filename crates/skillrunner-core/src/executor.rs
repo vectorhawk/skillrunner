@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use rusqlite::Connection;
 use skillrunner_manifest::{SkillPackage, WorkflowStep};
+use std::collections::HashMap;
 use std::fs;
 
 // ── Public result types ───────────────────────────────────────────────────────
@@ -88,10 +89,14 @@ pub fn run_skill(
     // 3. Validate input against inputs_schema.
     validate_input(&pkg_path, &pkg.manifest.inputs_schema, input)?;
 
-    // 4. Execute each workflow step.
+    // 4. Execute each workflow step, threading outputs forward.
     let mut steps: Vec<StepResult> = Vec::new();
+    let mut step_outputs: HashMap<String, serde_json::Value> = HashMap::new();
     for step in &pkg.workflow.steps {
-        let result = execute_step(&pkg, step, input, model_client)?;
+        let result = execute_step(&pkg, step, input, &step_outputs, model_client)?;
+        if let Some(out) = &result.output {
+            step_outputs.insert(result.id.clone(), out.clone());
+        }
         steps.push(result);
     }
 
@@ -125,9 +130,13 @@ fn execute_step(
     pkg: &SkillPackage,
     step: &WorkflowStep,
     run_input: &serde_json::Value,
+    step_outputs: &HashMap<String, serde_json::Value>,
     model_client: Option<&dyn ModelClient>,
 ) -> Result<StepResult> {
     match step {
+        WorkflowStep::Tool { id, tool, input } => {
+            execute_tool_step(id, tool, input, run_input)
+        }
         WorkflowStep::Llm {
             id,
             prompt,
@@ -135,12 +144,118 @@ fn execute_step(
             output_schema,
         } => match model_client {
             Some(client) => {
-                execute_llm_step(pkg, id, prompt, inputs, output_schema.as_deref(), run_input, client)
+                execute_llm_step(pkg, id, prompt, inputs, output_schema.as_deref(), run_input, step_outputs, client)
             }
             None => Ok(stub_step(step)),
         },
-        _ => Ok(stub_step(step)),
+        WorkflowStep::Transform { id, op, input } => {
+            execute_transform_step(id, op, input, run_input, step_outputs)
+        }
+        WorkflowStep::Validate { id, schema, input } => {
+            execute_validate_step(pkg, id, schema, input, run_input, step_outputs)
+        }
     }
+}
+
+// ── Tool step ────────────────────────────────────────────────────────────────
+
+fn execute_tool_step(
+    id: &str,
+    tool: &str,
+    input: &serde_yaml::Value,
+    run_input: &serde_json::Value,
+) -> Result<StepResult> {
+    match tool {
+        "extract_text" => {
+            let field = input.as_str().ok_or_else(|| {
+                anyhow::anyhow!("tool step '{id}': extract_text input must be a field name string")
+            })?;
+            let text = match run_input.get(field) {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(other) => other.to_string(),
+                None => anyhow::bail!("tool step '{id}': input field '{field}' not found"),
+            };
+            Ok(StepResult {
+                id: id.to_string(),
+                step_type: "tool".to_string(),
+                note: format!("extract_text: extracted field '{field}' ({} chars)", text.len()),
+                output: Some(serde_json::Value::String(text)),
+                prompt_tokens: None,
+                completion_tokens: None,
+                latency_ms: None,
+            })
+        }
+        other => anyhow::bail!("tool step '{id}': unknown built-in tool '{other}'"),
+    }
+}
+
+// ── Transform step ───────────────────────────────────────────────────────────
+
+fn execute_transform_step(
+    id: &str,
+    op: &str,
+    input: &serde_yaml::Value,
+    run_input: &serde_json::Value,
+    step_outputs: &HashMap<String, serde_json::Value>,
+) -> Result<StepResult> {
+    let ref_str = input.as_str().ok_or_else(|| {
+        anyhow::anyhow!("transform step '{id}': input must be a reference string")
+    })?;
+    let resolved = resolve_ref(ref_str, run_input, step_outputs);
+
+    let output = match op {
+        "json_parse" => serde_json::from_str(&resolved)
+            .map_err(|e| anyhow::anyhow!("transform step '{id}': json_parse failed: {e}"))?,
+        "to_string" => serde_json::Value::String(resolved.clone()),
+        "to_uppercase" => serde_json::Value::String(resolved.to_uppercase()),
+        "to_lowercase" => serde_json::Value::String(resolved.to_lowercase()),
+        "trim" => serde_json::Value::String(resolved.trim().to_string()),
+        other => anyhow::bail!("transform step '{id}': unknown op '{other}'"),
+    };
+
+    Ok(StepResult {
+        id: id.to_string(),
+        step_type: "transform".to_string(),
+        note: format!("transform op '{op}' applied"),
+        output: Some(output),
+        prompt_tokens: None,
+        completion_tokens: None,
+        latency_ms: None,
+    })
+}
+
+// ── Validate step ─────────────────────────────────────────────────────────────
+
+fn execute_validate_step(
+    pkg: &SkillPackage,
+    id: &str,
+    schema_rel: &str,
+    input: &serde_yaml::Value,
+    run_input: &serde_json::Value,
+    step_outputs: &HashMap<String, serde_json::Value>,
+) -> Result<StepResult> {
+    let ref_str = input.as_str().ok_or_else(|| {
+        anyhow::anyhow!("validate step '{id}': input must be a reference string")
+    })?;
+    let resolved_str = resolve_ref(ref_str, run_input, step_outputs);
+
+    // Try to parse the resolved string as JSON; if it's already a step output
+    // value it will be a valid JSON string representation.
+    let value: serde_json::Value = serde_json::from_str(&resolved_str)
+        .unwrap_or(serde_json::Value::String(resolved_str.clone()));
+
+    validate_output(&pkg.root, schema_rel, &value)
+        .with_context(|| format!("validate step '{id}' failed schema check"))?;
+
+    Ok(StepResult {
+        id: id.to_string(),
+        step_type: "validate".to_string(),
+        note: format!("validated against '{schema_rel}': ok"),
+        output: Some(value),
+        prompt_tokens: None,
+        completion_tokens: None,
+        latency_ms: None,
+    })
 }
 
 // ── LLM step ─────────────────────────────────────────────────────────────────
@@ -152,6 +267,7 @@ fn execute_llm_step(
     step_inputs: &Option<serde_yaml::Value>,
     output_schema_rel: Option<&str>,
     run_input: &serde_json::Value,
+    step_outputs: &HashMap<String, serde_json::Value>,
     client: &dyn ModelClient,
 ) -> Result<StepResult> {
     // Read system prompt from file.
@@ -160,7 +276,7 @@ fn execute_llm_step(
         .with_context(|| format!("failed to read prompt file {prompt_path}"))?;
 
     // Resolve step inputs → user message string.
-    let user_message = resolve_inputs(step_inputs, run_input);
+    let user_message = resolve_inputs(step_inputs, run_input, step_outputs);
 
     let request = ModelRequest {
         system_prompt,
@@ -204,8 +320,12 @@ fn execute_llm_step(
 // ── Input resolution ──────────────────────────────────────────────────────────
 
 /// Convert a step's `inputs` YAML mapping into a plain-text user message by
-/// resolving `input.<field>` references against the run's input JSON.
-fn resolve_inputs(step_inputs: &Option<serde_yaml::Value>, run_input: &serde_json::Value) -> String {
+/// resolving `input.<field>` and `<step_id>.output` references.
+fn resolve_inputs(
+    step_inputs: &Option<serde_yaml::Value>,
+    run_input: &serde_json::Value,
+    step_outputs: &HashMap<String, serde_json::Value>,
+) -> String {
     let Some(inputs) = step_inputs else {
         return String::new();
     };
@@ -217,18 +337,32 @@ fn resolve_inputs(step_inputs: &Option<serde_yaml::Value>, run_input: &serde_jso
     for (key, value) in mapping {
         let key_str = key.as_str().unwrap_or_default();
         let ref_str = value.as_str().unwrap_or_default();
-        let resolved = resolve_ref(ref_str, run_input);
+        let resolved = resolve_ref(ref_str, run_input, step_outputs);
         parts.push(format!("{key_str}: {resolved}"));
     }
     parts.join("\n")
 }
 
-/// Resolve a single reference like `input.requirements` to its value, or
-/// return the reference string unchanged when it cannot be resolved (e.g.
-/// references to earlier step outputs, which are not yet implemented).
-fn resolve_ref(ref_str: &str, run_input: &serde_json::Value) -> String {
+/// Resolve a reference to its string value.
+///
+/// Supports:
+/// - `input.<field>` — field from the run's input JSON
+/// - `<step_id>.output` — output of a previously executed step
+fn resolve_ref(
+    ref_str: &str,
+    run_input: &serde_json::Value,
+    step_outputs: &HashMap<String, serde_json::Value>,
+) -> String {
     if let Some(field) = ref_str.strip_prefix("input.") {
         if let Some(val) = run_input.get(field) {
+            return match val {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+        }
+    }
+    if let Some(step_id) = ref_str.strip_suffix(".output") {
+        if let Some(val) = step_outputs.get(step_id) {
             return match val {
                 serde_json::Value::String(s) => s.clone(),
                 other => other.to_string(),
@@ -429,6 +563,67 @@ mod tests {
         assert!(err.to_string().contains("not installed"), "got: {err}");
 
         let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn tool_step_extract_text_produces_output_for_chaining() {
+        let state_root = temp_root("tool-chain");
+        let skill_root = temp_root("tool-chain-skill");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        fs::create_dir_all(skill_root.join("schemas")).unwrap();
+        fs::create_dir_all(skill_root.join("prompts")).unwrap();
+        fs::write(
+            skill_root.join("manifest.json"),
+            r#"{
+  "schema_version": "1.0",
+  "id": "test-skill",
+  "name": "Test Skill",
+  "version": "0.1.0",
+  "publisher": "skillclub",
+  "entrypoint": "workflow.yaml",
+  "inputs_schema": "schemas/input.schema.json",
+  "outputs_schema": "schemas/output.schema.json",
+  "permissions": { "filesystem": "none", "network": "none", "clipboard": false },
+  "execution": { "sandbox_profile": "strict", "timeout_seconds": 30, "memory_mb": 256 }
+}"#,
+        )
+        .unwrap();
+        // workflow: extract doc → stub llm that references extracted output
+        fs::write(
+            skill_root.join("workflow.yaml"),
+            "name: test_skill\nsteps:\n  - id: extract\n    type: tool\n    tool: extract_text\n    input: doc\n  - id: run\n    type: llm\n    prompt: prompts/system.txt\n    inputs:\n      text: extract.output\n",
+        )
+        .unwrap();
+        fs::write(skill_root.join("prompts/system.txt"), "Summarise.").unwrap();
+        fs::write(skill_root.join("schemas/input.schema.json"), "{}").unwrap();
+        fs::write(skill_root.join("schemas/output.schema.json"), "{}").unwrap();
+
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg).unwrap();
+
+        let client = MockPolicyClient::new();
+        let result = run_skill(
+            &state,
+            &client,
+            "test-skill",
+            &serde_json::json!({"doc": "hello world"}),
+            None, // stub model
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.steps.len(), 2);
+        let extract = &result.steps[0];
+        assert_eq!(extract.id, "extract");
+        assert_eq!(extract.step_type, "tool");
+        assert_eq!(
+            extract.output,
+            Some(serde_json::Value::String("hello world".to_string()))
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
     }
 
     #[test]

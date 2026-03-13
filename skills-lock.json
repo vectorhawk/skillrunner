@@ -21,10 +21,15 @@
       "sourceType": "github",
       "computedHash": "8d262f08f33825947ea20204ebf5101e36056c98090251bd973a552ec8ef0c0c"
     },
-    "frontend-design": {
-      "source": "anthropics/claude-code",
+    "bmad-orchestrator": {
+      "source": "supercent-io/skills-template",
       "sourceType": "github",
-      "computedHash": "e8118284a6365753790d44bb2758a6032b3af27fa84696428d9233f2be0f4e78"
+      "computedHash": "9372769fe3ce4521f16ebc949f96462c1f2146e826ec97ae1637b94f498d2ee8"
+    },
+    "frontend-design": {
+      "source": "anthropics/skills",
+      "sourceType": "github",
+      "computedHash": "063a0e6448123cd359ad0044cc46b0e490cc7964d45ef4bb9fd842bd2ffbca67"
     }
   }
 }

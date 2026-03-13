@@ -52,7 +52,7 @@ enum SkillCommands {
         /// Skip model invocation and use stub execution
         #[arg(long)]
         stub: bool,
-        /// SkillClub registry URL for policy fetch and auto-update
+        /// SkillClub registry URL for policy fetch and auto-update (overrides SKILLCLUB_REGISTRY_URL)
         #[arg(long)]
         registry_url: Option<String>,
     },
@@ -94,8 +94,13 @@ fn main() -> Result<()> {
                 println!("Installed {}@{}", skill.manifest.id, skill.manifest.version);
             }
             SkillCommands::Resolve { skill_id } => {
-                let policy_client = MockPolicyClient::new();
-                let outcome = resolve_skill(&app.state, &policy_client, &skill_id)?;
+                let outcome = if let Some(url) = registry_url_from_env() {
+                    let policy_client = HttpPolicyClient::new(RegistryClient::new(&url), &app.state);
+                    resolve_skill(&app.state, &policy_client, &skill_id)?
+                } else {
+                    let policy_client = MockPolicyClient::new();
+                    resolve_skill(&app.state, &policy_client, &skill_id)?
+                };
                 match outcome {
                     ResolveOutcome::Active {
                         skill_id,
@@ -131,11 +136,13 @@ fn main() -> Result<()> {
                     Some(&ollama)
                 };
 
-                // When --registry-url is provided, use the HTTP policy client
-                // (with caching + offline grace) and enable silent auto-update.
-                let result = if let Some(url) = registry_url {
+                // --registry-url flag takes precedence, then SKILLCLUB_REGISTRY_URL env var.
+                // When a registry URL is available, use HttpPolicyClient (cached + offline grace)
+                // and enable silent auto-update.
+                let effective_url = registry_url.or_else(registry_url_from_env);
+                let result = if let Some(url) = effective_url {
                     let registry = RegistryClient::new(&url);
-                    let http_policy = HttpPolicyClient::new(RegistryClient::new(url), &app.state);
+                    let http_policy = HttpPolicyClient::new(RegistryClient::new(&url), &app.state);
                     run_skill(&app.state, &http_policy, &skill_id, &input_json, model_client, Some(&registry))?
                 } else {
                     let policy_client = MockPolicyClient::new();
@@ -195,4 +202,8 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn registry_url_from_env() -> Option<String> {
+    std::env::var("SKILLCLUB_REGISTRY_URL").ok().filter(|s| !s.is_empty())
 }
