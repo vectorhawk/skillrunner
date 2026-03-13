@@ -1,0 +1,26 @@
+[package]
+name = "skillrunner-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+camino.workspace = true
+jsonschema.workspace = true
+directories.workspace = true
+skillrunner-manifest = { path = "../skillrunner-manifest" }
+rusqlite.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+tar.workspace = true
+flate2.workspace = true
+tempfile.workspace = true
+sha2.workspace = true
+hex.workspace = true

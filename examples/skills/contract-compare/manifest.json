@@ -1,0 +1,31 @@
+{
+  "schema_version": "1.0",
+  "id": "contract-compare",
+  "name": "Contract Compare",
+  "version": "0.1.0",
+  "publisher": "skillclub",
+  "description": "Compare two contracts and summarize changes.",
+  "entrypoint": "workflow.yaml",
+  "inputs_schema": "schemas/input.schema.json",
+  "outputs_schema": "schemas/output.schema.json",
+  "permissions": {
+    "filesystem": "read_only_scoped",
+    "network": "none",
+    "clipboard": false
+  },
+  "execution": {
+    "sandbox_profile": "strict",
+    "timeout_seconds": 90,
+    "memory_mb": 1024
+  },
+  "model_requirements": {
+    "min_context_tokens": 16000,
+    "supports_structured_output": true,
+    "supports_tool_calling": true,
+    "preferred_execution": "local_first"
+  },
+  "update": {
+    "channel": "stable",
+    "auto_update": true
+  }
+}

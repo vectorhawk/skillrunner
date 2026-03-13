@@ -1,0 +1,456 @@
+use crate::{
+    model::{ModelClient, ModelRequest},
+    policy::PolicyClient,
+    registry::RegistryClient,
+    resolver::{resolve_skill, ResolveOutcome},
+    state::AppState,
+    updater::auto_update_if_needed,
+};
+use anyhow::{Context, Result};
+use camino::Utf8PathBuf;
+use rusqlite::Connection;
+use skillrunner_manifest::{SkillPackage, WorkflowStep};
+use std::fs;
+
+// ── Public result types ───────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub struct StepResult {
+    pub id: String,
+    pub step_type: String,
+    /// Human-readable summary of what happened.
+    pub note: String,
+    /// Parsed output produced by the step (None for stubs / non-llm steps).
+    pub output: Option<serde_json::Value>,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub latency_ms: Option<u64>,
+}
+
+#[derive(Debug)]
+pub struct RunResult {
+    pub skill_id: String,
+    pub version: String,
+    pub steps: Vec<StepResult>,
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
+    pub total_latency_ms: u64,
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+/// Resolve, load, validate input, and execute a skill's workflow.
+///
+/// When `model_client` is `Some`, `llm` steps are sent to the model. When
+/// `None`, every step is stub-executed (no network calls, useful for tests
+/// and dry-runs).
+///
+/// When `registry_client` is `Some`, the runner silently updates the skill
+/// to the registry's `target_version` before execution if the installed
+/// version is below `minimum_allowed_version`.
+pub fn run_skill(
+    state: &AppState,
+    policy_client: &dyn PolicyClient,
+    skill_id: &str,
+    input: &serde_json::Value,
+    model_client: Option<&dyn ModelClient>,
+    registry_client: Option<&RegistryClient>,
+) -> Result<RunResult> {
+    let wall_start = std::time::Instant::now();
+
+    // 0. Silent auto-update if registry is available and version is stale.
+    if let Some(registry) = registry_client {
+        let policy = policy_client.fetch_policy(skill_id)?;
+        auto_update_if_needed(state, registry, skill_id, &policy)?;
+    }
+
+    // 1. Resolve → get version and install path.
+    let outcome = resolve_skill(state, policy_client, skill_id)?;
+    let (version, install_path) = match outcome {
+        ResolveOutcome::Active {
+            version,
+            install_path,
+            ..
+        } => (version, install_path),
+        ResolveOutcome::NotInstalled { skill_id } => {
+            anyhow::bail!("skill '{}' is not installed", skill_id)
+        }
+        ResolveOutcome::Blocked { skill_id, reason } => {
+            anyhow::bail!("skill '{}' is blocked: {}", skill_id, reason)
+        }
+    };
+
+    // 2. Load the skill package from the active install path.
+    let pkg_path = Utf8PathBuf::from(&install_path);
+    let pkg = SkillPackage::load_from_dir(&pkg_path)
+        .with_context(|| format!("failed to load skill package at {pkg_path}"))?;
+
+    // 3. Validate input against inputs_schema.
+    validate_input(&pkg_path, &pkg.manifest.inputs_schema, input)?;
+
+    // 4. Execute each workflow step.
+    let mut steps: Vec<StepResult> = Vec::new();
+    for step in &pkg.workflow.steps {
+        let result = execute_step(&pkg, step, input, model_client)?;
+        steps.push(result);
+    }
+
+    let total_latency_ms = wall_start.elapsed().as_millis() as u64;
+    let total_prompt_tokens: u64 = steps.iter().filter_map(|s| s.prompt_tokens).sum();
+    let total_completion_tokens: u64 = steps.iter().filter_map(|s| s.completion_tokens).sum();
+
+    // 5. Record execution history.
+    record_execution(
+        state,
+        skill_id,
+        &version,
+        total_prompt_tokens,
+        total_completion_tokens,
+        total_latency_ms,
+    )?;
+
+    Ok(RunResult {
+        skill_id: skill_id.to_string(),
+        version,
+        steps,
+        total_prompt_tokens,
+        total_completion_tokens,
+        total_latency_ms,
+    })
+}
+
+// ── Step dispatch ─────────────────────────────────────────────────────────────
+
+fn execute_step(
+    pkg: &SkillPackage,
+    step: &WorkflowStep,
+    run_input: &serde_json::Value,
+    model_client: Option<&dyn ModelClient>,
+) -> Result<StepResult> {
+    match step {
+        WorkflowStep::Llm {
+            id,
+            prompt,
+            inputs,
+            output_schema,
+        } => match model_client {
+            Some(client) => {
+                execute_llm_step(pkg, id, prompt, inputs, output_schema.as_deref(), run_input, client)
+            }
+            None => Ok(stub_step(step)),
+        },
+        _ => Ok(stub_step(step)),
+    }
+}
+
+// ── LLM step ─────────────────────────────────────────────────────────────────
+
+fn execute_llm_step(
+    pkg: &SkillPackage,
+    id: &str,
+    prompt_rel: &str,
+    step_inputs: &Option<serde_yaml::Value>,
+    output_schema_rel: Option<&str>,
+    run_input: &serde_json::Value,
+    client: &dyn ModelClient,
+) -> Result<StepResult> {
+    // Read system prompt from file.
+    let prompt_path = pkg.root.join(prompt_rel);
+    let system_prompt = fs::read_to_string(&prompt_path)
+        .with_context(|| format!("failed to read prompt file {prompt_path}"))?;
+
+    // Resolve step inputs → user message string.
+    let user_message = resolve_inputs(step_inputs, run_input);
+
+    let request = ModelRequest {
+        system_prompt,
+        user_message,
+        json_output: output_schema_rel.is_some(),
+    };
+
+    let response = client
+        .generate(request)
+        .with_context(|| format!("LLM call failed for step '{id}'"))?;
+
+    // Parse model output.
+    let output: Option<serde_json::Value> = if output_schema_rel.is_some() {
+        serde_json::from_str(&response.text)
+            .ok()
+            .or_else(|| Some(serde_json::Value::String(response.text.clone())))
+    } else {
+        Some(serde_json::Value::String(response.text.clone()))
+    };
+
+    // Validate output against schema when present.
+    if let (Some(schema_rel), Some(output_val)) = (output_schema_rel, &output) {
+        validate_output(&pkg.root, schema_rel, output_val)
+            .with_context(|| format!("step '{id}' output failed schema validation"))?;
+    }
+
+    Ok(StepResult {
+        id: id.to_string(),
+        step_type: "llm".to_string(),
+        note: format!(
+            "completed in {}ms ({} prompt + {} completion tokens)",
+            response.latency_ms, response.prompt_tokens, response.completion_tokens
+        ),
+        output,
+        prompt_tokens: Some(response.prompt_tokens),
+        completion_tokens: Some(response.completion_tokens),
+        latency_ms: Some(response.latency_ms),
+    })
+}
+
+// ── Input resolution ──────────────────────────────────────────────────────────
+
+/// Convert a step's `inputs` YAML mapping into a plain-text user message by
+/// resolving `input.<field>` references against the run's input JSON.
+fn resolve_inputs(step_inputs: &Option<serde_yaml::Value>, run_input: &serde_json::Value) -> String {
+    let Some(inputs) = step_inputs else {
+        return String::new();
+    };
+    let Some(mapping) = inputs.as_mapping() else {
+        return String::new();
+    };
+
+    let mut parts = Vec::new();
+    for (key, value) in mapping {
+        let key_str = key.as_str().unwrap_or_default();
+        let ref_str = value.as_str().unwrap_or_default();
+        let resolved = resolve_ref(ref_str, run_input);
+        parts.push(format!("{key_str}: {resolved}"));
+    }
+    parts.join("\n")
+}
+
+/// Resolve a single reference like `input.requirements` to its value, or
+/// return the reference string unchanged when it cannot be resolved (e.g.
+/// references to earlier step outputs, which are not yet implemented).
+fn resolve_ref(ref_str: &str, run_input: &serde_json::Value) -> String {
+    if let Some(field) = ref_str.strip_prefix("input.") {
+        if let Some(val) = run_input.get(field) {
+            return match val {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+        }
+    }
+    ref_str.to_string()
+}
+
+// ── Stub execution ────────────────────────────────────────────────────────────
+
+fn stub_step(step: &WorkflowStep) -> StepResult {
+    match step {
+        WorkflowStep::Tool { id, tool, .. } => StepResult {
+            id: id.clone(),
+            step_type: "tool".to_string(),
+            note: format!("built-in tool '{tool}' — not yet implemented, skipped"),
+            output: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms: None,
+        },
+        WorkflowStep::Llm { id, prompt, .. } => StepResult {
+            id: id.clone(),
+            step_type: "llm".to_string(),
+            note: format!("LLM call with prompt '{prompt}' — stub, no model invoked"),
+            output: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms: None,
+        },
+        WorkflowStep::Transform { id, op, .. } => StepResult {
+            id: id.clone(),
+            step_type: "transform".to_string(),
+            note: format!("transform op '{op}' — not yet implemented, skipped"),
+            output: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms: None,
+        },
+        WorkflowStep::Validate { id, schema, .. } => StepResult {
+            id: id.clone(),
+            step_type: "validate".to_string(),
+            note: format!("schema validation '{schema}' — not yet implemented, skipped"),
+            output: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            latency_ms: None,
+        },
+    }
+}
+
+// ── Schema validation helpers ─────────────────────────────────────────────────
+
+fn validate_input(
+    pkg_path: &Utf8PathBuf,
+    schema_rel: &str,
+    input: &serde_json::Value,
+) -> Result<()> {
+    let schema_path = pkg_path.join(schema_rel);
+    let schema_text = fs::read_to_string(&schema_path)
+        .with_context(|| format!("failed to read input schema {schema_path}"))?;
+    let schema_json: serde_json::Value = serde_json::from_str(&schema_text)
+        .with_context(|| format!("{schema_rel} is not valid JSON"))?;
+
+    let validator = jsonschema::JSONSchema::compile(&schema_json)
+        .map_err(|e| anyhow::anyhow!("{schema_rel} is not a valid JSON Schema: {e}"))?;
+
+    if !validator.is_valid(input) {
+        anyhow::bail!("input failed validation against {schema_rel}");
+    }
+
+    Ok(())
+}
+
+fn validate_output(
+    pkg_root: &Utf8PathBuf,
+    schema_rel: &str,
+    output: &serde_json::Value,
+) -> Result<()> {
+    let schema_path = pkg_root.join(schema_rel);
+    let schema_text = fs::read_to_string(&schema_path)
+        .with_context(|| format!("failed to read output schema {schema_path}"))?;
+    let schema_json: serde_json::Value = serde_json::from_str(&schema_text)
+        .with_context(|| format!("{schema_rel} is not valid JSON"))?;
+
+    let validator = jsonschema::JSONSchema::compile(&schema_json)
+        .map_err(|e| anyhow::anyhow!("{schema_rel} is not a valid JSON Schema: {e}"))?;
+
+    if !validator.is_valid(output) {
+        anyhow::bail!("output failed validation against {schema_rel}");
+    }
+
+    Ok(())
+}
+
+// ── Execution history ─────────────────────────────────────────────────────────
+
+fn record_execution(
+    state: &AppState,
+    skill_id: &str,
+    version: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    latency_ms: u64,
+) -> Result<()> {
+    let conn = Connection::open(&state.db_path)
+        .context("failed to open state DB to record execution")?;
+    conn.execute(
+        "INSERT INTO execution_history (skill_id, version, status, prompt_tokens, completion_tokens, latency_ms)
+         VALUES (?1, ?2, 'completed', ?3, ?4, ?5)",
+        rusqlite::params![skill_id, version, prompt_tokens, completion_tokens, latency_ms],
+    )
+    .context("failed to insert execution_history row")?;
+    Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{install::install_unpacked_skill, policy::MockPolicyClient, state::AppState};
+    use camino::Utf8PathBuf;
+    use std::{fs, time::{SystemTime, UNIX_EPOCH}};
+
+    fn temp_root(label: &str) -> Utf8PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("forge-tests-executor-{label}-{nanos}")),
+        )
+        .unwrap()
+    }
+
+    fn write_skill_bundle(root: &Utf8PathBuf, input_schema: &str) {
+        fs::create_dir_all(root.join("schemas")).unwrap();
+        fs::create_dir_all(root.join("prompts")).unwrap();
+        fs::write(
+            root.join("manifest.json"),
+            r#"{
+  "schema_version": "1.0",
+  "id": "test-skill",
+  "name": "Test Skill",
+  "version": "0.1.0",
+  "publisher": "skillclub",
+  "entrypoint": "workflow.yaml",
+  "inputs_schema": "schemas/input.schema.json",
+  "outputs_schema": "schemas/output.schema.json",
+  "permissions": { "filesystem": "none", "network": "none", "clipboard": false },
+  "execution": { "sandbox_profile": "strict", "timeout_seconds": 30, "memory_mb": 256 }
+}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("workflow.yaml"),
+            "name: test_skill\nsteps:\n  - id: run\n    type: llm\n    prompt: prompts/system.txt\n    inputs: {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("prompts/system.txt"), "Do the thing.").unwrap();
+        fs::write(root.join("schemas/input.schema.json"), input_schema).unwrap();
+        fs::write(root.join("schemas/output.schema.json"), "{}").unwrap();
+    }
+
+    #[test]
+    fn run_executes_steps_and_returns_results_for_installed_skill() {
+        let state_root = temp_root("run-ok");
+        let skill_root = temp_root("run-ok-skill");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        write_skill_bundle(&skill_root, "{}");
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg).unwrap();
+
+        let client = MockPolicyClient::new();
+        let result = run_skill(&state, &client, "test-skill", &serde_json::json!({}), None, None).unwrap();
+
+        assert_eq!(result.skill_id, "test-skill");
+        assert_eq!(result.steps.len(), 1);
+        assert_eq!(result.steps[0].id, "run");
+        assert_eq!(result.steps[0].step_type, "llm");
+
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    #[test]
+    fn run_errors_when_skill_is_not_installed() {
+        let state_root = temp_root("run-not-installed");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let client = MockPolicyClient::new();
+        let err = run_skill(&state, &client, "ghost-skill", &serde_json::json!({}), None, None)
+            .expect_err("uninstalled skill should fail");
+
+        assert!(err.to_string().contains("not installed"), "got: {err}");
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn run_errors_when_input_fails_schema_validation() {
+        let state_root = temp_root("run-schema-fail");
+        let skill_root = temp_root("run-schema-fail-skill");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        write_skill_bundle(
+            &skill_root,
+            r#"{"type":"object","required":["query"],"properties":{"query":{"type":"string"}}}"#,
+        );
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg).unwrap();
+
+        let client = MockPolicyClient::new();
+        let err = run_skill(&state, &client, "test-skill", &serde_json::json!({"other": 1}), None, None)
+            .expect_err("invalid input should fail");
+
+        assert!(err.to_string().contains("validation"), "got: {err}");
+
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+}
