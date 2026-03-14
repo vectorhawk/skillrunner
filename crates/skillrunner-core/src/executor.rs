@@ -143,9 +143,15 @@ fn execute_step(
             inputs,
             output_schema,
         } => match model_client {
-            Some(client) => {
-                execute_llm_step(pkg, id, prompt, inputs, output_schema.as_deref(), run_input, step_outputs, client)
-            }
+            Some(client) => execute_llm_step(pkg, LlmStepParams {
+                id,
+                prompt_rel: prompt,
+                step_inputs: inputs,
+                output_schema_rel: output_schema.as_deref(),
+                run_input,
+                step_outputs,
+                client,
+            }),
             None => Ok(stub_step(step)),
         },
         WorkflowStep::Transform { id, op, input } => {
@@ -260,16 +266,18 @@ fn execute_validate_step(
 
 // ── LLM step ─────────────────────────────────────────────────────────────────
 
-fn execute_llm_step(
-    pkg: &SkillPackage,
-    id: &str,
-    prompt_rel: &str,
-    step_inputs: &Option<serde_yaml::Value>,
-    output_schema_rel: Option<&str>,
-    run_input: &serde_json::Value,
-    step_outputs: &HashMap<String, serde_json::Value>,
-    client: &dyn ModelClient,
-) -> Result<StepResult> {
+struct LlmStepParams<'a> {
+    id: &'a str,
+    prompt_rel: &'a str,
+    step_inputs: &'a Option<serde_yaml::Value>,
+    output_schema_rel: Option<&'a str>,
+    run_input: &'a serde_json::Value,
+    step_outputs: &'a HashMap<String, serde_json::Value>,
+    client: &'a dyn ModelClient,
+}
+
+fn execute_llm_step(pkg: &SkillPackage, p: LlmStepParams<'_>) -> Result<StepResult> {
+    let LlmStepParams { id, prompt_rel, step_inputs, output_schema_rel, run_input, step_outputs, client } = p;
     // Read system prompt from file.
     let prompt_path = pkg.root.join(prompt_rel);
     let system_prompt = fs::read_to_string(&prompt_path)
@@ -375,43 +383,38 @@ fn resolve_ref(
 // ── Stub execution ────────────────────────────────────────────────────────────
 
 fn stub_step(step: &WorkflowStep) -> StepResult {
-    match step {
-        WorkflowStep::Tool { id, tool, .. } => StepResult {
-            id: id.clone(),
-            step_type: "tool".to_string(),
-            note: format!("built-in tool '{tool}' — not yet implemented, skipped"),
-            output: None,
-            prompt_tokens: None,
-            completion_tokens: None,
-            latency_ms: None,
-        },
-        WorkflowStep::Llm { id, prompt, .. } => StepResult {
-            id: id.clone(),
-            step_type: "llm".to_string(),
-            note: format!("LLM call with prompt '{prompt}' — stub, no model invoked"),
-            output: None,
-            prompt_tokens: None,
-            completion_tokens: None,
-            latency_ms: None,
-        },
-        WorkflowStep::Transform { id, op, .. } => StepResult {
-            id: id.clone(),
-            step_type: "transform".to_string(),
-            note: format!("transform op '{op}' — not yet implemented, skipped"),
-            output: None,
-            prompt_tokens: None,
-            completion_tokens: None,
-            latency_ms: None,
-        },
-        WorkflowStep::Validate { id, schema, .. } => StepResult {
-            id: id.clone(),
-            step_type: "validate".to_string(),
-            note: format!("schema validation '{schema}' — not yet implemented, skipped"),
-            output: None,
-            prompt_tokens: None,
-            completion_tokens: None,
-            latency_ms: None,
-        },
+    // Only Llm steps reach this path (when model_client is None).
+    // Tool, Transform, and Validate are always dispatched to real implementations.
+    let (id, step_type, note) = match step {
+        WorkflowStep::Llm { id, prompt, .. } => (
+            id.clone(),
+            "llm",
+            format!("LLM call with prompt '{prompt}' — stub, no model invoked"),
+        ),
+        WorkflowStep::Tool { id, tool, .. } => (
+            id.clone(),
+            "tool",
+            format!("built-in tool '{tool}' — stub"),
+        ),
+        WorkflowStep::Transform { id, op, .. } => (
+            id.clone(),
+            "transform",
+            format!("transform op '{op}' — stub"),
+        ),
+        WorkflowStep::Validate { id, schema, .. } => (
+            id.clone(),
+            "validate",
+            format!("schema validation '{schema}' — stub"),
+        ),
+    };
+    StepResult {
+        id,
+        step_type: step_type.to_string(),
+        note,
+        output: None,
+        prompt_tokens: None,
+        completion_tokens: None,
+        latency_ms: None,
     }
 }
 
