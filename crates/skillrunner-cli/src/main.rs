@@ -25,7 +25,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Doctor,
+    Doctor {
+        /// Ollama base URL (default: http://localhost:11434)
+        #[arg(long, default_value = "http://localhost:11434")]
+        ollama_url: String,
+    },
     Skill {
         #[command(subcommand)]
         command: SkillCommands,
@@ -65,10 +69,28 @@ fn main() -> Result<()> {
     let app = SkillRunnerApp::bootstrap()?;
 
     match cli.command {
-        Commands::Doctor => {
+        Commands::Doctor { ollama_url } => {
             println!("SkillRunner root: {}", app.state.root_dir);
             println!("State DB:         {}", app.state.db_path);
             println!("Status:           OK");
+
+            let ollama = OllamaClient::new(&ollama_url, "");
+            let health = ollama.health_check();
+            if health.reachable {
+                match ollama.list_models() {
+                    Ok(models) => {
+                        println!("Ollama:           OK ({} models available) at {}", models.len(), ollama_url);
+                        for m in &models {
+                            println!("  - {}", m.name);
+                        }
+                    }
+                    Err(e) => {
+                        println!("Ollama:           REACHABLE but failed to list models: {e}");
+                    }
+                }
+            } else {
+                println!("Ollama:           NOT REACHABLE at {}", ollama_url);
+            }
         }
         Commands::Skill { command } => match command {
             SkillCommands::Import { path } => {

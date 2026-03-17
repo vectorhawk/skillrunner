@@ -89,7 +89,12 @@ pub fn run_skill(
     // 3. Validate input against inputs_schema.
     validate_input(&pkg_path, &pkg.manifest.inputs_schema, input)?;
 
-    // 4. Execute each workflow step, threading outputs forward.
+    // 4. Warn if model requirements are specified but may not be met.
+    if let (Some(client), Some(reqs)) = (model_client, &pkg.manifest.model_requirements) {
+        check_model_requirements(reqs, client);
+    }
+
+    // 5. Execute each workflow step, threading outputs forward.
     let mut steps: Vec<StepResult> = Vec::new();
     let mut step_outputs: HashMap<String, serde_json::Value> = HashMap::new();
     for step in &pkg.workflow.steps {
@@ -483,12 +488,41 @@ fn record_execution(
     Ok(())
 }
 
+// ── Model requirements check ──────────────────────────────────────────────────
+
+fn check_model_requirements(
+    reqs: &skillrunner_manifest::ModelRequirements,
+    _client: &dyn ModelClient,
+) {
+    // Warn about requirements that can't be verified locally.
+    // This is advisory — we don't block execution, just log warnings.
+    if let Some(min_ctx) = reqs.min_context_tokens {
+        tracing::warn!(
+            "skill requires min_context_tokens={min_ctx} — cannot verify locally, proceeding"
+        );
+    }
+    if reqs.supports_structured_output == Some(true) {
+        tracing::info!("skill requires structured output support — requesting JSON format from model");
+    }
+    if reqs.supports_tool_calling == Some(true) {
+        tracing::warn!("skill requires tool calling — not yet supported by local Ollama backend");
+    }
+    if let Some(pref) = &reqs.preferred_execution {
+        tracing::info!("skill preferred execution: {pref}");
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{install::install_unpacked_skill, policy::MockPolicyClient, state::AppState};
+    use crate::{
+        install::install_unpacked_skill,
+        model::MockModelClient,
+        policy::MockPolicyClient,
+        state::AppState,
+    };
     use camino::Utf8PathBuf;
     use std::{fs, time::{SystemTime, UNIX_EPOCH}};
 
@@ -647,6 +681,200 @@ mod tests {
             .expect_err("invalid input should fail");
 
         assert!(err.to_string().contains("validation"), "got: {err}");
+
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    // ── MockModelClient integration tests ────────────────────────────────────
+
+    #[test]
+    fn llm_step_with_mock_model_produces_output_and_token_counts() {
+        let state_root = temp_root("mock-llm");
+        let skill_root = temp_root("mock-llm-skill");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        write_skill_bundle(&skill_root, "{}");
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg).unwrap();
+
+        let mock_model = MockModelClient::new("mock response text").with_tokens(20, 15);
+        let policy = MockPolicyClient::new();
+        let result = run_skill(
+            &state,
+            &policy,
+            "test-skill",
+            &serde_json::json!({}),
+            Some(&mock_model),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.steps.len(), 1);
+        let step = &result.steps[0];
+        assert_eq!(step.step_type, "llm");
+        assert_eq!(
+            step.output,
+            Some(serde_json::Value::String("mock response text".to_string()))
+        );
+        assert_eq!(step.prompt_tokens, Some(20));
+        assert_eq!(step.completion_tokens, Some(15));
+        assert!(step.latency_ms.is_some());
+        assert_eq!(result.total_prompt_tokens, 20);
+        assert_eq!(result.total_completion_tokens, 15);
+
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    #[test]
+    fn llm_step_output_validated_against_schema() {
+        let state_root = temp_root("mock-llm-schema");
+        let skill_root = temp_root("mock-llm-schema-skill");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        // Create a skill with output_schema on the LLM step.
+        fs::create_dir_all(skill_root.join("schemas")).unwrap();
+        fs::create_dir_all(skill_root.join("prompts")).unwrap();
+        fs::write(
+            skill_root.join("manifest.json"),
+            r#"{
+  "schema_version": "1.0",
+  "id": "test-skill",
+  "name": "Test Skill",
+  "version": "0.1.0",
+  "publisher": "skillclub",
+  "entrypoint": "workflow.yaml",
+  "inputs_schema": "schemas/input.schema.json",
+  "outputs_schema": "schemas/output.schema.json",
+  "permissions": { "filesystem": "none", "network": "none", "clipboard": false },
+  "execution": { "sandbox_profile": "strict", "timeout_seconds": 30, "memory_mb": 256 }
+}"#,
+        )
+        .unwrap();
+        fs::write(
+            skill_root.join("workflow.yaml"),
+            "name: test_skill\nsteps:\n  - id: run\n    type: llm\n    prompt: prompts/system.txt\n    inputs: {}\n    output_schema: schemas/output.schema.json\n",
+        )
+        .unwrap();
+        fs::write(skill_root.join("prompts/system.txt"), "Return JSON.").unwrap();
+        fs::write(skill_root.join("schemas/input.schema.json"), "{}").unwrap();
+        fs::write(
+            skill_root.join("schemas/output.schema.json"),
+            r#"{"type":"object","required":["summary"],"properties":{"summary":{"type":"string"}}}"#,
+        )
+        .unwrap();
+
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg).unwrap();
+
+        // Mock returns valid JSON matching the schema.
+        let mock_model = MockModelClient::new(r#"{"summary":"all good"}"#);
+        let policy = MockPolicyClient::new();
+        let result = run_skill(
+            &state,
+            &policy,
+            "test-skill",
+            &serde_json::json!({}),
+            Some(&mock_model),
+            None,
+        )
+        .unwrap();
+
+        let output = result.steps[0].output.as_ref().unwrap();
+        assert_eq!(output["summary"], "all good");
+
+        // Mock returns JSON that does NOT match the schema — should fail validation.
+        let bad_model = MockModelClient::new(r#"{"wrong_field":"oops"}"#);
+        let err = run_skill(
+            &state,
+            &policy,
+            "test-skill",
+            &serde_json::json!({}),
+            Some(&bad_model),
+            None,
+        )
+        .expect_err("schema mismatch should fail");
+
+        assert!(
+            err.to_string().contains("schema validation"),
+            "got: {err}"
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    #[test]
+    fn multi_step_tool_then_llm_with_mock_model() {
+        let state_root = temp_root("multi-step-mock");
+        let skill_root = temp_root("multi-step-mock-skill");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        fs::create_dir_all(skill_root.join("schemas")).unwrap();
+        fs::create_dir_all(skill_root.join("prompts")).unwrap();
+        fs::write(
+            skill_root.join("manifest.json"),
+            r#"{
+  "schema_version": "1.0",
+  "id": "test-skill",
+  "name": "Test Skill",
+  "version": "0.1.0",
+  "publisher": "skillclub",
+  "entrypoint": "workflow.yaml",
+  "inputs_schema": "schemas/input.schema.json",
+  "outputs_schema": "schemas/output.schema.json",
+  "permissions": { "filesystem": "none", "network": "none", "clipboard": false },
+  "execution": { "sandbox_profile": "strict", "timeout_seconds": 30, "memory_mb": 256 }
+}"#,
+        )
+        .unwrap();
+        fs::write(
+            skill_root.join("workflow.yaml"),
+            "name: test_skill\nsteps:\n  - id: extract\n    type: tool\n    tool: extract_text\n    input: doc\n  - id: analyze\n    type: llm\n    prompt: prompts/system.txt\n    inputs:\n      text: extract.output\n",
+        )
+        .unwrap();
+        fs::write(skill_root.join("prompts/system.txt"), "Analyze the text.").unwrap();
+        fs::write(skill_root.join("schemas/input.schema.json"), "{}").unwrap();
+        fs::write(skill_root.join("schemas/output.schema.json"), "{}").unwrap();
+
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg).unwrap();
+
+        let mock_model = MockModelClient::new("analysis result").with_tokens(30, 20);
+        let policy = MockPolicyClient::new();
+        let result = run_skill(
+            &state,
+            &policy,
+            "test-skill",
+            &serde_json::json!({"doc": "contract text here"}),
+            Some(&mock_model),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.steps.len(), 2);
+
+        // Tool step extracted text.
+        assert_eq!(result.steps[0].step_type, "tool");
+        assert_eq!(result.steps[0].id, "extract");
+        assert_eq!(
+            result.steps[0].output,
+            Some(serde_json::Value::String("contract text here".to_string()))
+        );
+
+        // LLM step used mock model.
+        assert_eq!(result.steps[1].step_type, "llm");
+        assert_eq!(result.steps[1].id, "analyze");
+        assert_eq!(
+            result.steps[1].output,
+            Some(serde_json::Value::String("analysis result".to_string()))
+        );
+        assert_eq!(result.steps[1].prompt_tokens, Some(30));
+        assert_eq!(result.steps[1].completion_tokens, Some(20));
+
+        assert_eq!(result.total_prompt_tokens, 30);
+        assert_eq!(result.total_completion_tokens, 20);
 
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&skill_root);
