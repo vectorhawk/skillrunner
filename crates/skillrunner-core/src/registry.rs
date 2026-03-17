@@ -38,19 +38,20 @@ pub struct ArtifactMetadata {
     pub size_bytes: Option<u64>,
 }
 
-/// A single skill result from `GET /skills?q=<query>`.
+/// A single skill result from `GET /portal/skills?search=<query>`.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SearchResult {
-    pub id: String,
+    pub skill_id: String,
     pub name: String,
-    pub version: String,
-    pub publisher: String,
+    pub latest_version: Option<String>,
+    pub publisher_name: Option<String>,
+    pub description: Option<String>,
 }
 
 /// Wire format returned by the search endpoint.
 #[derive(Debug, Deserialize)]
 struct SearchApiResponse {
-    skills: Vec<SearchResult>,
+    items: Vec<SearchResult>,
 }
 
 // ── RegistryClient ────────────────────────────────────────────────────────────
@@ -200,7 +201,7 @@ impl RegistryClient {
     /// Search the registry for skills matching `query`.
     pub fn search_skills(&self, query: &str) -> Result<Vec<SearchResult>> {
         let url = format!(
-            "{}/skills?q={}",
+            "{}/portal/skills?search={}",
             self.base_url.trim_end_matches('/'),
             urlencoding::encode(query)
         );
@@ -221,7 +222,7 @@ impl RegistryClient {
         let wire: SearchApiResponse = resp
             .json()
             .context("failed to deserialize search response")?;
-        Ok(wire.skills)
+        Ok(wire.items)
     }
 }
 
@@ -633,16 +634,19 @@ mod tests {
     fn search_skills_parses_results() {
         let mut server = Server::new();
         let mock = server
-            .mock("GET", "/skills")
-            .match_query(Matcher::UrlEncoded("q".into(), "contract".into()))
+            .mock("GET", "/portal/skills")
+            .match_query(Matcher::UrlEncoded("search".into(), "contract".into()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
                 r#"{
-                    "skills": [
-                        { "id": "contract-compare", "name": "Contract Compare", "version": "0.1.0", "publisher": "skillclub" },
-                        { "id": "contract-review", "name": "Contract Review", "version": "1.0.0", "publisher": "acme" }
-                    ]
+                    "items": [
+                        { "skill_id": "contract-compare", "name": "Contract Compare", "latest_version": "0.1.0", "publisher_name": "skillclub" },
+                        { "skill_id": "contract-review", "name": "Contract Review", "latest_version": "1.0.0", "publisher_name": "acme" }
+                    ],
+                    "total": 2,
+                    "page": 1,
+                    "page_size": 20
                 }"#,
             )
             .create();
@@ -651,8 +655,8 @@ mod tests {
         let results = client.search_skills("contract").unwrap();
 
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].id, "contract-compare");
-        assert_eq!(results[1].publisher, "acme");
+        assert_eq!(results[0].skill_id, "contract-compare");
+        assert_eq!(results[1].publisher_name.as_deref(), Some("acme"));
         mock.assert();
     }
 
@@ -660,8 +664,8 @@ mod tests {
     fn search_skills_returns_error_on_http_failure() {
         let mut server = Server::new();
         let mock = server
-            .mock("GET", "/skills")
-            .match_query(Matcher::UrlEncoded("q".into(), "test".into()))
+            .mock("GET", "/portal/skills")
+            .match_query(Matcher::UrlEncoded("search".into(), "test".into()))
             .with_status(500)
             .with_body("internal error")
             .create();

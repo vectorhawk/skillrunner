@@ -139,7 +139,13 @@ fn main() -> Result<()> {
                     println!("{:<25} {:<30} {:<10} PUBLISHER", "ID", "NAME", "VERSION");
                     println!("{}", "-".repeat(75));
                     for r in &results {
-                        println!("{:<25} {:<30} {:<10} {}", r.id, r.name, r.version, r.publisher);
+                        println!(
+                            "{:<25} {:<30} {:<10} {}",
+                            r.skill_id,
+                            r.name,
+                            r.latest_version.as_deref().unwrap_or("-"),
+                            r.publisher_name.as_deref().unwrap_or("-"),
+                        );
                     }
                 }
             }
