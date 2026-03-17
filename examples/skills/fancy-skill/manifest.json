@@ -1,0 +1,31 @@
+{
+  "schema_version": "1.0",
+  "id": "fancy-skill",
+  "name": "Fancy Text Transformer",
+  "version": "0.1.0",
+  "publisher": "skillclub",
+  "description": "Transform ordinary text into fancy Regency era English as if written in Regency-era England.",
+  "entrypoint": "workflow.yaml",
+  "inputs_schema": "schemas/input.schema.json",
+  "outputs_schema": "schemas/output.schema.json",
+  "permissions": {
+    "filesystem": "none",
+    "network": "none",
+    "clipboard": false
+  },
+  "execution": {
+    "sandbox_profile": "strict",
+    "timeout_seconds": 60,
+    "memory_mb": 512
+  },
+  "model_requirements": {
+    "min_context_tokens": 2000,
+    "supports_structured_output": false,
+    "supports_tool_calling": false,
+    "preferred_execution": "local_first"
+  },
+  "update": {
+    "channel": "stable",
+    "auto_update": true
+  }
+}

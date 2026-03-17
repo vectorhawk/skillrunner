@@ -1,0 +1,8 @@
+name: fancy_text_transform
+steps:
+  - id: transform
+    type: llm
+    prompt: prompts/transform.txt
+    inputs:
+      text: text
+    output_schema: schemas/output.schema.json
