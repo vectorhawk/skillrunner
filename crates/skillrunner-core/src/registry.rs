@@ -38,6 +38,21 @@ pub struct ArtifactMetadata {
     pub size_bytes: Option<u64>,
 }
 
+/// A single skill result from `GET /skills?q=<query>`.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SearchResult {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub publisher: String,
+}
+
+/// Wire format returned by the search endpoint.
+#[derive(Debug, Deserialize)]
+struct SearchApiResponse {
+    skills: Vec<SearchResult>,
+}
+
 // ── RegistryClient ────────────────────────────────────────────────────────────
 
 /// Pure HTTP client for the SkillClub registry.
@@ -165,6 +180,48 @@ impl RegistryClient {
 
         debug!("artifact hash verified");
         Ok(())
+    }
+
+    /// Check if the registry is reachable by hitting `GET /health`.
+    ///
+    /// Returns `Ok(true)` if the registry responds with a success status,
+    /// `Ok(false)` if it responds with a non-success status, and `Err` only
+    /// on connection/timeout failures.
+    pub fn health_check(&self) -> Result<bool> {
+        let url = format!("{}/health", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+        Ok(resp.status().is_success())
+    }
+
+    /// Search the registry for skills matching `query`.
+    pub fn search_skills(&self, query: &str) -> Result<Vec<SearchResult>> {
+        let url = format!(
+            "{}/skills?q={}",
+            self.base_url.trim_end_matches('/'),
+            urlencoding::encode(query)
+        );
+        debug!(url, "searching skills");
+
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!("registry returned HTTP {status} for search: {body}");
+        }
+
+        let wire: SearchApiResponse = resp
+            .json()
+            .context("failed to deserialize search response")?;
+        Ok(wire.skills)
     }
 }
 
@@ -319,4 +376,431 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after Unix epoch")
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::AppState;
+    use camino::Utf8PathBuf;
+    use mockito::{Matcher, Server};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_root(label: &str) -> Utf8PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("forge-tests-registry-{label}-{nanos}")),
+        )
+        .unwrap()
+    }
+
+    // ── RegistryClient: fetch_policy_remote ────────────────────────────────
+
+    #[test]
+    fn fetch_policy_remote_parses_active_policy() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/skills/my-skill/policy")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "skill_id": "my-skill",
+                    "status": "active",
+                    "target_version": "1.2.0",
+                    "minimum_allowed_version": "1.0.0",
+                    "policy_ttl_seconds": 3600
+                }"#,
+            )
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        let (policy, ttl) = client.fetch_policy_remote("my-skill").unwrap();
+
+        assert_eq!(policy.skill_id, "my-skill");
+        assert_eq!(policy.status, PolicyStatus::Active);
+        assert_eq!(
+            policy.target_version,
+            Some(Version::parse("1.2.0").unwrap())
+        );
+        assert_eq!(
+            policy.minimum_allowed_version,
+            Some(Version::parse("1.0.0").unwrap())
+        );
+        assert_eq!(ttl, 3600);
+        mock.assert();
+    }
+
+    #[test]
+    fn fetch_policy_remote_parses_blocked_policy() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/skills/bad-skill/policy")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "skill_id": "bad-skill",
+                    "status": "blocked",
+                    "blocked_message": "security vulnerability"
+                }"#,
+            )
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        let (policy, ttl) = client.fetch_policy_remote("bad-skill").unwrap();
+
+        assert_eq!(policy.status, PolicyStatus::Blocked);
+        assert_eq!(
+            policy.blocked_message.as_deref(),
+            Some("security vulnerability")
+        );
+        assert_eq!(ttl, 86400); // default TTL
+        mock.assert();
+    }
+
+    #[test]
+    fn fetch_policy_remote_returns_error_on_http_failure() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/skills/my-skill/policy")
+            .with_status(500)
+            .with_body("internal error")
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        let err = client.fetch_policy_remote("my-skill").unwrap_err();
+        assert!(err.to_string().contains("500"));
+        mock.assert();
+    }
+
+    #[test]
+    fn fetch_policy_remote_returns_error_on_malformed_json() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/skills/my-skill/policy")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("not json at all")
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        let err = client.fetch_policy_remote("my-skill").unwrap_err();
+        assert!(err.to_string().contains("deserialize"));
+        mock.assert();
+    }
+
+    // ── RegistryClient: fetch_artifact_metadata ────────────────────────────
+
+    #[test]
+    fn fetch_artifact_metadata_parses_response() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/skills/my-skill/versions/1.0.0")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "skill_id": "my-skill",
+                    "version": "1.0.0",
+                    "download_url": "https://cdn.example.com/my-skill-1.0.0.cskill",
+                    "sha256": "abcdef1234567890",
+                    "size_bytes": 12345
+                }"#,
+            )
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        let meta = client.fetch_artifact_metadata("my-skill", "1.0.0").unwrap();
+
+        assert_eq!(meta.skill_id, "my-skill");
+        assert_eq!(meta.version, "1.0.0");
+        assert_eq!(meta.sha256, "abcdef1234567890");
+        assert_eq!(meta.size_bytes, Some(12345));
+        mock.assert();
+    }
+
+    #[test]
+    fn fetch_artifact_metadata_returns_error_on_http_failure() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/skills/my-skill/versions/1.0.0")
+            .with_status(404)
+            .with_body("not found")
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        let err = client
+            .fetch_artifact_metadata("my-skill", "1.0.0")
+            .unwrap_err();
+        assert!(err.to_string().contains("404"));
+        mock.assert();
+    }
+
+    // ── RegistryClient: download_artifact ──────────────────────────────────
+
+    #[test]
+    fn download_artifact_verifies_sha256() {
+        let content = b"hello world skill bundle";
+        let expected_hash = hex::encode(sha2::Sha256::digest(content));
+
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/download/bundle.cskill")
+            .with_status(200)
+            .with_body(content.as_slice())
+            .create();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = Utf8PathBuf::from_path_buf(tmp.path().join("out.cskill")).unwrap();
+
+        let client = RegistryClient::new(server.url());
+        let download_url = format!("{}/download/bundle.cskill", server.url());
+        client
+            .download_artifact(&download_url, &expected_hash, &dest)
+            .unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), content);
+        mock.assert();
+    }
+
+    #[test]
+    fn download_artifact_rejects_hash_mismatch() {
+        let content = b"hello world skill bundle";
+
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/download/bundle.cskill")
+            .with_status(200)
+            .with_body(content.as_slice())
+            .create();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dest = Utf8PathBuf::from_path_buf(tmp.path().join("out.cskill")).unwrap();
+
+        let client = RegistryClient::new(server.url());
+        let download_url = format!("{}/download/bundle.cskill", server.url());
+        let err = client
+            .download_artifact(&download_url, "badhash000", &dest)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("hash mismatch"));
+        assert!(!dest.exists(), "file should be cleaned up on mismatch");
+        mock.assert();
+    }
+
+    // ── RegistryClient: health_check ───────────────────────────────────────
+
+    #[test]
+    fn health_check_returns_true_when_healthy() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/health")
+            .with_status(200)
+            .with_body("ok")
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        assert!(client.health_check().unwrap());
+        mock.assert();
+    }
+
+    #[test]
+    fn health_check_returns_false_on_server_error() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/health")
+            .with_status(503)
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        assert!(!client.health_check().unwrap());
+        mock.assert();
+    }
+
+    #[test]
+    fn health_check_returns_error_on_connection_failure() {
+        let client = RegistryClient::new("http://127.0.0.1:1");
+        assert!(client.health_check().is_err());
+    }
+
+    // ── RegistryClient: search_skills ──────────────────────────────────────
+
+    #[test]
+    fn search_skills_parses_results() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/skills")
+            .match_query(Matcher::UrlEncoded("q".into(), "contract".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "skills": [
+                        { "id": "contract-compare", "name": "Contract Compare", "version": "0.1.0", "publisher": "skillclub" },
+                        { "id": "contract-review", "name": "Contract Review", "version": "1.0.0", "publisher": "acme" }
+                    ]
+                }"#,
+            )
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        let results = client.search_skills("contract").unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, "contract-compare");
+        assert_eq!(results[1].publisher, "acme");
+        mock.assert();
+    }
+
+    #[test]
+    fn search_skills_returns_error_on_http_failure() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/skills")
+            .match_query(Matcher::UrlEncoded("q".into(), "test".into()))
+            .with_status(500)
+            .with_body("internal error")
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        let err = client.search_skills("test").unwrap_err();
+        assert!(err.to_string().contains("500"));
+        mock.assert();
+    }
+
+    // ── HttpPolicyClient: cache behaviour ──────────────────────────────────
+
+    #[test]
+    fn http_policy_cache_hit_avoids_network_call() {
+        let mut server = Server::new();
+        // The mock should only be called once.
+        let mock = server
+            .mock("GET", "/skills/cached-skill/policy")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "skill_id": "cached-skill",
+                    "status": "active",
+                    "policy_ttl_seconds": 86400
+                }"#,
+            )
+            .expect(1)
+            .create();
+
+        let root = temp_root("cache-hit");
+        let state = AppState::bootstrap_in(root.clone()).unwrap();
+        let registry = RegistryClient::new(server.url());
+        let client = HttpPolicyClient::new(registry, &state);
+
+        // First call: populates cache
+        let p1 = client.fetch_policy("cached-skill").unwrap();
+        assert_eq!(p1.status, PolicyStatus::Active);
+
+        // Second call: should come from cache, no HTTP
+        let p2 = client.fetch_policy("cached-skill").unwrap();
+        assert_eq!(p2.status, PolicyStatus::Active);
+
+        mock.assert(); // exactly 1 call
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn http_policy_cache_miss_fetches_and_stores() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/skills/new-skill/policy")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "skill_id": "new-skill",
+                    "status": "active",
+                    "target_version": "2.0.0",
+                    "policy_ttl_seconds": 600
+                }"#,
+            )
+            .expect(1)
+            .create();
+
+        let root = temp_root("cache-miss");
+        let state = AppState::bootstrap_in(root.clone()).unwrap();
+        let registry = RegistryClient::new(server.url());
+        let client = HttpPolicyClient::new(registry, &state);
+
+        let policy = client.fetch_policy("new-skill").unwrap();
+        assert_eq!(policy.target_version, Some(Version::parse("2.0.0").unwrap()));
+
+        // Verify cache row was written
+        let conn = Connection::open(&state.db_path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM policy_cache WHERE skill_id = 'new-skill'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        mock.assert();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn http_policy_stale_cache_fallback_within_grace_window() {
+        let root = temp_root("stale-grace");
+        let state = AppState::bootstrap_in(root.clone()).unwrap();
+
+        // Manually insert a stale cache entry (expired but within 7-day grace)
+        let now = unix_now();
+        let wire_json = serde_json::to_string(&PolicyApiResponse {
+            skill_id: "stale-skill".to_string(),
+            status: "active".to_string(),
+            channel: None,
+            target_version: Some("1.0.0".to_string()),
+            minimum_allowed_version: None,
+            blocked_message: None,
+            policy_ttl_seconds: Some(60),
+        })
+        .unwrap();
+
+        let conn = Connection::open(&state.db_path).unwrap();
+        conn.execute(
+            "INSERT INTO policy_cache (skill_id, policy_json, expires_at, fetched_at) VALUES (?1, ?2, ?3, ?4)",
+            params!["stale-skill", wire_json, (now - 10) as i64, now as i64],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Point at an unreachable server to simulate network failure
+        let registry = RegistryClient::new("http://127.0.0.1:1");
+        let client = HttpPolicyClient::new(registry, &state);
+
+        let policy = client.fetch_policy("stale-skill").unwrap();
+        assert_eq!(policy.status, PolicyStatus::Active);
+        assert_eq!(
+            policy.target_version,
+            Some(Version::parse("1.0.0").unwrap())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn http_policy_error_when_no_cache_and_network_fails() {
+        let root = temp_root("no-cache-fail");
+        let state = AppState::bootstrap_in(root.clone()).unwrap();
+
+        let registry = RegistryClient::new("http://127.0.0.1:1");
+        let client = HttpPolicyClient::new(registry, &state);
+
+        let err = client.fetch_policy("ghost-skill").unwrap_err();
+        assert!(err.to_string().contains("failed to fetch policy"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

@@ -126,6 +126,7 @@ mod tests {
     use crate::{
         install::install_unpacked_skill,
         policy::{Policy, PolicyStatus},
+        registry::RegistryClient,
         state::AppState,
     };
     use camino::Utf8PathBuf;
@@ -170,6 +171,32 @@ mod tests {
         fs::write(root.join("prompts/system.txt"), "Do the thing.").unwrap();
         fs::write(root.join("schemas/input.schema.json"), "{}").unwrap();
         fs::write(root.join("schemas/output.schema.json"), "{}").unwrap();
+    }
+
+    /// Create a tar.gz archive of a skill bundle and return (archive_path, sha256_hex).
+    fn create_skill_archive(version: &str) -> (tempfile::TempDir, String, String) {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use sha2::{Digest, Sha256};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bundle_dir = tmp.path().join("bundle");
+        let bundle_utf8 = Utf8PathBuf::from_path_buf(bundle_dir.clone()).unwrap();
+        write_skill_bundle(&bundle_utf8, version);
+
+        let archive_path = tmp.path().join("bundle.cskill");
+        let file = fs::File::create(&archive_path).unwrap();
+        let enc = GzEncoder::new(file, Compression::default());
+        let mut tar = tar::Builder::new(enc);
+        tar.append_dir_all(".", &bundle_dir).unwrap();
+        tar.finish().unwrap();
+        drop(tar);
+
+        let archive_bytes = fs::read(&archive_path).unwrap();
+        let sha = hex::encode(Sha256::digest(&archive_bytes));
+        let archive_path_str = archive_path.to_string_lossy().to_string();
+
+        (tmp, archive_path_str, sha)
     }
 
     #[test]
@@ -240,5 +267,85 @@ mod tests {
         assert!(!updated, "should not update when skill is not installed");
 
         let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn auto_update_downloads_extracts_and_installs_new_version() {
+        use mockito::Server;
+
+        let state_root = temp_root("auto-update-happy");
+        let skill_root = temp_root("auto-update-happy-skill");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        // Install v1.0.0 (below minimum)
+        write_skill_bundle(&skill_root, "1.0.0");
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg).unwrap();
+
+        // Create a v2.0.0 archive to serve
+        let (_tmp, archive_path, sha) = create_skill_archive("2.0.0");
+        let archive_bytes = fs::read(&archive_path).unwrap();
+
+        let mut server = Server::new();
+        let download_path = "/download/test-skill-2.0.0.cskill";
+
+        // Mock metadata endpoint
+        let meta_mock = server
+            .mock("GET", "/skills/test-skill/versions/2.0.0")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{
+                    "skill_id": "test-skill",
+                    "version": "2.0.0",
+                    "download_url": "{}{download_path}",
+                    "sha256": "{sha}",
+                    "size_bytes": {}
+                }}"#,
+                server.url(),
+                archive_bytes.len()
+            ))
+            .create();
+
+        // Mock download endpoint
+        let dl_mock = server
+            .mock("GET", download_path)
+            .with_status(200)
+            .with_body(&archive_bytes)
+            .create();
+
+        let policy = Policy {
+            skill_id: "test-skill".to_string(),
+            status: PolicyStatus::Active,
+            target_version: Some(Version::parse("2.0.0").unwrap()),
+            minimum_allowed_version: Some(Version::parse("2.0.0").unwrap()),
+            blocked_message: None,
+        };
+
+        let registry = RegistryClient::new(server.url());
+        let updated = auto_update_if_needed(&state, &registry, "test-skill", &policy).unwrap();
+        assert!(updated, "should have performed the update");
+
+        // Verify the new version is now installed
+        let conn = rusqlite::Connection::open(&state.db_path).unwrap();
+        let active_ver: String = conn
+            .query_row(
+                "SELECT active_version FROM installed_skills WHERE skill_id = 'test-skill'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_ver, "2.0.0");
+
+        // Verify files on disk
+        let install_path = state
+            .root_dir
+            .join("skills/test-skill/versions/2.0.0/manifest.json");
+        assert!(install_path.exists(), "manifest.json should exist for v2.0.0");
+
+        meta_mock.assert();
+        dl_mock.assert();
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
     }
 }

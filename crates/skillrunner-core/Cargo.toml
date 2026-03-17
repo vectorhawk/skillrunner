@@ -24,6 +24,7 @@ flate2.workspace = true
 tempfile.workspace = true
 sha2.workspace = true
 hex.workspace = true
+urlencoding.workspace = true
 
 [dev-dependencies]
 mockito = "1"

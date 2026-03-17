@@ -29,6 +29,9 @@ enum Commands {
         /// Ollama base URL (default: http://localhost:11434)
         #[arg(long, default_value = "http://localhost:11434")]
         ollama_url: String,
+        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        #[arg(long)]
+        registry_url: Option<String>,
     },
     Skill {
         #[command(subcommand)]
@@ -39,6 +42,12 @@ enum Commands {
 #[derive(Subcommand)]
 enum SkillCommands {
     Import { path: Utf8PathBuf },
+    Search {
+        query: String,
+        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        #[arg(long)]
+        registry_url: Option<String>,
+    },
     Info { path: Utf8PathBuf },
     Install { path: Utf8PathBuf },
     List,
@@ -69,7 +78,7 @@ fn main() -> Result<()> {
     let app = SkillRunnerApp::bootstrap()?;
 
     match cli.command {
-        Commands::Doctor { ollama_url } => {
+        Commands::Doctor { ollama_url, registry_url } => {
             println!("SkillRunner root: {}", app.state.root_dir);
             println!("State DB:         {}", app.state.db_path);
             println!("Status:           OK");
@@ -91,6 +100,21 @@ fn main() -> Result<()> {
             } else {
                 println!("Ollama:           NOT REACHABLE at {}", ollama_url);
             }
+
+            let effective_url = registry_url.or_else(registry_url_from_env);
+            match effective_url {
+                Some(url) => {
+                    let reg = RegistryClient::new(&url);
+                    match reg.health_check() {
+                        Ok(true) => println!("Registry:         OK at {}", url),
+                        Ok(false) => println!("Registry:         NOT REACHABLE at {}", url),
+                        Err(_) => println!("Registry:         NOT REACHABLE at {}", url),
+                    }
+                }
+                None => {
+                    println!("Registry:         not configured");
+                }
+            }
         }
         Commands::Skill { command } => match command {
             SkillCommands::Import { path } => {
@@ -99,6 +123,24 @@ fn main() -> Result<()> {
                 println!("Output:         {}", bundle.output_dir);
                 for f in &bundle.files {
                     println!("  wrote {f}");
+                }
+            }
+            SkillCommands::Search { query, registry_url } => {
+                let effective_url = registry_url
+                    .or_else(registry_url_from_env)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "no registry URL configured; set SKILLCLUB_REGISTRY_URL or use --registry-url"
+                    ))?;
+                let reg = RegistryClient::new(&effective_url);
+                let results = reg.search_skills(&query)?;
+                if results.is_empty() {
+                    println!("No skills found matching '{query}'.");
+                } else {
+                    println!("{:<25} {:<30} {:<10} PUBLISHER", "ID", "NAME", "VERSION");
+                    println!("{}", "-".repeat(75));
+                    for r in &results {
+                        println!("{:<25} {:<30} {:<10} {}", r.id, r.name, r.version, r.publisher);
+                    }
                 }
             }
             SkillCommands::Info { path } => {
