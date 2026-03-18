@@ -1,23 +1,19 @@
 [package]
-name = "skillrunner-cli"
+name = "skillrunner-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
-[[bin]]
-name = "skillrunner"
-path = "src/main.rs"
-
 [dependencies]
 anyhow.workspace = true
 camino.workspace = true
-clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 skillrunner-core = { path = "../skillrunner-core" }
 skillrunner-manifest = { path = "../skillrunner-manifest" }
-skillrunner-mcp = { path = "../skillrunner-mcp" }
-serde_json.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
 rusqlite.workspace = true
-rpassword.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -3,6 +3,7 @@ members = [
   "crates/skillrunner-cli",
   "crates/skillrunner-core",
   "crates/skillrunner-manifest",
+  "crates/skillrunner-mcp",
 ]
 resolver = "2"
 

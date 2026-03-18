@@ -15,6 +15,10 @@ use skillrunner_core::{
     validator::validate_bundle,
 };
 use skillrunner_manifest::SkillPackage;
+use skillrunner_mcp::{
+    server::{McpServerConfig, run_server},
+    setup::{configure_client, detect_ai_clients, mark_first_run_offered},
+};
 use rusqlite::Connection;
 
 #[derive(Parser)]
@@ -42,6 +46,36 @@ enum Commands {
     Skill {
         #[command(subcommand)]
         command: SkillCommands,
+    },
+    /// MCP server for AI client integration
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpCommands {
+    /// Start the MCP server (stdio transport)
+    Serve {
+        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        #[arg(long)]
+        registry_url: Option<String>,
+        /// Ollama base URL (default: http://localhost:11434)
+        #[arg(long, default_value = "http://localhost:11434")]
+        ollama_url: String,
+        /// Model name to use via Ollama (default: llama3.2)
+        #[arg(long, default_value = "llama3.2")]
+        model: String,
+    },
+    /// Configure SkillRunner as an MCP server for detected AI clients
+    Setup {
+        /// SkillClub registry URL to configure
+        #[arg(long)]
+        registry_url: Option<String>,
+        /// Which client to configure (claude, cursor, all)
+        #[arg(long, default_value = "all")]
+        client: String,
     },
 }
 
@@ -215,6 +249,63 @@ fn main() -> Result<()> {
                     }
                     None => println!("Not logged in at {}", url),
                 }
+            }
+        },
+        Commands::Mcp { command } => match command {
+            McpCommands::Serve { registry_url, ollama_url, model } => {
+                let effective_url = registry_url.or_else(registry_url_from_env);
+                let config = McpServerConfig {
+                    registry_url: effective_url,
+                    ollama_url,
+                    model,
+                };
+                run_server(app.state, config)?;
+            }
+            McpCommands::Setup { registry_url, client } => {
+                let effective_url = registry_url.or_else(registry_url_from_env);
+                let skillrunner_path = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.to_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "skillrunner".to_string());
+
+                let clients = detect_ai_clients(&skillrunner_path);
+                if clients.is_empty() {
+                    println!("No AI clients detected (looked for Claude Code, Cursor).");
+                    return Ok(());
+                }
+
+                for detected in &clients {
+                    let should_configure = match client.as_str() {
+                        "all" => true,
+                        "claude" => detected.name == "Claude Code",
+                        "cursor" => detected.name == "Cursor",
+                        _ => {
+                            println!("Unknown client '{}'. Use: claude, cursor, or all", client);
+                            return Ok(());
+                        }
+                    };
+
+                    if !should_configure {
+                        continue;
+                    }
+
+                    if detected.already_configured {
+                        println!("  {} — already configured ✓", detected.name);
+                        continue;
+                    }
+
+                    match configure_client(detected, &skillrunner_path, &effective_url) {
+                        Ok(()) => println!(
+                            "  {} — configured ✓ ({})",
+                            detected.name,
+                            detected.config_path.display()
+                        ),
+                        Err(e) => println!("  {} — failed: {e}", detected.name),
+                    }
+                }
+
+                mark_first_run_offered(&app.state)?;
+                println!("\nRestart your AI client to activate SkillRunner MCP.");
             }
         },
         Commands::Skill { command } => match command {
