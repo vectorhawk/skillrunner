@@ -209,6 +209,27 @@ fn main() -> Result<()> {
                     println!("Registry:         not configured");
                 }
             }
+
+            // MCP status
+            let skillrunner_path = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| "skillrunner".to_string());
+            let clients = detect_ai_clients(&skillrunner_path);
+            if clients.is_empty() {
+                println!("MCP:              no AI clients detected");
+            } else {
+                for c in &clients {
+                    if c.already_configured {
+                        println!("MCP:              {} — configured ✓", c.name);
+                    } else {
+                        println!(
+                            "MCP:              {} — not configured (run `skillrunner mcp setup`)",
+                            c.name
+                        );
+                    }
+                }
+            }
         }
         Commands::Auth { command } => match command {
             AuthCommands::Login { registry_url, email } => {
