@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 /// A request to generate text from a language model.
+#[derive(Clone)]
 pub struct ModelRequest {
     /// System prompt (instructions / persona).
     pub system_prompt: String,

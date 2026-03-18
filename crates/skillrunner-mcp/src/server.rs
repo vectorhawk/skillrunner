@@ -4,6 +4,7 @@ use crate::{
         ServerInfo, ToolCallParams, ToolsCapability, ToolsListResult, INVALID_PARAMS,
         METHOD_NOT_FOUND,
     },
+    sampling::{HybridModelClient, McpSamplingClient, SharedIo},
     tools::{build_tool_list, handle_tool_call},
 };
 use anyhow::Result;
@@ -14,7 +15,8 @@ use skillrunner_core::{
     registry::{HttpPolicyClient, RegistryClient},
     state::AppState,
 };
-use std::io::{self, BufRead, Write};
+use std::io;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info};
 
 /// Configuration for the MCP server.
@@ -27,39 +29,56 @@ pub struct McpServerConfig {
 /// Run the MCP server over stdio.
 ///
 /// Reads JSON-RPC messages from stdin (one per line) and writes responses to stdout.
-/// Exits when stdin is closed.
+/// When a skill's LLM step needs a model, the server uses a hybrid approach:
+/// try local Ollama first, fall back to MCP `sampling/createMessage` delegation.
+/// Both the server loop and the sampling client share the same stdin/stdout handles.
 pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
+    // Create shared IO for both the server loop and sampling client
+    let shared_io = Arc::new(Mutex::new(SharedIo::new(
+        Box::new(io::stdout()),
+        Box::new(io::BufReader::new(io::stdin())),
+    )));
 
-    let registry_client = config
-        .registry_url
-        .as_ref()
-        .map(RegistryClient::new);
+    let registry_client = config.registry_url.as_ref().map(RegistryClient::new);
 
     let ollama = OllamaClient::new(&config.ollama_url, &config.model);
-
-    // Check if Ollama is available for model calls
     let ollama_available = ollama.health_check().reachable;
-    let model_client: Option<&dyn ModelClient> = if ollama_available {
-        Some(&ollama)
-    } else {
-        None
-    };
+
+    // Create the sampling client (delegates LLM calls to the AI client)
+    let sampling_client = McpSamplingClient::from_shared(Arc::clone(&shared_io));
+
+    // Create the hybrid model client: tries Ollama first, falls back to sampling
+    let hybrid_client = HybridModelClient::new(
+        if ollama_available {
+            Some(&ollama as &dyn ModelClient)
+        } else {
+            None
+        },
+        &sampling_client,
+        ollama_available,
+    );
 
     info!(
         "MCP server starting (ollama={}, registry={})",
-        if ollama_available { "available" } else { "unavailable" },
+        if ollama_available {
+            "available"
+        } else {
+            "unavailable"
+        },
         config.registry_url.as_deref().unwrap_or("none"),
     );
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(e) => {
-                error!("Failed to read stdin: {e}");
-                break;
+    loop {
+        // Read next line from stdin (release lock before dispatching)
+        let line = {
+            let mut io = shared_io.lock().unwrap();
+            match io.read_line() {
+                Ok(l) => l,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => {
+                    error!("Failed to read stdin: {e}");
+                    break;
+                }
             }
         };
 
@@ -76,7 +95,8 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
                     crate::protocol::PARSE_ERROR,
                     format!("Invalid JSON: {e}"),
                 );
-                write_response(&mut stdout, &resp)?;
+                let mut io = shared_io.lock().unwrap();
+                io.write_message(&serde_json::to_string(&resp)?)?;
                 continue;
             }
         };
@@ -85,19 +105,33 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
 
         // Notifications (no id) don't get responses
         if request.id.is_none() {
-            // Handle notifications like "notifications/initialized"
             continue;
         }
 
-        let response = dispatch_request(&request, &state, &config, model_client, registry_client.as_ref());
-        write_response(&mut stdout, &response)?;
+        // Dispatch the request — during tools/call, this may trigger
+        // sampling requests through the shared_io (the lock is not held here)
+        let response = dispatch_request(
+            &request,
+            &state,
+            &config,
+            Some(&hybrid_client),
+            registry_client.as_ref(),
+        );
+
+        // Write response (lock shared_io)
+        {
+            let mut io = shared_io.lock().unwrap();
+            io.write_message(&serde_json::to_string(&response)?)?;
+        }
 
         // After install, notify client that tools list changed
         if request.method == "tools/call" {
             if let Ok(params) = serde_json::from_value::<ToolCallParams>(request.params.clone()) {
                 if params.name == "skillclub_install" {
-                    let notification = JsonRpcNotification::new("notifications/tools/list_changed");
-                    write_notification(&mut stdout, &notification)?;
+                    let notification =
+                        JsonRpcNotification::new("notifications/tools/list_changed");
+                    let mut io = shared_io.lock().unwrap();
+                    io.write_message(&serde_json::to_string(&notification)?)?;
                 }
             }
         }
@@ -211,20 +245,6 @@ fn handle_tools_call(
         request.id.clone(),
         serde_json::to_value(result).unwrap_or_default(),
     )
-}
-
-fn write_response(writer: &mut impl Write, response: &JsonRpcResponse) -> Result<()> {
-    let json = serde_json::to_string(response)?;
-    writeln!(writer, "{json}")?;
-    writer.flush()?;
-    Ok(())
-}
-
-fn write_notification(writer: &mut impl Write, notification: &JsonRpcNotification) -> Result<()> {
-    let json = serde_json::to_string(notification)?;
-    writeln!(writer, "{json}")?;
-    writer.flush()?;
-    Ok(())
 }
 
 #[cfg(test)]

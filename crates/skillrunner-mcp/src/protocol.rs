@@ -11,7 +11,7 @@ pub struct JsonRpcRequest {
     pub params: serde_json::Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct JsonRpcResponse {
     pub jsonrpc: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -22,7 +22,7 @@ pub struct JsonRpcResponse {
     pub error: Option<JsonRpcError>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct JsonRpcError {
     pub code: i64,
     pub message: String,
@@ -163,6 +163,68 @@ impl ToolCallResult {
             is_error: Some(true),
         }
     }
+}
+
+// ── MCP sampling types (server → client LLM delegation) ─────────────────────
+
+/// Request params for `sampling/createMessage` (server asks client to generate).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SamplingCreateMessageParams {
+    pub messages: Vec<SamplingMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    pub max_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_preferences: Option<ModelPreferences>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SamplingMessage {
+    pub role: String,
+    pub content: SamplingContent,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SamplingContent {
+    #[serde(rename = "type")]
+    pub content_type: String,
+    pub text: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPreferences {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hints: Option<Vec<ModelHint>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_priority: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed_priority: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intelligence_priority: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelHint {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// Response from `sampling/createMessage`.
+#[derive(Debug, Deserialize)]
+pub struct SamplingCreateMessageResult {
+    pub role: String,
+    pub content: SamplingResultContent,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SamplingResultContent {
+    #[serde(rename = "type")]
+    pub content_type: String,
+    pub text: String,
 }
 
 // ── JSON-RPC error codes ────────────────────────────────────────────────────
