@@ -348,26 +348,8 @@ impl PolicyClient for HttpPolicyClient {
         let now = unix_now();
         let conn = Connection::open(&self.db_path).context("failed to open state DB")?;
 
-        // 1. Check for a fresh cache entry.
-        let cached: Option<(String, i64)> = conn
-            .query_row(
-                "SELECT policy_json, expires_at FROM policy_cache WHERE skill_id = ?1",
-                [skill_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-
-        if let Some((json, expires_at)) = &cached {
-            if *expires_at as u64 > now {
-                debug!(skill_id, "policy cache hit");
-                let wire: PolicyApiResponse = serde_json::from_str(json)
-                    .context("failed to deserialize cached policy")?;
-                return policy_from_wire(wire);
-            }
-            debug!(skill_id, "policy cache expired, fetching fresh");
-        }
-
-        // 2. Try to fetch from registry.
+        // 1. Always try to fetch fresh from registry first so that policy
+        //    changes (e.g. blocking a skill) take effect immediately.
         match self.registry.fetch_policy_remote(skill_id) {
             Ok((policy, ttl)) => {
                 // Serialize policy back to wire form for cache storage.
@@ -389,20 +371,18 @@ impl PolicyClient for HttpPolicyClient {
                 Ok(policy)
             }
             Err(fetch_err) => {
-                // 3. Fallback: use stale cache within 7-day grace window.
-                if let Some((json, _)) = cached {
-                    let fetched_at: Option<i64> = conn
-                        .query_row(
-                            "SELECT fetched_at FROM policy_cache WHERE skill_id = ?1",
-                            [skill_id],
-                            |row| row.get(0),
-                        )
-                        .optional()?;
+                // 2. Fallback: use cached policy within 7-day offline grace window.
+                let cached = conn
+                    .query_row(
+                        "SELECT policy_json, fetched_at FROM policy_cache WHERE skill_id = ?1",
+                        [skill_id],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .optional()?;
 
+                if let Some((json, fetched_at)) = cached {
                     const GRACE_SECONDS: u64 = 7 * 86400;
-                    let within_grace = fetched_at
-                        .map(|t| now < t as u64 + GRACE_SECONDS)
-                        .unwrap_or(false);
+                    let within_grace = now < fetched_at as u64 + GRACE_SECONDS;
 
                     if within_grace {
                         warn!(
@@ -775,9 +755,10 @@ mod tests {
     // ── HttpPolicyClient: cache behaviour ──────────────────────────────────
 
     #[test]
-    fn http_policy_cache_hit_avoids_network_call() {
+    fn http_policy_always_fetches_fresh_from_network() {
         let mut server = Server::new();
-        // The mock should only be called once.
+        // Both calls should hit the network so that policy changes (e.g.
+        // blocking a skill) are reflected immediately without waiting for TTL.
         let mock = server
             .mock("GET", "/skills/cached-skill/policy")
             .with_status(200)
@@ -789,7 +770,7 @@ mod tests {
                     "policy_ttl_seconds": 86400
                 }"#,
             )
-            .expect(1)
+            .expect(2)
             .create();
 
         let root = temp_root("cache-hit");
@@ -797,15 +778,14 @@ mod tests {
         let registry = RegistryClient::new(server.url());
         let client = HttpPolicyClient::new(registry, &state);
 
-        // First call: populates cache
         let p1 = client.fetch_policy("cached-skill").unwrap();
         assert_eq!(p1.status, PolicyStatus::Active);
 
-        // Second call: should come from cache, no HTTP
+        // Second call also hits the network — picks up any policy changes.
         let p2 = client.fetch_policy("cached-skill").unwrap();
         assert_eq!(p2.status, PolicyStatus::Active);
 
-        mock.assert(); // exactly 1 call
+        mock.assert(); // exactly 2 calls
         let _ = std::fs::remove_dir_all(&root);
     }
 
