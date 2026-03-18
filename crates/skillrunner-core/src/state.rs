@@ -56,6 +56,13 @@ impl AppState {
                 fetched_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS auth_tokens (
+                registry_url TEXT PRIMARY KEY,
+                access_token TEXT NOT NULL,
+                refresh_token TEXT NOT NULL,
+                saved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS execution_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 skill_id TEXT NOT NULL,

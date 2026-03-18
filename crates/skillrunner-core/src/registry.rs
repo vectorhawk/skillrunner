@@ -54,6 +54,16 @@ struct SearchApiResponse {
     items: Vec<SearchResult>,
 }
 
+/// Skill detail returned by `GET /portal/skills/{skill_id}`.
+#[derive(Debug, Deserialize)]
+pub struct SkillDetail {
+    pub skill_id: String,
+    pub name: String,
+    pub latest_version: Option<String>,
+    pub publisher_name: Option<String>,
+    pub description: Option<String>,
+}
+
 // ── RegistryClient ────────────────────────────────────────────────────────────
 
 /// Pure HTTP client for the SkillClub registry.
@@ -63,6 +73,7 @@ struct SearchApiResponse {
 pub struct RegistryClient {
     pub base_url: String,
     http: reqwest::blocking::Client,
+    auth_token: Option<String>,
 }
 
 impl RegistryClient {
@@ -73,7 +84,19 @@ impl RegistryClient {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("HTTP client should build"),
+            auth_token: None,
         }
+    }
+
+    /// Set the Bearer auth token for authenticated requests.
+    pub fn with_auth(mut self, token: impl Into<String>) -> Self {
+        self.auth_token = Some(token.into());
+        self
+    }
+
+    /// Set the auth token on an existing client (non-consuming).
+    pub fn set_auth(&mut self, token: impl Into<String>) {
+        self.auth_token = Some(token.into());
     }
 
     /// Fetch policy from the registry.
@@ -223,6 +246,79 @@ impl RegistryClient {
             .json()
             .context("failed to deserialize search response")?;
         Ok(wire.items)
+    }
+
+    /// Fetch skill detail including latest version info.
+    pub fn fetch_skill_detail(&self, skill_id: &str) -> Result<SkillDetail> {
+        let url = format!(
+            "{}/portal/skills/{}",
+            self.base_url.trim_end_matches('/'),
+            skill_id
+        );
+        debug!(url, "fetching skill detail");
+
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!("registry returned HTTP {status} for skill {skill_id}: {body}");
+        }
+
+        resp.json()
+            .context("failed to deserialize skill detail response")
+    }
+
+    /// Upload a `.cskill` archive to the registry.
+    ///
+    /// Requires auth token to be set via [`with_auth`].
+    pub fn publish_skill(&self, archive_path: &Utf8Path) -> Result<serde_json::Value> {
+        let token = self
+            .auth_token
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("not authenticated; run `skillrunner auth login` first"))?;
+
+        let url = format!(
+            "{}/portal/skills",
+            self.base_url.trim_end_matches('/')
+        );
+        debug!(url, archive = %archive_path, "uploading skill");
+
+        let file_bytes = std::fs::read(archive_path)
+            .with_context(|| format!("failed to read archive {archive_path}"))?;
+
+        let file_name = archive_path
+            .file_name()
+            .unwrap_or("bundle.cskill")
+            .to_string();
+
+        let form = reqwest::blocking::multipart::Form::new().part(
+            "file",
+            reqwest::blocking::multipart::Part::bytes(file_bytes)
+                .file_name(file_name)
+                .mime_str("application/octet-stream")
+                .context("invalid MIME type")?,
+        );
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .multipart(form)
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!("publish failed (HTTP {status}): {body}");
+        }
+
+        resp.json().context("failed to deserialize publish response")
     }
 }
 

@@ -29,8 +29,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 directories = "5"
 rusqlite = { version = "0.31", features = ["bundled"] }
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+reqwest = { version = "0.12", features = ["blocking", "json", "multipart"] }
 tar = "0.4"
 flate2 = "1"
 tempfile = "3"
 urlencoding = "2"
+rpassword = "5"

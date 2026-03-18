@@ -19,3 +19,4 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 rusqlite.workspace = true
+rpassword.workspace = true

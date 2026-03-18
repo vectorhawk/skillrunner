@@ -5,10 +5,11 @@ use crate::{
     state::AppState,
 };
 use anyhow::{Context, Result};
-use camino::Utf8PathBuf;
-use flate2::read::GzDecoder;
+use camino::{Utf8Path, Utf8PathBuf};
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use rusqlite::{Connection, OptionalExtension};
 use semver::Version;
+use sha2::{Digest, Sha256};
 use skillrunner_manifest::SkillPackage;
 use tar::Archive;
 use tracing::info;
@@ -53,6 +54,71 @@ pub fn auto_update_if_needed(
 
     info!(skill_id, version = %target_ver, "auto-update complete");
     Ok(true)
+}
+
+/// Install a skill from the registry by ID.
+///
+/// If `version` is `None`, resolves the latest published version.
+/// Returns the installed version string.
+pub fn install_from_registry(
+    state: &AppState,
+    registry: &RegistryClient,
+    skill_id: &str,
+    version: Option<&str>,
+) -> Result<String> {
+    let version = match version {
+        Some(v) => v.to_string(),
+        None => {
+            let detail = registry
+                .fetch_skill_detail(skill_id)
+                .with_context(|| format!("failed to look up '{skill_id}' in the registry"))?;
+            detail
+                .latest_version
+                .ok_or_else(|| anyhow::anyhow!("skill '{skill_id}' has no published versions"))?
+        }
+    };
+
+    info!(skill_id, version, "installing from registry");
+    download_and_install(state, registry, skill_id, &version)?;
+    Ok(version)
+}
+
+/// Package a skill directory into a `.cskill` tar.gz archive.
+///
+/// Validates the bundle first, then creates the archive in a temp directory.
+/// Returns `(archive_path, sha256_hex)`.
+pub fn package_skill(skill_dir: &Utf8Path) -> Result<(Utf8PathBuf, String)> {
+    let pkg = SkillPackage::load_from_dir(skill_dir)
+        .with_context(|| format!("skill at {skill_dir} failed validation"))?;
+
+    let filename = format!("{}-{}.cskill", pkg.manifest.id, pkg.manifest.version);
+    let archive_path = Utf8PathBuf::from_path_buf(
+        std::env::temp_dir().join(&filename),
+    )
+    .map_err(|_| anyhow::anyhow!("temp dir path is not valid UTF-8"))?;
+
+    let file = std::fs::File::create(&archive_path)
+        .with_context(|| format!("failed to create {archive_path}"))?;
+    let enc = GzEncoder::new(file, Compression::default());
+    let mut tar = tar::Builder::new(enc);
+    tar.append_dir_all(".", skill_dir.as_std_path())
+        .with_context(|| format!("failed to build archive from {skill_dir}"))?;
+    tar.finish().context("failed to finalize archive")?;
+    drop(tar);
+
+    let archive_bytes = std::fs::read(&archive_path)
+        .with_context(|| format!("failed to read archive {archive_path}"))?;
+    let sha = hex::encode(Sha256::digest(&archive_bytes));
+
+    info!(
+        skill_id = %pkg.manifest.id,
+        version = %pkg.manifest.version,
+        path = %archive_path,
+        sha256 = %sha,
+        "packaged skill"
+    );
+
+    Ok((archive_path, sha))
 }
 
 // ── Download + install flow ───────────────────────────────────────────────────

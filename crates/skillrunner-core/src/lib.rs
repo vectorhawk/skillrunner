@@ -1,4 +1,5 @@
 pub mod app;
+pub mod auth;
 pub mod executor;
 pub mod import;
 pub mod install;

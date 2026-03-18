@@ -3,6 +3,7 @@ use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use skillrunner_core::{
     app::SkillRunnerApp,
+    auth::{self, AuthClient},
     executor::run_skill,
     import::import_skill_md,
     install::install_unpacked_skill,
@@ -10,6 +11,7 @@ use skillrunner_core::{
     policy::MockPolicyClient,
     registry::{HttpPolicyClient, RegistryClient},
     resolver::{resolve_skill, ResolveOutcome},
+    updater::{install_from_registry, package_skill},
     validator::validate_bundle,
 };
 use skillrunner_manifest::SkillPackage;
@@ -33,9 +35,38 @@ enum Commands {
         #[arg(long)]
         registry_url: Option<String>,
     },
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
     Skill {
         #[command(subcommand)]
         command: SkillCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthCommands {
+    /// Log in to the SkillClub registry
+    Login {
+        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        #[arg(long)]
+        registry_url: Option<String>,
+        /// Email address
+        #[arg(long)]
+        email: Option<String>,
+    },
+    /// Log out from the SkillClub registry
+    Logout {
+        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        #[arg(long)]
+        registry_url: Option<String>,
+    },
+    /// Show current authentication status
+    Status {
+        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        #[arg(long)]
+        registry_url: Option<String>,
     },
 }
 
@@ -49,7 +80,25 @@ enum SkillCommands {
         registry_url: Option<String>,
     },
     Info { path: Utf8PathBuf },
-    Install { path: Utf8PathBuf },
+    /// Install a skill from a local path or from the registry by ID
+    Install {
+        /// Skill ID (for registry install) or local path to a skill directory
+        skill_ref: String,
+        /// Specific version to install from registry (default: latest)
+        #[arg(long)]
+        version: Option<String>,
+        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        #[arg(long)]
+        registry_url: Option<String>,
+    },
+    /// Publish a skill to the registry
+    Publish {
+        /// Path to the skill directory to publish
+        path: Utf8PathBuf,
+        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        #[arg(long)]
+        registry_url: Option<String>,
+    },
     List,
     Resolve { skill_id: String },
     Run {
@@ -110,12 +159,64 @@ fn main() -> Result<()> {
                         Ok(false) => println!("Registry:         NOT REACHABLE at {}", url),
                         Err(_) => println!("Registry:         NOT REACHABLE at {}", url),
                     }
+
+                    match auth::load_tokens(&app.state, &url) {
+                        Ok(Some(tokens)) => {
+                            let auth_client = AuthClient::new(&url);
+                            match auth_client.me(&tokens.access_token) {
+                                Ok(user) => println!("Auth:             logged in as {} ({})", user.display_name, user.email),
+                                Err(_) => println!("Auth:             token expired (run `skillrunner auth login`)"),
+                            }
+                        }
+                        _ => println!("Auth:             not logged in"),
+                    }
                 }
                 None => {
                     println!("Registry:         not configured");
                 }
             }
         }
+        Commands::Auth { command } => match command {
+            AuthCommands::Login { registry_url, email } => {
+                let url = require_registry_url(registry_url)?;
+
+                let email = match email {
+                    Some(e) => e,
+                    None => {
+                        eprint!("Email: ");
+                        let mut buf = String::new();
+                        std::io::stdin().read_line(&mut buf)?;
+                        buf.trim().to_string()
+                    }
+                };
+
+                let password = rpassword::read_password_from_tty(Some("Password: "))?;
+                let auth_client = AuthClient::new(&url);
+                let tokens = auth_client.login(&email, &password)?;
+                auth::save_tokens(&app.state, &url, &tokens.access_token, &tokens.refresh_token)?;
+
+                let user = auth_client.me(&tokens.access_token)?;
+                println!("Logged in as {} ({}) at {}", user.display_name, user.email, url);
+            }
+            AuthCommands::Logout { registry_url } => {
+                let url = require_registry_url(registry_url)?;
+                auth::clear_tokens(&app.state, &url)?;
+                println!("Logged out from {}", url);
+            }
+            AuthCommands::Status { registry_url } => {
+                let url = require_registry_url(registry_url)?;
+                match auth::load_tokens(&app.state, &url)? {
+                    Some(tokens) => {
+                        let auth_client = AuthClient::new(&url);
+                        match auth_client.me(&tokens.access_token) {
+                            Ok(user) => println!("Logged in as {} ({}) at {}", user.display_name, user.email, url),
+                            Err(_) => println!("Token expired at {}. Run `skillrunner auth login` to re-authenticate.", url),
+                        }
+                    }
+                    None => println!("Not logged in at {}", url),
+                }
+            }
+        },
         Commands::Skill { command } => match command {
             SkillCommands::Import { path } => {
                 let bundle = import_skill_md(&path)?;
@@ -126,12 +227,8 @@ fn main() -> Result<()> {
                 }
             }
             SkillCommands::Search { query, registry_url } => {
-                let effective_url = registry_url
-                    .or_else(registry_url_from_env)
-                    .ok_or_else(|| anyhow::anyhow!(
-                        "no registry URL configured; set SKILLCLUB_REGISTRY_URL or use --registry-url"
-                    ))?;
-                let reg = RegistryClient::new(&effective_url);
+                let url = require_registry_url(registry_url)?;
+                let reg = RegistryClient::new(&url);
                 let results = reg.search_skills(&query)?;
                 if results.is_empty() {
                     println!("No skills found matching '{query}'.");
@@ -158,10 +255,88 @@ fn main() -> Result<()> {
                 println!("entrypoint: {}", skill.manifest.entrypoint);
                 println!("steps: {}", skill.workflow.steps.len());
             }
-            SkillCommands::Install { path } => {
-                let skill = SkillPackage::load_from_dir(path)?;
-                install_unpacked_skill(&app.state, &skill)?;
-                println!("Installed {}@{}", skill.manifest.id, skill.manifest.version);
+            SkillCommands::Install { skill_ref, version, registry_url } => {
+                // Heuristic: if skill_ref looks like a path, install from local dir.
+                let is_local = skill_ref.contains('/')
+                    || skill_ref.starts_with('.')
+                    || std::path::Path::new(&skill_ref).exists();
+
+                if is_local {
+                    let path = Utf8PathBuf::from(&skill_ref);
+                    let skill = SkillPackage::load_from_dir(path)?;
+                    install_unpacked_skill(&app.state, &skill)?;
+                    println!("Installed {}@{}", skill.manifest.id, skill.manifest.version);
+                } else {
+                    let url = require_registry_url(registry_url)?;
+                    let registry = RegistryClient::new(&url);
+                    let installed_ver = install_from_registry(
+                        &app.state,
+                        &registry,
+                        &skill_ref,
+                        version.as_deref(),
+                    )?;
+                    println!("Installed {}@{} from registry", skill_ref, installed_ver);
+                }
+            }
+            SkillCommands::Publish { path, registry_url } => {
+                let url = require_registry_url(registry_url)?;
+                let tokens = auth::load_tokens(&app.state, &url)?
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "not logged in; run `skillrunner auth login --registry-url {url}` first"
+                    ))?;
+
+                let (archive_path, _sha) = package_skill(&path)?;
+                println!("Packaged {}", archive_path);
+
+                let registry = RegistryClient::new(&url).with_auth(&tokens.access_token);
+                match registry.publish_skill(&archive_path) {
+                    Ok(resp) => {
+                        println!("Published successfully!");
+                        if let Some(id) = resp.get("skill_id").and_then(|v| v.as_str()) {
+                            println!("  skill_id: {id}");
+                        }
+                        if let Some(ver) = resp.get("version").and_then(|v| v.as_str()) {
+                            println!("  version:  {ver}");
+                        }
+                    }
+                    Err(e) => {
+                        // Try token refresh before giving up
+                        let auth_client = AuthClient::new(&url);
+                        if let Ok(new_tokens) = auth_client.refresh(&tokens.refresh_token) {
+                            auth::save_tokens(&app.state, &url, &new_tokens.access_token, &new_tokens.refresh_token)?;
+                            let registry = RegistryClient::new(&url).with_auth(&new_tokens.access_token);
+                            let resp = registry.publish_skill(&archive_path)?;
+                            println!("Published successfully!");
+                            if let Some(id) = resp.get("skill_id").and_then(|v| v.as_str()) {
+                                println!("  skill_id: {id}");
+                            }
+                            if let Some(ver) = resp.get("version").and_then(|v| v.as_str()) {
+                                println!("  version:  {ver}");
+                            }
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
+
+                let _ = std::fs::remove_file(&archive_path);
+            }
+            SkillCommands::List => {
+                let conn = Connection::open(&app.state.db_path)?;
+                let mut stmt = conn.prepare(
+                    "SELECT skill_id, active_version, current_status FROM installed_skills ORDER BY skill_id",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (skill_id, version, status) = row?;
+                    println!("{} {} [{}]", skill_id, version, status);
+                }
             }
             SkillCommands::Resolve { skill_id } => {
                 let outcome = if let Some(url) = registry_url_from_env() {
@@ -206,9 +381,6 @@ fn main() -> Result<()> {
                     Some(&ollama)
                 };
 
-                // --registry-url flag takes precedence, then SKILLCLUB_REGISTRY_URL env var.
-                // When a registry URL is available, use HttpPolicyClient (cached + offline grace)
-                // and enable silent auto-update.
                 let effective_url = registry_url.or_else(registry_url_from_env);
                 let result = if let Some(url) = effective_url {
                     let registry = RegistryClient::new(&url);
@@ -251,23 +423,6 @@ fn main() -> Result<()> {
                     anyhow::bail!("one or more validation checks failed");
                 }
             }
-            SkillCommands::List => {
-                let conn = Connection::open(&app.state.db_path)?;
-                let mut stmt = conn.prepare(
-                    "SELECT skill_id, active_version, current_status FROM installed_skills ORDER BY skill_id",
-                )?;
-                let rows = stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?;
-                for row in rows {
-                    let (skill_id, version, status) = row?;
-                    println!("{} {} [{}]", skill_id, version, status);
-                }
-            }
         },
     }
 
@@ -276,4 +431,11 @@ fn main() -> Result<()> {
 
 fn registry_url_from_env() -> Option<String> {
     std::env::var("SKILLCLUB_REGISTRY_URL").ok().filter(|s| !s.is_empty())
+}
+
+fn require_registry_url(flag: Option<String>) -> Result<String> {
+    flag.or_else(registry_url_from_env)
+        .ok_or_else(|| anyhow::anyhow!(
+            "no registry URL configured; set SKILLCLUB_REGISTRY_URL or use --registry-url"
+        ))
 }
