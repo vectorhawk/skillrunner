@@ -6,6 +6,7 @@ use skillrunner_core::{
     auth,
     executor::run_skill,
     import::import_skill_md,
+    install::install_unpacked_skill,
     model::ModelClient,
     policy::PolicyClient,
     registry::RegistryClient,
@@ -82,6 +83,30 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
         }),
     });
 
+    // Install tool is always available (supports both local paths and registry)
+    tools.push(ToolDefinition {
+        name: "skillclub_install".to_string(),
+        description: "Install a skill from a local path or from the SkillClub registry by its ID.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "skill_id": {
+                    "type": "string",
+                    "description": "The ID of the skill to install from the registry (use this OR path, not both)"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Local path to a skill bundle directory to install (use this OR skill_id, not both)"
+                },
+                "version": {
+                    "type": "string",
+                    "description": "Optional specific version to install from registry (default: latest)"
+                }
+            },
+            "required": []
+        }),
+    });
+
     if registry_url.is_some() {
         tools.push(ToolDefinition {
             name: "skillclub_search".to_string(),
@@ -95,25 +120,6 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
                     }
                 },
                 "required": ["query"]
-            }),
-        });
-
-        tools.push(ToolDefinition {
-            name: "skillclub_install".to_string(),
-            description: "Install a skill from the SkillClub registry by its ID.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "skill_id": {
-                        "type": "string",
-                        "description": "The ID of the skill to install from the registry"
-                    },
-                    "version": {
-                        "type": "string",
-                        "description": "Optional specific version to install (default: latest)"
-                    }
-                },
-                "required": ["skill_id"]
             }),
         });
 
@@ -302,26 +308,43 @@ fn handle_install(
     state: &AppState,
     registry_url: &Option<String>,
 ) -> ToolCallResult {
-    let url = match registry_url {
-        Some(u) => u,
-        None => return ToolCallResult::error("No registry URL configured"),
-    };
+    let path = arguments.get("path").and_then(|v| v.as_str());
+    let skill_id = arguments.get("skill_id").and_then(|v| v.as_str());
 
-    let skill_id = match arguments.get("skill_id").and_then(|v| v.as_str()) {
-        Some(id) => id,
-        None => return ToolCallResult::error("Missing required parameter: skill_id"),
-    };
-
-    let version = arguments
-        .get("version")
-        .and_then(|v| v.as_str());
-
-    let registry = RegistryClient::new(url);
-    match install_from_registry(state, &registry, skill_id, version) {
-        Ok(installed_ver) => ToolCallResult::success(format!(
-            "Successfully installed {skill_id}@{installed_ver} from registry."
-        )),
-        Err(e) => ToolCallResult::error(format!("Failed to install {skill_id}: {e}")),
+    match (path, skill_id) {
+        // Local path install
+        (Some(local_path), _) => {
+            let utf8_path = camino::Utf8Path::new(local_path);
+            let pkg = match SkillPackage::load_from_dir(utf8_path) {
+                Ok(p) => p,
+                Err(e) => return ToolCallResult::error(format!("Failed to load skill bundle at {local_path}: {e}")),
+            };
+            let id = pkg.manifest.id.clone();
+            let ver = pkg.manifest.version.to_string();
+            match install_unpacked_skill(state, &pkg) {
+                Ok(_) => ToolCallResult::success(format!(
+                    "Successfully installed {id}@{ver} from local path."
+                )),
+                Err(e) => ToolCallResult::error(format!("Failed to install {id}: {e}")),
+            }
+        }
+        // Registry install
+        (None, Some(id)) => {
+            let url = match registry_url {
+                Some(u) => u,
+                None => return ToolCallResult::error("No registry URL configured. Provide a local 'path' instead."),
+            };
+            let version = arguments.get("version").and_then(|v| v.as_str());
+            let registry = RegistryClient::new(url);
+            match install_from_registry(state, &registry, id, version) {
+                Ok(installed_ver) => ToolCallResult::success(format!(
+                    "Successfully installed {id}@{installed_ver} from registry."
+                )),
+                Err(e) => ToolCallResult::error(format!("Failed to install {id}: {e}")),
+            }
+        }
+        // Neither provided
+        (None, None) => ToolCallResult::error("Provide either 'path' (local install) or 'skill_id' (registry install)"),
     }
 }
 
@@ -661,8 +684,8 @@ mod tests {
         assert!(names.contains(&"skillclub_list"));
         assert!(names.contains(&"skillclub_author"));
         assert!(names.contains(&"skillclub_validate"));
+        assert!(names.contains(&"skillclub_install")); // install always available (supports local paths)
         assert!(!names.contains(&"skillclub_search"));
-        assert!(!names.contains(&"skillclub_install"));
         assert!(!names.contains(&"skillclub_publish"));
 
         let _ = fs::remove_dir_all(&state_root);
@@ -741,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_install_requires_skill_id() {
+    fn handle_install_requires_path_or_skill_id() {
         let state_root = temp_root("handle-install-no-id");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
 
@@ -751,7 +774,48 @@ mod tests {
             &Some("http://localhost:8000".to_string()),
         );
         assert_eq!(result.is_error, Some(true));
-        assert!(result.content[0].text.contains("skill_id"));
+        assert!(result.content[0].text.contains("path") || result.content[0].text.contains("skill_id"));
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_install_local_path() {
+        let state_root = temp_root("handle-install-local");
+        let skill_root = temp_root("handle-install-local-skill");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        write_test_skill(&skill_root);
+
+        let result = handle_install(
+            &serde_json::json!({"path": skill_root.as_str()}),
+            &state,
+            &None, // no registry needed for local install
+        );
+        assert!(result.is_error.is_none(), "got: {:?}", result.content[0].text);
+        assert!(result.content[0].text.contains("test-skill"));
+        assert!(result.content[0].text.contains("0.1.0"));
+
+        // Verify the skill appears in the list
+        let list_result = handle_list(&state);
+        assert!(list_result.content[0].text.contains("test-skill"));
+
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    #[test]
+    fn handle_install_registry_requires_url() {
+        let state_root = temp_root("handle-install-no-reg");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let result = handle_install(
+            &serde_json::json!({"skill_id": "some-skill"}),
+            &state,
+            &None,
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("registry"));
 
         let _ = fs::remove_dir_all(&state_root);
     }
