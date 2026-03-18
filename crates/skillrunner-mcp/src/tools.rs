@@ -1,13 +1,17 @@
 use crate::protocol::{ToolCallResult, ToolDefinition};
 use anyhow::Result;
+use camino::Utf8PathBuf;
 use rusqlite::Connection;
 use skillrunner_core::{
+    auth,
     executor::run_skill,
+    import::import_skill_md,
     model::ModelClient,
     policy::PolicyClient,
     registry::RegistryClient,
     state::AppState,
-    updater::install_from_registry,
+    updater::{install_from_registry, package_skill},
+    validator::validate_bundle,
 };
 use skillrunner_manifest::SkillPackage;
 use std::fs;
@@ -32,6 +36,49 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
             "type": "object",
             "properties": {},
             "required": []
+        }),
+    });
+
+    // Authoring tools (always available)
+    tools.push(ToolDefinition {
+        name: "skillclub_author".to_string(),
+        description: "Create a new SkillClub skill from a name, description, and system prompt. Scaffolds a complete skill bundle directory.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Human-readable name for the skill (e.g., 'Contract Compare')"
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Brief description of what the skill does"
+                },
+                "system_prompt": {
+                    "type": "string",
+                    "description": "The system prompt that defines the skill's behavior"
+                },
+                "output_dir": {
+                    "type": "string",
+                    "description": "Directory to create the skill bundle in (default: current directory)"
+                }
+            },
+            "required": ["name", "description", "system_prompt"]
+        }),
+    });
+
+    tools.push(ToolDefinition {
+        name: "skillclub_validate".to_string(),
+        description: "Validate a SkillClub skill bundle directory. Checks manifest, workflow, schemas, and file references.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the skill bundle directory to validate"
+                }
+            },
+            "required": ["path"]
         }),
     });
 
@@ -67,6 +114,21 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
                     }
                 },
                 "required": ["skill_id"]
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "skillclub_publish".to_string(),
+            description: "Package and publish a skill bundle to the SkillClub registry. Requires authentication.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the skill bundle directory to publish"
+                    }
+                },
+                "required": ["path"]
             }),
         });
 
@@ -151,6 +213,9 @@ pub fn handle_tool_call(
         "skillclub_search" => handle_search(arguments, registry_url),
         "skillclub_install" => handle_install(arguments, state, registry_url),
         "skillclub_info" => handle_info(arguments, state),
+        "skillclub_author" => handle_author(arguments),
+        "skillclub_validate" => handle_validate(arguments),
+        "skillclub_publish" => handle_publish(arguments, state, registry_url),
         _ => handle_skill_run(name, arguments, state, policy_client, model_client, registry_client),
     }
 }
@@ -317,6 +382,164 @@ fn handle_info(arguments: &serde_json::Value, state: &AppState) -> ToolCallResul
     }
 }
 
+// ── Authoring tool handlers ──────────────────────────────────────────────────
+
+fn handle_author(arguments: &serde_json::Value) -> ToolCallResult {
+    let name = match arguments.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return ToolCallResult::error("Missing required parameter: name"),
+    };
+
+    let description = match arguments.get("description").and_then(|v| v.as_str()) {
+        Some(d) => d,
+        None => return ToolCallResult::error("Missing required parameter: description"),
+    };
+
+    let system_prompt = match arguments.get("system_prompt").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return ToolCallResult::error("Missing required parameter: system_prompt"),
+    };
+
+    let output_dir = arguments
+        .get("output_dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or(".");
+
+    // Build SKILL.md content
+    let skill_md = format!(
+        "---\nname: {name}\ndescription: {description}\n---\n\n{system_prompt}\n"
+    );
+
+    // Derive skill ID for the subdirectory name
+    let skill_id: String = name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+
+    let skill_dir = Utf8PathBuf::from(output_dir).join(&skill_id);
+
+    // Create directory and write SKILL.md
+    if let Err(e) = fs::create_dir_all(&skill_dir) {
+        return ToolCallResult::error(format!("Failed to create directory {skill_dir}: {e}"));
+    }
+
+    let skill_md_path = skill_dir.join("SKILL.md");
+    if let Err(e) = fs::write(&skill_md_path, &skill_md) {
+        return ToolCallResult::error(format!("Failed to write SKILL.md: {e}"));
+    }
+
+    // Import SKILL.md to scaffold the full bundle
+    match import_skill_md(&skill_md_path) {
+        Ok(bundle) => {
+            let files: Vec<&str> = bundle.files.iter().map(|f| f.as_str()).collect();
+            let result = serde_json::json!({
+                "skill_id": bundle.id,
+                "output_dir": bundle.output_dir.to_string(),
+                "files": files,
+                "message": format!(
+                    "Created skill '{}' at {}. You can test it with: skillrunner skill validate {}",
+                    bundle.id, bundle.output_dir, bundle.output_dir
+                ),
+            });
+            match serde_json::to_string_pretty(&result) {
+                Ok(text) => ToolCallResult::success(text),
+                Err(e) => ToolCallResult::error(format!("Failed to serialize result: {e}")),
+            }
+        }
+        Err(e) => ToolCallResult::error(format!("Failed to scaffold skill bundle: {e}")),
+    }
+}
+
+fn handle_validate(arguments: &serde_json::Value) -> ToolCallResult {
+    let path = match arguments.get("path").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return ToolCallResult::error("Missing required parameter: path"),
+    };
+
+    let utf8_path = camino::Utf8Path::new(path);
+    let report = validate_bundle(utf8_path);
+
+    let checks: Vec<serde_json::Value> = report
+        .checks
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "name": c.name,
+                "passed": c.passed,
+                "detail": c.detail,
+            })
+        })
+        .collect();
+
+    let result = serde_json::json!({
+        "all_passed": report.all_passed(),
+        "checks": checks,
+    });
+
+    match serde_json::to_string_pretty(&result) {
+        Ok(text) => ToolCallResult::success(text),
+        Err(e) => ToolCallResult::error(format!("Failed to serialize: {e}")),
+    }
+}
+
+fn handle_publish(
+    arguments: &serde_json::Value,
+    state: &AppState,
+    registry_url: &Option<String>,
+) -> ToolCallResult {
+    let url = match registry_url {
+        Some(u) => u,
+        None => return ToolCallResult::error("No registry URL configured"),
+    };
+
+    let path = match arguments.get("path").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return ToolCallResult::error("Missing required parameter: path"),
+    };
+
+    // Check auth
+    let tokens = match auth::load_tokens(state, url) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return ToolCallResult::error(
+                "Not logged in. Run `skillrunner auth login` first.",
+            )
+        }
+        Err(e) => return ToolCallResult::error(format!("Failed to load auth tokens: {e}")),
+    };
+
+    // Package the skill
+    let utf8_path = camino::Utf8Path::new(path);
+    let (archive_path, _sha) = match package_skill(utf8_path) {
+        Ok(r) => r,
+        Err(e) => return ToolCallResult::error(format!("Failed to package skill: {e}")),
+    };
+
+    // Publish to registry
+    let registry = RegistryClient::new(url).with_auth(&tokens.access_token);
+    let result = match registry.publish_skill(&archive_path) {
+        Ok(resp) => {
+            // Clean up archive
+            let _ = fs::remove_file(&archive_path);
+
+            let skill_id = resp.get("skill_id").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let version = resp.get("version").and_then(|v| v.as_str()).unwrap_or("unknown");
+            format!("Published {skill_id}@{version} to registry successfully.")
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&archive_path);
+            return ToolCallResult::error(format!("Failed to publish: {e}"));
+        }
+    };
+
+    ToolCallResult::success(result)
+}
+
 // ── Skill execution handler ──────────────────────────────────────────────────
 
 fn handle_skill_run(
@@ -420,6 +643,9 @@ mod tests {
         assert!(names.contains(&"skillclub_search"));
         assert!(names.contains(&"skillclub_install"));
         assert!(names.contains(&"skillclub_info"));
+        assert!(names.contains(&"skillclub_author"));
+        assert!(names.contains(&"skillclub_validate"));
+        assert!(names.contains(&"skillclub_publish"));
 
         let _ = fs::remove_dir_all(&state_root);
     }
@@ -433,8 +659,11 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
         assert!(names.contains(&"skillclub_list"));
+        assert!(names.contains(&"skillclub_author"));
+        assert!(names.contains(&"skillclub_validate"));
         assert!(!names.contains(&"skillclub_search"));
         assert!(!names.contains(&"skillclub_install"));
+        assert!(!names.contains(&"skillclub_publish"));
 
         let _ = fs::remove_dir_all(&state_root);
     }
@@ -557,6 +786,145 @@ mod tests {
 
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    // ── Authoring tool tests ──────────────────────────────────────────────
+
+    #[test]
+    fn handle_author_creates_skill_bundle() {
+        let out_dir = temp_root("author-ok");
+        fs::create_dir_all(&out_dir).unwrap();
+
+        let result = handle_author(&serde_json::json!({
+            "name": "My Test Skill",
+            "description": "Does something useful",
+            "system_prompt": "You are a helpful assistant.",
+            "output_dir": out_dir.as_str(),
+        }));
+
+        assert!(result.is_error.is_none(), "got: {:?}", result.content[0].text);
+        let text = &result.content[0].text;
+        assert!(text.contains("my-test-skill"), "got: {text}");
+
+        // Verify bundle files were created
+        let skill_dir = out_dir.join("my-test-skill");
+        assert!(skill_dir.join("manifest.json").exists());
+        assert!(skill_dir.join("workflow.yaml").exists());
+        assert!(skill_dir.join("prompts/system.txt").exists());
+        assert!(skill_dir.join("schemas/input.schema.json").exists());
+
+        // Verify system prompt content
+        let prompt = fs::read_to_string(skill_dir.join("prompts/system.txt")).unwrap();
+        assert!(prompt.contains("You are a helpful assistant."));
+
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn handle_author_requires_name() {
+        let result = handle_author(&serde_json::json!({
+            "description": "test",
+            "system_prompt": "test",
+        }));
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("name"));
+    }
+
+    #[test]
+    fn handle_author_requires_system_prompt() {
+        let result = handle_author(&serde_json::json!({
+            "name": "test",
+            "description": "test",
+        }));
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("system_prompt"));
+    }
+
+    #[test]
+    fn handle_validate_passes_valid_bundle() {
+        let skill_root = temp_root("validate-ok");
+        write_test_skill(&skill_root);
+
+        let result = handle_validate(&serde_json::json!({
+            "path": skill_root.as_str(),
+        }));
+        assert!(result.is_error.is_none());
+        let text = &result.content[0].text;
+        assert!(text.contains("\"all_passed\": true"), "got: {text}");
+
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    #[test]
+    fn handle_validate_fails_invalid_bundle() {
+        let skill_root = temp_root("validate-bad");
+        fs::create_dir_all(&skill_root).unwrap();
+        // Empty directory — no manifest.json
+        fs::write(skill_root.join("something.txt"), "not a skill").unwrap();
+
+        let result = handle_validate(&serde_json::json!({
+            "path": skill_root.as_str(),
+        }));
+        assert!(result.is_error.is_none()); // Returns validation report, not error
+        let text = &result.content[0].text;
+        assert!(text.contains("\"all_passed\": false"), "got: {text}");
+
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    #[test]
+    fn handle_validate_requires_path() {
+        let result = handle_validate(&serde_json::json!({}));
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("path"));
+    }
+
+    #[test]
+    fn handle_publish_requires_registry() {
+        let state_root = temp_root("publish-no-reg");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let result = handle_publish(
+            &serde_json::json!({"path": "/tmp/fake"}),
+            &state,
+            &None,
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("registry"));
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_publish_requires_path() {
+        let state_root = temp_root("publish-no-path");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let result = handle_publish(
+            &serde_json::json!({}),
+            &state,
+            &Some("http://localhost:8000".to_string()),
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("path"));
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_publish_requires_auth() {
+        let state_root = temp_root("publish-no-auth");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let result = handle_publish(
+            &serde_json::json!({"path": "/tmp/fake"}),
+            &state,
+            &Some("http://localhost:8000".to_string()),
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("Not logged in"));
+
+        let _ = fs::remove_dir_all(&state_root);
     }
 
     #[test]
