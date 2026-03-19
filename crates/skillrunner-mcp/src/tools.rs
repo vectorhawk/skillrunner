@@ -3,7 +3,7 @@ use anyhow::Result;
 use camino::Utf8PathBuf;
 use rusqlite::Connection;
 use skillrunner_core::{
-    auth,
+    auth::{self, AuthClient},
     executor::run_skill,
     import::import_skill_md,
     install::install_unpacked_skill,
@@ -17,6 +17,7 @@ use skillrunner_core::{
 };
 use skillrunner_manifest::SkillPackage;
 use std::fs;
+use tracing::debug;
 
 // ── Tool registry ────────────────────────────────────────────────────────────
 
@@ -626,6 +627,69 @@ fn handle_publish(
     ToolCallResult::success(result)
 }
 
+// ── Auth helper with refresh + elicitation fallback ──────────────────────────
+
+/// Attempt to get a valid access token. On failure, returns an elicitation-style
+/// error message that prompts the user to authenticate.
+///
+/// Flow:
+/// 1. Load stored tokens
+/// 2. If tokens exist, return the access token (caller will handle 401 retry)
+/// 3. If no tokens, return an elicitation prompt
+fn ensure_auth(state: &AppState, registry_url: &str) -> std::result::Result<String, ToolCallResult> {
+    match auth::load_tokens(state, registry_url) {
+        Ok(Some(tokens)) => Ok(tokens.access_token),
+        Ok(None) => Err(auth_elicitation_prompt(registry_url)),
+        Err(e) => Err(ToolCallResult::error(format!("Failed to load auth tokens: {e}"))),
+    }
+}
+
+/// When a 401 is encountered, attempt a token refresh. If refresh succeeds,
+/// save the new tokens and return the new access token. If refresh fails,
+/// return an elicitation prompt.
+fn try_refresh_auth(
+    state: &AppState,
+    registry_url: &str,
+    refresh_token: &str,
+) -> std::result::Result<String, ToolCallResult> {
+    debug!("access token expired, attempting refresh");
+
+    let auth_client = AuthClient::new(registry_url);
+    match auth_client.refresh(refresh_token) {
+        Ok(new_tokens) => {
+            // Save refreshed tokens
+            if let Err(e) = auth::save_tokens(
+                state,
+                registry_url,
+                &new_tokens.access_token,
+                &new_tokens.refresh_token,
+            ) {
+                debug!("failed to save refreshed tokens: {e}");
+            }
+            Ok(new_tokens.access_token)
+        }
+        Err(_) => {
+            // Refresh failed — clear stale tokens and prompt re-auth
+            let _ = auth::clear_tokens(state, registry_url);
+            Err(auth_elicitation_prompt(registry_url))
+        }
+    }
+}
+
+/// Build an elicitation-style prompt that asks the user to authenticate.
+/// Includes both the MCP elicitation format (for clients that support it)
+/// and a CLI fallback instruction.
+fn auth_elicitation_prompt(registry_url: &str) -> ToolCallResult {
+    ToolCallResult::error(format!(
+        "Authentication required.\n\n\
+        To authenticate, please run:\n\
+        ```\n\
+        skillrunner auth login --registry-url {registry_url}\n\
+        ```\n\n\
+        After logging in, retry this command."
+    ))
+}
+
 // ── MCP Governance tool handlers ──────────────────────────────────────────────
 
 fn handle_mcp_catalog(state: &AppState, registry_url: &Option<String>) -> ToolCallResult {
@@ -707,26 +771,37 @@ fn handle_mcp_request(
 
     let package_source = arguments.get("package_source").and_then(|v| v.as_str());
 
-    // Check auth first
-    let tokens = match auth::load_tokens(state, url) {
-        Ok(Some(t)) => t,
-        Ok(None) => {
-            return ToolCallResult::error(
-                "Not logged in. Run `skillrunner auth login` first to submit MCP server requests.",
-            )
-        }
-        Err(e) => return ToolCallResult::error(format!("Failed to load auth tokens: {e}")),
+    // Ensure auth with refresh fallback
+    let access_token = match ensure_auth(state, url) {
+        Ok(t) => t,
+        Err(e) => return e,
     };
 
     // Submit request to registry
     let registry = RegistryClient::new(url);
-    let result = match registry.submit_mcp_request(
-        server_name,
-        package_source,
-        &tokens.access_token,
-    ) {
+    let result = match registry.submit_mcp_request(server_name, package_source, &access_token) {
         Ok(v) => v,
-        Err(e) => return ToolCallResult::error(format!("Failed to submit request: {e}")),
+        Err(e) => {
+            // On auth failure, try refresh
+            let err_str = e.to_string();
+            if err_str.contains("401") || err_str.contains("Unauthorized") {
+                let refresh_token = match auth::load_tokens(state, url) {
+                    Ok(Some(t)) => t.refresh_token,
+                    _ => return auth_elicitation_prompt(url),
+                };
+                let new_token = match try_refresh_auth(state, url, &refresh_token) {
+                    Ok(t) => t,
+                    Err(e) => return e,
+                };
+                // Retry with refreshed token
+                match registry.submit_mcp_request(server_name, package_source, &new_token) {
+                    Ok(v) => v,
+                    Err(e) => return ToolCallResult::error(format!("Failed to submit request: {e}")),
+                }
+            } else {
+                return ToolCallResult::error(format!("Failed to submit request: {e}"));
+            }
+        }
     };
 
     let req_status = result
@@ -772,20 +847,35 @@ fn handle_mcp_status(state: &AppState, registry_url: &Option<String>) -> ToolCal
         None => return ToolCallResult::error("No registry URL configured"),
     };
 
-    let tokens = match auth::load_tokens(state, url) {
-        Ok(Some(t)) => t,
-        Ok(None) => {
-            return ToolCallResult::error(
-                "Not logged in. Run `skillrunner auth login` first to check request status.",
-            )
-        }
-        Err(e) => return ToolCallResult::error(format!("Failed to load auth tokens: {e}")),
+    // Ensure auth with refresh fallback
+    let access_token = match ensure_auth(state, url) {
+        Ok(t) => t,
+        Err(e) => return e,
     };
 
     let registry = RegistryClient::new(url);
-    let result = match registry.list_mcp_requests(&tokens.access_token) {
+    let result = match registry.list_mcp_requests(&access_token) {
         Ok(v) => v,
-        Err(e) => return ToolCallResult::error(format!("Failed to fetch requests: {e}")),
+        Err(e) => {
+            // On auth failure, try refresh
+            let err_str = e.to_string();
+            if err_str.contains("401") || err_str.contains("Unauthorized") {
+                let refresh_token = match auth::load_tokens(state, url) {
+                    Ok(Some(t)) => t.refresh_token,
+                    _ => return auth_elicitation_prompt(url),
+                };
+                let new_token = match try_refresh_auth(state, url, &refresh_token) {
+                    Ok(t) => t,
+                    Err(e) => return e,
+                };
+                match registry.list_mcp_requests(&new_token) {
+                    Ok(v) => v,
+                    Err(e) => return ToolCallResult::error(format!("Failed to fetch requests: {e}")),
+                }
+            } else {
+                return ToolCallResult::error(format!("Failed to fetch requests: {e}"));
+            }
+        }
     };
 
     let items = result
