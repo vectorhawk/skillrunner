@@ -1,0 +1,27 @@
+{
+  "schema_version": "1.0",
+  "id": "code-review",
+  "name": "Code Review",
+  "version": "0.1.0",
+  "publisher": "skillclub",
+  "description": "Perform structured code reviews with security, performance, and maintainability checks. Returns actionable findings with severity levels.",
+  "triggers": ["review this code","check for bugs","code quality check","review my pull request"],
+  "offload_eligible": true,
+  "entrypoint": "workflow.yaml",
+  "inputs_schema": "schemas/input.schema.json",
+  "outputs_schema": "schemas/output.schema.json",
+  "permissions": {
+    "filesystem": "none",
+    "network": "none",
+    "clipboard": false
+  },
+  "execution": {
+    "sandbox_profile": "strict",
+    "timeout_seconds": 120,
+    "memory_mb": 512
+  },
+  "update": {
+    "channel": "stable",
+    "auto_update": true
+  }
+}

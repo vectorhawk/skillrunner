@@ -666,4 +666,156 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn submit_mcp_request_sends_correct_payload() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/portal/mcp/requests")
+            .match_header("authorization", "Bearer test-token")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "id": "req-123",
+                "server_name": "slack-mcp",
+                "status": "approved",
+                "reviewed_by": "system/auto-approve"
+            }"#)
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        let result = client
+            .submit_mcp_request("slack-mcp", Some("@modelcontextprotocol/server-slack"), "test-token")
+            .unwrap();
+
+        assert_eq!(result["status"].as_str().unwrap(), "approved");
+        assert_eq!(result["server_name"].as_str().unwrap(), "slack-mcp");
+        mock.assert();
+    }
+
+    #[test]
+    fn submit_mcp_request_returns_error_on_401() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/portal/mcp/requests")
+            .with_status(401)
+            .with_body(r#"{"detail":"Unauthorized"}"#)
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        let err = client
+            .submit_mcp_request("test", None, "bad-token")
+            .unwrap_err();
+
+        assert!(err.to_string().contains("401"));
+        mock.assert();
+    }
+
+    #[test]
+    fn list_mcp_requests_parses_response() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/portal/mcp/requests")
+            .match_header("authorization", "Bearer user-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "items": [
+                    {"id": "r1", "server_name": "github", "status": "approved"},
+                    {"id": "r2", "server_name": "slack", "status": "pending"}
+                ],
+                "total": 2
+            }"#)
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        let result = client.list_mcp_requests("user-token").unwrap();
+
+        let items = result["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["status"].as_str().unwrap(), "approved");
+        assert_eq!(items[1]["status"].as_str().unwrap(), "pending");
+        mock.assert();
+    }
+
+    #[test]
+    fn upload_audit_batch_sends_events() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/api/runner/mcp-audit")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"created": 2}"#)
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        let events = vec![
+            serde_json::json!({"event_type": "server_accessed", "server_name": "github"}),
+            serde_json::json!({"event_type": "tool_called", "tool_name": "read_file"}),
+        ];
+
+        client.upload_audit_batch(&events).unwrap();
+        mock.assert();
+    }
+
+    #[test]
+    fn upload_audit_batch_returns_error_on_failure() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/api/runner/mcp-audit")
+            .with_status(500)
+            .with_body("Internal Server Error")
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        let err = client
+            .upload_audit_batch(&[serde_json::json!({"event_type": "test"})])
+            .unwrap_err();
+
+        assert!(err.to_string().contains("500"));
+        mock.assert();
+    }
+
+    #[test]
+    fn fetch_mcp_servers_returns_error_on_network_failure() {
+        let client = RegistryClient::new("http://127.0.0.1:1".to_string());
+        let err = client.fetch_mcp_servers().unwrap_err();
+        assert!(err.to_string().contains("failed to reach registry"));
+    }
+
+    #[test]
+    fn sync_falls_back_to_cache_on_network_failure() {
+        let root = temp_root("sync-cache-fallback");
+        let state = AppState::bootstrap_in(root.clone()).unwrap();
+
+        // Pre-populate cache
+        let cached_response = McpServersResponse {
+            approval_mode: "catalog_only".to_string(),
+            servers: vec![McpServerEntry {
+                name: "cached-server".to_string(),
+                package_source: "cached-pkg".to_string(),
+                version_pin: None,
+                status: "approved".to_string(),
+                credential_note: None,
+                server_config: None,
+            }],
+        };
+        cache_mcp_config(&state, &cached_response).unwrap();
+
+        // Use unreachable registry — should fall back to cache
+        let registry = RegistryClient::new("http://127.0.0.1:1".to_string());
+        let result = sync_mcp_config(
+            &state,
+            &registry,
+            "/usr/local/bin/skillrunner",
+            "http://127.0.0.1:1",
+            true, // dry run
+        )
+        .unwrap();
+
+        assert_eq!(result.servers_synced, 1);
+        assert_eq!(result.approval_mode, "catalog_only");
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }
