@@ -257,7 +257,7 @@ pub fn handle_tool_call(
     registry_client: Option<&RegistryClient>,
     registry_url: &Option<String>,
 ) -> ToolCallResult {
-    match name {
+    let result = match name {
         "skillclub_list" => handle_list(state),
         "skillclub_search" => handle_search(arguments, registry_url),
         "skillclub_install" => handle_install(arguments, state, registry_url),
@@ -269,7 +269,24 @@ pub fn handle_tool_call(
         "skillclub_mcp_request" => handle_mcp_request(arguments, state, registry_url),
         "skillclub_mcp_status" => handle_mcp_status(state, registry_url),
         _ => handle_skill_run(name, arguments, state, policy_client, model_client, registry_client),
+    };
+
+    // Buffer audit event for tool calls (best-effort, don't fail the call)
+    if !name.starts_with("skillclub_list") && !name.starts_with("skillclub_info") {
+        let event = mcp_governance::AuditEvent {
+            server_name: None,
+            user_id: None,
+            user_email: None,
+            machine_id: None,
+            event_type: "tool_called".to_string(),
+            tool_name: Some(name.to_string()),
+            metadata: None,
+            org_id: "default".to_string(),
+        };
+        let _ = mcp_governance::buffer_audit_event(state, &event);
     }
+
+    result
 }
 
 // ── Management tool handlers ─────────────────────────────────────────────────

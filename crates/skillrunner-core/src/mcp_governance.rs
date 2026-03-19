@@ -247,6 +247,13 @@ pub fn sync_mcp_config(
         info!(path = config_path, servers = servers_synced, "wrote managed-mcp.json");
     }
 
+    // Flush audit buffer on each sync
+    match flush_audit_buffer(state, registry) {
+        Ok(n) if n > 0 => info!(count = n, "flushed audit events during sync"),
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "failed to flush audit buffer during sync"),
+    }
+
     Ok(SyncResult {
         servers_synced,
         servers_blocked,
@@ -326,6 +333,124 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after Unix epoch")
         .as_secs()
+}
+
+// ── Audit buffer ─────────────────────────────────────────────────────────────
+
+/// A single audit event to be buffered locally and batch-uploaded.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AuditEvent {
+    pub server_name: Option<String>,
+    pub user_id: Option<String>,
+    pub user_email: Option<String>,
+    pub machine_id: Option<String>,
+    pub event_type: String,
+    pub tool_name: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+    pub org_id: String,
+}
+
+fn ensure_audit_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS mcp_audit_buffer (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )",
+    )?;
+    Ok(())
+}
+
+/// Buffer an audit event in local SQLite.
+pub fn buffer_audit_event(state: &AppState, event: &AuditEvent) -> Result<()> {
+    let conn = Connection::open(&state.db_path)?;
+    ensure_audit_table(&conn)?;
+
+    let json = serde_json::to_string(event)?;
+    let now = unix_now();
+
+    conn.execute(
+        "INSERT INTO mcp_audit_buffer (event_json, created_at) VALUES (?1, ?2)",
+        params![json, now as i64],
+    )?;
+
+    debug!(event_type = %event.event_type, "buffered audit event");
+    Ok(())
+}
+
+/// Flush buffered audit events to the registry. Returns count of events uploaded.
+pub fn flush_audit_buffer(state: &AppState, registry: &RegistryClient) -> Result<usize> {
+    let conn = Connection::open(&state.db_path)?;
+    ensure_audit_table(&conn)?;
+
+    // Read all buffered events
+    let mut stmt = conn.prepare(
+        "SELECT id, event_json FROM mcp_audit_buffer ORDER BY id ASC LIMIT 500",
+    )?;
+    let rows: Vec<(i64, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let mut events: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
+    let mut ids: Vec<i64> = Vec::with_capacity(rows.len());
+
+    for (id, json) in &rows {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(json) {
+            events.push(val);
+            ids.push(*id);
+        }
+    }
+
+    if events.is_empty() {
+        return Ok(0);
+    }
+
+    // Upload to registry
+    registry.upload_audit_batch(&events)?;
+
+    // Delete uploaded events
+    let placeholders: String = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("DELETE FROM mcp_audit_buffer WHERE id IN ({placeholders})");
+    let params: Vec<Box<dyn rusqlite::types::ToSql>> = ids
+        .iter()
+        .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
+        .collect();
+    conn.execute(&sql, rusqlite::params_from_iter(params.iter().map(|b| b.as_ref())))?;
+
+    info!(count = ids.len(), "flushed audit events to registry");
+    Ok(ids.len())
+}
+
+impl RegistryClient {
+    /// Upload a batch of audit events to the registry.
+    pub fn upload_audit_batch(&self, events: &[serde_json::Value]) -> Result<()> {
+        let url = format!(
+            "{}/api/runner/mcp-audit",
+            self.base_url.trim_end_matches('/')
+        );
+
+        let body = serde_json::json!({ "events": events });
+
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .with_context(|| format!("failed to upload audit batch to {url}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!("audit upload failed (HTTP {status}): {body}");
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -454,6 +579,90 @@ mod tests {
         assert_eq!(result.servers_blocked, 0);
         assert_eq!(result.approval_mode, "trust");
         mock.assert();
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn audit_buffer_roundtrip() {
+        let root = temp_root("audit-buf");
+        let state = AppState::bootstrap_in(root.clone()).unwrap();
+
+        let event = AuditEvent {
+            server_name: Some("test-mcp".to_string()),
+            user_id: Some("user-1".to_string()),
+            user_email: Some("user@example.com".to_string()),
+            machine_id: Some("machine-abc".to_string()),
+            event_type: "tool_called".to_string(),
+            tool_name: Some("read_file".to_string()),
+            metadata: None,
+            org_id: "default".to_string(),
+        };
+
+        buffer_audit_event(&state, &event).unwrap();
+        buffer_audit_event(&state, &event).unwrap();
+
+        // Verify events are in the buffer
+        let conn = Connection::open(&state.db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mcp_audit_buffer", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn flush_audit_uploads_and_clears() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/api/runner/mcp-audit")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"created": 2}"#)
+            .create();
+
+        let root = temp_root("audit-flush");
+        let state = AppState::bootstrap_in(root.clone()).unwrap();
+        let registry = RegistryClient::new(server.url());
+
+        // Buffer two events
+        let event = AuditEvent {
+            server_name: Some("github-mcp".to_string()),
+            user_id: None,
+            user_email: None,
+            machine_id: None,
+            event_type: "config_synced".to_string(),
+            tool_name: None,
+            metadata: None,
+            org_id: "default".to_string(),
+        };
+        buffer_audit_event(&state, &event).unwrap();
+        buffer_audit_event(&state, &event).unwrap();
+
+        // Flush
+        let flushed = flush_audit_buffer(&state, &registry).unwrap();
+        assert_eq!(flushed, 2);
+        mock.assert();
+
+        // Buffer should be empty
+        let conn = Connection::open(&state.db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM mcp_audit_buffer", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn flush_empty_buffer_is_noop() {
+        let root = temp_root("audit-empty");
+        let state = AppState::bootstrap_in(root.clone()).unwrap();
+        let registry = RegistryClient::new("http://unused:9999".to_string());
+
+        let flushed = flush_audit_buffer(&state, &registry).unwrap();
+        assert_eq!(flushed, 0);
 
         let _ = fs::remove_dir_all(&root);
     }
