@@ -72,7 +72,7 @@ pub struct SkillDetail {
 /// Has no local state — use [`HttpPolicyClient`] for cached policy.
 pub struct RegistryClient {
     pub base_url: String,
-    http: reqwest::blocking::Client,
+    pub http: reqwest::blocking::Client,
     auth_token: Option<String>,
 }
 

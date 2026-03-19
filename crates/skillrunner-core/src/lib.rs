@@ -3,6 +3,8 @@ pub mod auth;
 pub mod executor;
 pub mod import;
 pub mod install;
+pub mod managed;
+pub mod mcp_governance;
 pub mod model;
 pub mod ollama;
 pub mod policy;

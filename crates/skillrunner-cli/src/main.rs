@@ -7,6 +7,8 @@ use skillrunner_core::{
     executor::run_skill,
     import::import_skill_md,
     install::install_unpacked_skill,
+    managed::load_managed_config,
+    mcp_governance,
     ollama::OllamaClient,
     policy::MockPolicyClient,
     registry::{HttpPolicyClient, RegistryClient},
@@ -76,6 +78,21 @@ enum McpCommands {
         /// Which client to configure (claude, cursor, all)
         #[arg(long, default_value = "all")]
         client: String,
+        /// Non-interactive mode for automated installs
+        #[arg(long)]
+        auto: bool,
+        /// Write system-level managed-mcp.json
+        #[arg(long)]
+        system: bool,
+    },
+    /// Sync MCP server config from the registry
+    Sync {
+        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        #[arg(long)]
+        registry_url: Option<String>,
+        /// Show what would be synced without writing files
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -159,6 +176,8 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     let cli = Cli::parse();
     let app = SkillRunnerApp::bootstrap()?;
+    let managed_registry_url: Option<String> = load_managed_config(&app.state)
+        .and_then(|c| c.registry_url);
 
     match cli.command {
         Commands::Doctor { ollama_url, registry_url } => {
@@ -184,7 +203,7 @@ fn main() -> Result<()> {
                 println!("Ollama:           NOT REACHABLE at {}", ollama_url);
             }
 
-            let effective_url = registry_url.or_else(registry_url_from_env);
+            let effective_url = resolve_registry_url(registry_url, managed_registry_url.as_deref());
             match effective_url {
                 Some(url) => {
                     let reg = RegistryClient::new(&url);
@@ -233,7 +252,7 @@ fn main() -> Result<()> {
         }
         Commands::Auth { command } => match command {
             AuthCommands::Login { registry_url, email } => {
-                let url = require_registry_url(registry_url)?;
+                let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
 
                 let email = match email {
                     Some(e) => e,
@@ -254,12 +273,12 @@ fn main() -> Result<()> {
                 println!("Logged in as {} ({}) at {}", user.display_name, user.email, url);
             }
             AuthCommands::Logout { registry_url } => {
-                let url = require_registry_url(registry_url)?;
+                let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
                 auth::clear_tokens(&app.state, &url)?;
                 println!("Logged out from {}", url);
             }
             AuthCommands::Status { registry_url } => {
-                let url = require_registry_url(registry_url)?;
+                let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
                 match auth::load_tokens(&app.state, &url)? {
                     Some(tokens) => {
                         let auth_client = AuthClient::new(&url);
@@ -274,7 +293,7 @@ fn main() -> Result<()> {
         },
         Commands::Mcp { command } => match command {
             McpCommands::Serve { registry_url, ollama_url, model } => {
-                let effective_url = registry_url.or_else(registry_url_from_env);
+                let effective_url = resolve_registry_url(registry_url, managed_registry_url.as_deref());
                 let config = McpServerConfig {
                     registry_url: effective_url,
                     ollama_url,
@@ -282,12 +301,40 @@ fn main() -> Result<()> {
                 };
                 run_server(app.state, config)?;
             }
-            McpCommands::Setup { registry_url, client } => {
-                let effective_url = registry_url.or_else(registry_url_from_env);
+            McpCommands::Sync { registry_url, dry_run } => {
+                let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
+                let registry = RegistryClient::new(&url);
                 let skillrunner_path = std::env::current_exe()
                     .ok()
                     .and_then(|p| p.to_str().map(|s| s.to_string()))
                     .unwrap_or_else(|| "skillrunner".to_string());
+
+                let result = mcp_governance::sync_mcp_config(
+                    &app.state,
+                    &registry,
+                    &skillrunner_path,
+                    &url,
+                    dry_run,
+                )?;
+
+                if dry_run {
+                    println!("Dry run — no files written.");
+                } else {
+                    println!("Wrote {}", result.config_path);
+                }
+                println!("Approval mode: {}", result.approval_mode);
+                println!("Servers synced: {} (blocked: {})", result.servers_synced, result.servers_blocked);
+                println!("\nRestart Claude Code to apply changes.");
+            }
+            McpCommands::Setup { registry_url, client, auto: _auto, system: _system } => {
+                let effective_url = resolve_registry_url(registry_url, managed_registry_url.as_deref());
+                let skillrunner_path = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.to_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "skillrunner".to_string());
+
+                // --auto: non-interactive mode (current behavior is already non-interactive)
+                // --system: writes system-level managed-mcp.json (future: /etc/skillclub/)
 
                 let clients = detect_ai_clients(&skillrunner_path);
                 if clients.is_empty() {
@@ -339,7 +386,7 @@ fn main() -> Result<()> {
                 }
             }
             SkillCommands::Search { query, registry_url } => {
-                let url = require_registry_url(registry_url)?;
+                let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
                 let reg = RegistryClient::new(&url);
                 let results = reg.search_skills(&query)?;
                 if results.is_empty() {
@@ -379,7 +426,7 @@ fn main() -> Result<()> {
                     install_unpacked_skill(&app.state, &skill)?;
                     println!("Installed {}@{}", skill.manifest.id, skill.manifest.version);
                 } else {
-                    let url = require_registry_url(registry_url)?;
+                    let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
                     let registry = RegistryClient::new(&url);
                     let installed_ver = install_from_registry(
                         &app.state,
@@ -391,7 +438,7 @@ fn main() -> Result<()> {
                 }
             }
             SkillCommands::Publish { path, registry_url } => {
-                let url = require_registry_url(registry_url)?;
+                let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
                 let tokens = auth::load_tokens(&app.state, &url)?
                     .ok_or_else(|| anyhow::anyhow!(
                         "not logged in; run `skillrunner auth login --registry-url {url}` first"
@@ -451,7 +498,7 @@ fn main() -> Result<()> {
                 }
             }
             SkillCommands::Resolve { skill_id } => {
-                let outcome = if let Some(url) = registry_url_from_env() {
+                let outcome = if let Some(url) = resolve_registry_url(None, managed_registry_url.as_deref()) {
                     let policy_client = HttpPolicyClient::new(RegistryClient::new(&url), &app.state);
                     resolve_skill(&app.state, &policy_client, &skill_id)?
                 } else {
@@ -493,7 +540,7 @@ fn main() -> Result<()> {
                     Some(&ollama)
                 };
 
-                let effective_url = registry_url.or_else(registry_url_from_env);
+                let effective_url = resolve_registry_url(registry_url, managed_registry_url.as_deref());
                 let result = if let Some(url) = effective_url {
                     let registry = RegistryClient::new(&url);
                     let http_policy = HttpPolicyClient::new(RegistryClient::new(&url), &app.state);
@@ -545,9 +592,19 @@ fn registry_url_from_env() -> Option<String> {
     std::env::var("SKILLCLUB_REGISTRY_URL").ok().filter(|s| !s.is_empty())
 }
 
-fn require_registry_url(flag: Option<String>) -> Result<String> {
-    flag.or_else(registry_url_from_env)
-        .ok_or_else(|| anyhow::anyhow!(
-            "no registry URL configured; set SKILLCLUB_REGISTRY_URL or use --registry-url"
-        ))
+/// Resolve the effective registry URL using priority order:
+/// 1. managed.json registry_url (IT override, already resolved before call)
+/// 2. --registry-url CLI flag
+/// 3. SKILLCLUB_REGISTRY_URL env var
+fn resolve_registry_url(flag: Option<String>, managed_url: Option<&str>) -> Option<String> {
+    managed_url
+        .map(|s| s.to_string())
+        .or(flag)
+        .or_else(registry_url_from_env)
+}
+
+fn require_registry_url(flag: Option<String>, managed_url: Option<&str>) -> Result<String> {
+    resolve_registry_url(flag, managed_url).ok_or_else(|| {
+        anyhow::anyhow!("no registry URL configured; set SKILLCLUB_REGISTRY_URL or use --registry-url")
+    })
 }

@@ -7,6 +7,7 @@ use skillrunner_core::{
     executor::run_skill,
     import::import_skill_md,
     install::install_unpacked_skill,
+    mcp_governance,
     model::ModelClient,
     policy::PolicyClient,
     registry::RegistryClient,
@@ -106,6 +107,48 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
             "required": []
         }),
     });
+
+    // MCP Governance tools (always available when registry is configured)
+    if registry_url.is_some() {
+        tools.push(ToolDefinition {
+            name: "skillclub_mcp_catalog".to_string(),
+            description: "Browse approved MCP servers in your organisation's catalog. Shows available servers with their status, version pins, and credential notes.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "skillclub_mcp_request".to_string(),
+            description: "Request access to a new MCP server. In trust mode, the request is auto-approved. In catalog-only mode, known servers are auto-approved. In strict mode, the request goes to IT for review.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "server_name": {
+                        "type": "string",
+                        "description": "Name of the MCP server to request (e.g., 'Slack MCP')"
+                    },
+                    "package_source": {
+                        "type": "string",
+                        "description": "Optional package source (e.g., '@modelcontextprotocol/server-slack')"
+                    }
+                },
+                "required": ["server_name"]
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "skillclub_mcp_status".to_string(),
+            description: "Check the status of your MCP server access requests.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        });
+    }
 
     if registry_url.is_some() {
         tools.push(ToolDefinition {
@@ -222,6 +265,9 @@ pub fn handle_tool_call(
         "skillclub_author" => handle_author(arguments),
         "skillclub_validate" => handle_validate(arguments),
         "skillclub_publish" => handle_publish(arguments, state, registry_url),
+        "skillclub_mcp_catalog" => handle_mcp_catalog(state, registry_url),
+        "skillclub_mcp_request" => handle_mcp_request(arguments, state, registry_url),
+        "skillclub_mcp_status" => handle_mcp_status(state, registry_url),
         _ => handle_skill_run(name, arguments, state, policy_client, model_client, registry_client),
     }
 }
@@ -561,6 +607,196 @@ fn handle_publish(
     };
 
     ToolCallResult::success(result)
+}
+
+// ── MCP Governance tool handlers ──────────────────────────────────────────────
+
+fn handle_mcp_catalog(state: &AppState, registry_url: &Option<String>) -> ToolCallResult {
+    let url = match registry_url {
+        Some(u) => u,
+        None => return ToolCallResult::error("No registry URL configured"),
+    };
+
+    let registry = RegistryClient::new(url);
+    match registry.fetch_mcp_servers() {
+        Ok(resp) => {
+            // Cache for offline use
+            let _ = mcp_governance::sync_mcp_config(
+                state,
+                &registry,
+                "skillrunner",
+                url,
+                true, // dry run — just cache, don't write file
+            );
+
+            let formatted: Vec<serde_json::Value> = resp
+                .servers
+                .iter()
+                .filter(|s| s.status == "approved")
+                .map(|s| {
+                    let mut entry = serde_json::json!({
+                        "name": s.name,
+                        "package_source": s.package_source,
+                        "status": s.status,
+                    });
+                    if let Some(pin) = &s.version_pin {
+                        entry["version_pin"] = serde_json::json!(pin);
+                    }
+                    if let Some(note) = &s.credential_note {
+                        entry["credential_note"] = serde_json::json!(note);
+                    }
+                    entry
+                })
+                .collect();
+
+            if formatted.is_empty() {
+                ToolCallResult::success(format!(
+                    "No approved MCP servers in catalog (approval mode: {}).\nAsk your IT admin to add servers via the SkillClub admin portal.",
+                    resp.approval_mode
+                ))
+            } else {
+                let mut output = format!(
+                    "Org approval mode: {}\n\nApproved MCP servers ({}):\n",
+                    resp.approval_mode,
+                    formatted.len()
+                );
+                match serde_json::to_string_pretty(&formatted) {
+                    Ok(text) => {
+                        output.push_str(&text);
+                        ToolCallResult::success(output)
+                    }
+                    Err(e) => ToolCallResult::error(format!("Failed to serialize: {e}")),
+                }
+            }
+        }
+        Err(e) => ToolCallResult::error(format!("Failed to fetch MCP catalog: {e}")),
+    }
+}
+
+fn handle_mcp_request(
+    arguments: &serde_json::Value,
+    state: &AppState,
+    registry_url: &Option<String>,
+) -> ToolCallResult {
+    let url = match registry_url {
+        Some(u) => u,
+        None => return ToolCallResult::error("No registry URL configured"),
+    };
+
+    let server_name = match arguments.get("server_name").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return ToolCallResult::error("Missing required parameter: server_name"),
+    };
+
+    let package_source = arguments.get("package_source").and_then(|v| v.as_str());
+
+    // Check auth first
+    let tokens = match auth::load_tokens(state, url) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return ToolCallResult::error(
+                "Not logged in. Run `skillrunner auth login` first to submit MCP server requests.",
+            )
+        }
+        Err(e) => return ToolCallResult::error(format!("Failed to load auth tokens: {e}")),
+    };
+
+    // Submit request to registry
+    let registry = RegistryClient::new(url);
+    let result = match registry.submit_mcp_request(
+        server_name,
+        package_source,
+        &tokens.access_token,
+    ) {
+        Ok(v) => v,
+        Err(e) => return ToolCallResult::error(format!("Failed to submit request: {e}")),
+    };
+
+    let req_status = result
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    match req_status {
+        "approved" => {
+            // Auto-approved — trigger immediate sync
+            let skillrunner_path = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| "skillrunner".to_string());
+
+            let _ = mcp_governance::sync_mcp_config(
+                state,
+                &registry,
+                &skillrunner_path,
+                url,
+                false,
+            );
+
+            ToolCallResult::success(format!(
+                "Request for '{}' was auto-approved! The server has been added to your managed MCP config.\n\nPlease restart Claude Code to activate the new MCP server.",
+                server_name
+            ))
+        }
+        "pending" => ToolCallResult::success(format!(
+            "Request for '{}' has been submitted and is pending IT review.\n\nYour admin will review it in the SkillClub portal. Run `skillclub_mcp_status` to check on it later.",
+            server_name
+        )),
+        _ => ToolCallResult::success(format!(
+            "Request submitted with status: {}",
+            req_status
+        )),
+    }
+}
+
+fn handle_mcp_status(state: &AppState, registry_url: &Option<String>) -> ToolCallResult {
+    let url = match registry_url {
+        Some(u) => u,
+        None => return ToolCallResult::error("No registry URL configured"),
+    };
+
+    let tokens = match auth::load_tokens(state, url) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return ToolCallResult::error(
+                "Not logged in. Run `skillrunner auth login` first to check request status.",
+            )
+        }
+        Err(e) => return ToolCallResult::error(format!("Failed to load auth tokens: {e}")),
+    };
+
+    let registry = RegistryClient::new(url);
+    let result = match registry.list_mcp_requests(&tokens.access_token) {
+        Ok(v) => v,
+        Err(e) => return ToolCallResult::error(format!("Failed to fetch requests: {e}")),
+    };
+
+    let items = result
+        .get("items")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    if items.is_empty() {
+        ToolCallResult::success("No MCP server access requests found.")
+    } else {
+        let formatted: Vec<serde_json::Value> = items
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "server_name": item.get("server_name").and_then(|v| v.as_str()).unwrap_or("?"),
+                    "status": item.get("status").and_then(|v| v.as_str()).unwrap_or("?"),
+                    "admin_notes": item.get("admin_notes").and_then(|v| v.as_str()),
+                    "created_at": item.get("created_at").and_then(|v| v.as_str()),
+                })
+            })
+            .collect();
+
+        match serde_json::to_string_pretty(&formatted) {
+            Ok(text) => ToolCallResult::success(text),
+            Err(e) => ToolCallResult::error(format!("Failed to serialize: {e}")),
+        }
+    }
 }
 
 // ── Skill execution handler ──────────────────────────────────────────────────
