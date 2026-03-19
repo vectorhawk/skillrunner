@@ -33,6 +33,12 @@ pub struct Manifest {
     pub execution: Execution,
     pub model_requirements: Option<ModelRequirements>,
     pub update: Option<UpdateConfig>,
+    /// Trigger phrases that help AI clients decide when to invoke this skill.
+    #[serde(default)]
+    pub triggers: Vec<String>,
+    /// Whether this skill can be offloaded to a cheaper/faster model.
+    #[serde(default)]
+    pub offload_eligible: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

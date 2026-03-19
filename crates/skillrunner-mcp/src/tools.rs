@@ -45,7 +45,7 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
     // Authoring tools (always available)
     tools.push(ToolDefinition {
         name: "skillclub_author".to_string(),
-        description: "Create a new SkillClub skill from a name, description, and system prompt. Scaffolds a complete skill bundle directory.".to_string(),
+        description: "Create a new SkillClub skill from a name and system prompt. Scaffolds a complete skill bundle directory ready for validation and publishing.".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -55,18 +55,23 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
                 },
                 "description": {
                     "type": "string",
-                    "description": "Brief description of what the skill does"
+                    "description": "Brief description of what the skill does (auto-generated if omitted)"
                 },
                 "system_prompt": {
                     "type": "string",
                     "description": "The system prompt that defines the skill's behavior"
+                },
+                "triggers": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Trigger phrases that help AI clients decide when to invoke this skill (e.g., ['compare contracts', 'diff legal docs'])"
                 },
                 "output_dir": {
                     "type": "string",
                     "description": "Directory to create the skill bundle in (default: current directory)"
                 }
             },
-            "required": ["name", "description", "system_prompt"]
+            "required": ["name", "system_prompt"]
         }),
     });
 
@@ -228,11 +233,22 @@ fn skill_tools_from_db(state: &AppState) -> Result<Vec<ToolDefinition>> {
 fn skill_to_tool(skill_id: &str, active_path: &str) -> Result<ToolDefinition> {
     let pkg = SkillPackage::load_from_dir(active_path)?;
 
-    let description = pkg
+    let base_desc = pkg
         .manifest
         .description
         .clone()
         .unwrap_or_else(|| format!("SkillClub skill: {}", pkg.manifest.name));
+
+    // Enrich description with trigger phrases if present
+    let description = if pkg.manifest.triggers.is_empty() {
+        base_desc
+    } else {
+        format!(
+            "{}\n\nUse this tool when the user asks to: {}",
+            base_desc,
+            pkg.manifest.triggers.join(", ")
+        )
+    };
 
     // Read the input schema file to use as the tool's inputSchema
     let schema_path = pkg.root.join(&pkg.manifest.inputs_schema);
@@ -477,10 +493,12 @@ fn handle_author(arguments: &serde_json::Value) -> ToolCallResult {
         None => return ToolCallResult::error("Missing required parameter: name"),
     };
 
-    let description = match arguments.get("description").and_then(|v| v.as_str()) {
-        Some(d) => d,
-        None => return ToolCallResult::error("Missing required parameter: description"),
-    };
+    // Description is now optional — auto-generate from name if omitted
+    let description = arguments
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("A skill that helps with {}", name.to_lowercase()));
 
     let system_prompt = match arguments.get("system_prompt").and_then(|v| v.as_str()) {
         Some(s) => s,
@@ -492,10 +510,32 @@ fn handle_author(arguments: &serde_json::Value) -> ToolCallResult {
         .and_then(|v| v.as_str())
         .unwrap_or(".");
 
-    // Build SKILL.md content
-    let skill_md = format!(
-        "---\nname: {name}\ndescription: {description}\n---\n\n{system_prompt}\n"
-    );
+    // Optional triggers for tool registration
+    let triggers: Vec<String> = arguments
+        .get("triggers")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Build SKILL.md content with optional fields
+    let mut frontmatter = format!("---\nname: {name}\ndescription: {description}\n");
+    if !triggers.is_empty() {
+        frontmatter.push_str(&format!(
+            "triggers:\n{}\n",
+            triggers
+                .iter()
+                .map(|t| format!("  - {t}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    frontmatter.push_str("---\n");
+
+    let skill_md = format!("{frontmatter}\n{system_prompt}\n");
 
     // Derive skill ID for the subdirectory name
     let skill_id: String = name

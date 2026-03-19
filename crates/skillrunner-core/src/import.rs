@@ -17,6 +17,8 @@ struct SkillMdFrontmatter {
     name: String,
     description: Option<String>,
     license: Option<String>,
+    #[serde(default)]
+    triggers: Vec<String>,
 }
 
 /// Read a SKILL.md, parse its frontmatter and body, and scaffold a complete
@@ -140,7 +142,15 @@ fn write_file(dir: &Utf8Path, rel: &str, content: &str, log: &mut Vec<String>) -
 }
 
 fn build_manifest_json(id: &str, fm: &SkillMdFrontmatter) -> String {
-    let description = fm.description.as_deref().unwrap_or("");
+    let description = fm
+        .description
+        .as_deref()
+        .unwrap_or("");
+    let description = if description.is_empty() {
+        format!("A skill that helps with {}", fm.name.to_lowercase())
+    } else {
+        description.to_string()
+    };
     let license_line = fm
         .license
         .as_deref()
@@ -152,6 +162,18 @@ fn build_manifest_json(id: &str, fm: &SkillMdFrontmatter) -> String {
         })
         .unwrap_or_default();
 
+    let triggers_line = if fm.triggers.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n  \"triggers\": {},",
+            serde_json::to_string(&fm.triggers).expect("triggers are valid JSON")
+        )
+    };
+
+    // Prompt-only skills (single LLM step, no network) are offload-eligible
+    let offload_line = "\n  \"offload_eligible\": true,";
+
     format!(
         r#"{{
   "schema_version": "1.0",
@@ -159,7 +181,7 @@ fn build_manifest_json(id: &str, fm: &SkillMdFrontmatter) -> String {
   "name": {name},
   "version": "0.1.0",
   "publisher": "skillclub",
-  "description": {description},{license_line}
+  "description": {description},{license_line}{triggers_line}{offload_line}
   "entrypoint": "workflow.yaml",
   "inputs_schema": "schemas/input.schema.json",
   "outputs_schema": "schemas/output.schema.json",
@@ -179,7 +201,7 @@ fn build_manifest_json(id: &str, fm: &SkillMdFrontmatter) -> String {
   }}
 }}"#,
         name = serde_json::to_string(&fm.name).expect("name is valid JSON string"),
-        description = serde_json::to_string(description).expect("description is valid JSON string"),
+        description = serde_json::to_string(&description).expect("description is valid JSON string"),
     )
 }
 
