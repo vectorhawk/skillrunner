@@ -20,6 +20,35 @@ pub struct McpServerEntry {
     pub status: String,
     pub credential_note: Option<String>,
     pub server_config: Option<serde_json::Value>,
+
+    // ── Aggregator-specific fields (G2) ──────────────────────────────────────
+    /// Stable identifier used for tool namespacing (e.g. `"github"` →
+    /// tools become `github__create_issue`). Defaults to `name` when absent.
+    #[serde(default)]
+    pub server_id: Option<String>,
+
+    /// Transport type for the aggregator to use when connecting upstream.
+    /// One of `"stdio"`, `"http"`, `"gateway"`. Defaults to `"http"`.
+    #[serde(default)]
+    pub transport_type: Option<String>,
+
+    /// For `gateway` transport: the upstream gateway URL to connect to.
+    #[serde(default)]
+    pub gateway_url: Option<String>,
+
+    /// Tool visibility policy. One of `"all"`, `"curated"`, `"on_demand"`.
+    /// Defaults to `"all"` if absent.
+    #[serde(default)]
+    pub tool_visibility: Option<String>,
+
+    /// For `tool_visibility = "curated"`: the list of tool names to surface.
+    #[serde(default)]
+    pub visible_tools: Option<Vec<String>>,
+
+    /// Admin-assigned priority (higher = more important for tool budget).
+    /// Governance tools use priority 100; default server priority is 50.
+    #[serde(default)]
+    pub priority: Option<u8>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -135,6 +164,40 @@ impl RegistryClient {
         }
 
         resp.json().context("failed to deserialize requests response")
+    }
+}
+
+// ── Public fetch helper ───────────────────────────────────────────────────────
+
+/// Fetch the approved MCP server list, with SQLite cache fallback.
+///
+/// This is the public entry point for the aggregator (`BackendRegistry`) to
+/// retrieve which servers should be proxied. It is intentionally separate from
+/// the file-writing `sync_mcp_config` path.
+///
+/// Behaviour:
+/// - On network success: updates the SQLite cache and returns the fresh list.
+/// - On network failure: returns the cached list if it is within the 7-day
+///   offline grace window, otherwise returns an error.
+pub fn fetch_approved_servers(
+    state: &AppState,
+    registry: &RegistryClient,
+) -> Result<McpServersResponse> {
+    match registry.fetch_mcp_servers() {
+        Ok(resp) => {
+            cache_mcp_config(state, &resp)?;
+            Ok(resp)
+        }
+        Err(fetch_err) => {
+            warn!(error = %fetch_err, "failed to fetch approved servers, trying cache");
+            match load_cached_mcp_config(state)? {
+                Some(cached) => {
+                    info!("using cached MCP server list (offline mode)");
+                    Ok(cached)
+                }
+                None => Err(fetch_err.context("no cached server list available")),
+            }
+        }
     }
 }
 
@@ -616,6 +679,12 @@ mod tests {
                 status: "approved".to_string(),
                 credential_note: None,
                 server_config: None,
+                server_id: None,
+                transport_type: None,
+                gateway_url: None,
+                tool_visibility: None,
+                visible_tools: None,
+                priority: None,
             }],
         };
 
@@ -874,6 +943,117 @@ mod tests {
         assert!(err.to_string().contains("failed to reach registry"));
     }
 
+    // ── fetch_approved_servers tests ─────────────────────────────────────────
+
+    #[test]
+    fn fetch_approved_servers_returns_live_response() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/api/runner/mcp-servers")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "approval_mode": "catalog_only",
+                    "servers": [
+                        {
+                            "name": "github",
+                            "package_source": "@modelcontextprotocol/server-github",
+                            "status": "approved",
+                            "server_id": "github",
+                            "transport_type": "http",
+                            "tool_visibility": "all",
+                            "priority": 50
+                        }
+                    ]
+                }"#,
+            )
+            .create();
+
+        let root = temp_root("fetch-approved-live");
+        let state = AppState::bootstrap_in(root.clone()).unwrap();
+        let registry = RegistryClient::new(server.url());
+
+        let resp = fetch_approved_servers(&state, &registry).unwrap();
+        assert_eq!(resp.servers.len(), 1);
+        assert_eq!(resp.servers[0].name, "github");
+        assert_eq!(resp.servers[0].server_id, Some("github".to_string()));
+        assert_eq!(resp.servers[0].transport_type, Some("http".to_string()));
+        assert_eq!(resp.servers[0].tool_visibility, Some("all".to_string()));
+        assert_eq!(resp.servers[0].priority, Some(50));
+        mock.assert();
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_approved_servers_falls_back_to_cache() {
+        let root = temp_root("fetch-approved-cache");
+        let state = AppState::bootstrap_in(root.clone()).unwrap();
+
+        // Pre-populate cache
+        let cached = McpServersResponse {
+            approval_mode: "trust".to_string(),
+            servers: vec![McpServerEntry {
+                name: "cached-server".to_string(),
+                package_source: "cached-pkg".to_string(),
+                version_pin: None,
+                status: "approved".to_string(),
+                credential_note: None,
+                server_config: None,
+                server_id: None,
+                transport_type: None,
+                gateway_url: None,
+                tool_visibility: None,
+                visible_tools: None,
+                priority: None,
+            }],
+        };
+        cache_mcp_config(&state, &cached).unwrap();
+
+        // Use an unreachable registry — should fall back to cache
+        let registry = RegistryClient::new("http://127.0.0.1:1".to_string());
+        let resp = fetch_approved_servers(&state, &registry).unwrap();
+
+        assert_eq!(resp.servers.len(), 1);
+        assert_eq!(resp.servers[0].name, "cached-server");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fetch_approved_servers_errors_when_no_cache_and_offline() {
+        let root = temp_root("fetch-approved-no-cache");
+        let state = AppState::bootstrap_in(root.clone()).unwrap();
+
+        // No cache pre-populated, unreachable registry
+        let registry = RegistryClient::new("http://127.0.0.1:1".to_string());
+        let err = fetch_approved_servers(&state, &registry).unwrap_err();
+        assert!(
+            err.to_string().contains("no cached server list available")
+                || err.to_string().contains("failed to reach registry"),
+            "unexpected error: {err}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mcpserverentry_aggregator_fields_default_to_none() {
+        let json = r#"{
+            "name": "test",
+            "package_source": "test-pkg",
+            "status": "approved"
+        }"#;
+        let entry: McpServerEntry = serde_json::from_str(json).unwrap();
+        assert!(entry.server_id.is_none());
+        assert!(entry.transport_type.is_none());
+        assert!(entry.gateway_url.is_none());
+        assert!(entry.tool_visibility.is_none());
+        assert!(entry.visible_tools.is_none());
+        assert!(entry.priority.is_none());
+    }
+
     #[test]
     fn sync_falls_back_to_cache_on_network_failure() {
         let root = temp_root("sync-cache-fallback");
@@ -889,6 +1069,12 @@ mod tests {
                 status: "approved".to_string(),
                 credential_note: None,
                 server_config: None,
+                server_id: None,
+                transport_type: None,
+                gateway_url: None,
+                tool_visibility: None,
+                visible_tools: None,
+                priority: None,
             }],
         };
         cache_mcp_config(&state, &cached_response).unwrap();
