@@ -8,7 +8,6 @@ use skillrunner_core::{
     import::import_skill_md,
     install::install_unpacked_skill,
     managed::load_managed_config,
-    mcp_governance,
     ollama::OllamaClient,
     policy::MockPolicyClient,
     registry::{HttpPolicyClient, RegistryClient},
@@ -81,21 +80,6 @@ enum McpCommands {
         /// Non-interactive mode for automated installs
         #[arg(long)]
         auto: bool,
-        /// Write system-level managed-mcp.json
-        #[arg(long)]
-        system: bool,
-    },
-    /// Sync MCP server config from the registry
-    Sync {
-        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
-        #[arg(long)]
-        registry_url: Option<String>,
-        /// Show what would be synced without writing files
-        #[arg(long)]
-        dry_run: bool,
-        /// Write to system-level path (enterprise exclusive mode, requires admin/root)
-        #[arg(long)]
-        system: bool,
     },
 }
 
@@ -304,33 +288,7 @@ fn main() -> Result<()> {
                 };
                 run_server(app.state, config)?;
             }
-            McpCommands::Sync { registry_url, dry_run, system } => {
-                let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
-                let registry = RegistryClient::new(&url);
-                let skillrunner_path = std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.to_str().map(|s| s.to_string()))
-                    .unwrap_or_else(|| "skillrunner".to_string());
-
-                let result = mcp_governance::sync_mcp_config(
-                    &app.state,
-                    &registry,
-                    &skillrunner_path,
-                    &url,
-                    dry_run,
-                    system,
-                )?;
-
-                if dry_run {
-                    println!("Dry run — no files written.");
-                } else {
-                    println!("Wrote {}", result.config_path);
-                }
-                println!("Approval mode: {}", result.approval_mode);
-                println!("Servers synced: {} (blocked: {})", result.servers_synced, result.servers_blocked);
-                println!("\nRestart Claude Code to apply changes.");
-            }
-            McpCommands::Setup { registry_url, client, auto: _auto, system } => {
+            McpCommands::Setup { registry_url, client, auto: _auto } => {
                 let effective_url = resolve_registry_url(registry_url, managed_registry_url.as_deref());
                 let skillrunner_path = std::env::current_exe()
                     .ok()
@@ -376,25 +334,6 @@ fn main() -> Result<()> {
                 }
 
                 mark_first_run_offered(&app.state)?;
-
-                // --system: also write system-level managed-mcp.json for enterprise
-                // exclusive mode. Requires admin/root; will fail with a permission
-                // error if not elevated.
-                if system {
-                    let url = require_registry_url(effective_url.clone(), managed_registry_url.as_deref())?;
-                    let registry = RegistryClient::new(&url);
-                    let result = mcp_governance::sync_mcp_config(
-                        &app.state,
-                        &registry,
-                        &skillrunner_path,
-                        &url,
-                        false, // not dry run
-                        true,  // system_level
-                    )?;
-                    println!("Wrote system-level managed config: {}", result.config_path);
-                    println!("Servers synced: {} (blocked: {})", result.servers_synced, result.servers_blocked);
-                    println!("Claude Code exclusive mode will be active on restart.");
-                }
 
                 println!("\nRestart your AI client to activate SkillRunner MCP.");
             }

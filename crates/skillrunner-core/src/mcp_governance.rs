@@ -1,13 +1,14 @@
-//! MCP fleet governance: sync approved servers from registry, build managed-mcp.json.
+//! MCP fleet governance: approved server fetching, caching, and audit buffering.
+//!
+//! The file-writing `sync_mcp_config` path has been removed. The aggregator
+//! (`skillrunner-mcp::aggregator::BackendRegistry`) now handles all server
+//! management internally — no config files are written after initial setup.
 
 use crate::{registry::RegistryClient, state::AppState};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::{
-    fs,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 // ── Wire types — must match Python RunnerMcpServersResponse exactly ──────────
@@ -55,30 +56,6 @@ pub struct McpServerEntry {
 pub struct McpServersResponse {
     pub approval_mode: String,
     pub servers: Vec<McpServerEntry>,
-}
-
-// ── Managed MCP config (written to disk) ─────────────────────────────────────
-
-/// The `managed-mcp.json` structure written for Claude Code / Cursor.
-///
-/// Claude Code's native format only contains `mcpServers`. When written to the
-/// system-level path it triggers exclusive mode; written to the user path it
-/// is additive.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ManagedMcpConfig {
-    /// MCP server entries keyed by name
-    #[serde(rename = "mcpServers")]
-    pub mcp_servers: serde_json::Map<String, serde_json::Value>,
-}
-
-// ── Sync result ──────────────────────────────────────────────────────────────
-
-#[derive(Debug)]
-pub struct SyncResult {
-    pub servers_synced: usize,
-    pub servers_blocked: usize,
-    pub approval_mode: String,
-    pub config_path: String,
 }
 
 // ── RegistryClient extension ─────────────────────────────────────────────────
@@ -198,226 +175,6 @@ pub fn fetch_approved_servers(
                 None => Err(fetch_err.context("no cached server list available")),
             }
         }
-    }
-}
-
-// ── Sync logic ───────────────────────────────────────────────────────────────
-
-/// Sync approved MCP servers from registry and write `managed-mcp.json`.
-///
-/// - Fetches the server list from registry
-/// - Caches in local SQLite for offline resilience
-/// - Builds `managed-mcp.json` with SkillRunner always as entry #1
-/// - Blocked servers are excluded from the config
-/// - When `system_level` is true, writes to the OS system path which triggers
-///   Claude Code's exclusive mode (requires admin/root).
-/// - When `system_level` is false, writes to the user-level path (additive mode).
-#[deprecated(
-    note = "Replaced by aggregator pattern. SkillRunner will be the single MCP \
-            entry in the client config; backend servers are managed internally \
-            via BackendRegistry rather than written to disk."
-)]
-pub fn sync_mcp_config(
-    state: &AppState,
-    registry: &RegistryClient,
-    skillrunner_path: &str,
-    registry_url: &str,
-    dry_run: bool,
-    system_level: bool,
-) -> Result<SyncResult> {
-    // Try to fetch from registry, fall back to cache on failure
-    let response = match registry.fetch_mcp_servers() {
-        Ok(resp) => {
-            // Cache the response
-            cache_mcp_config(state, &resp)?;
-            resp
-        }
-        Err(fetch_err) => {
-            warn!(error = %fetch_err, "failed to fetch MCP servers, trying cache");
-            match load_cached_mcp_config(state)? {
-                Some(cached) => {
-                    info!("using cached MCP server list");
-                    cached
-                }
-                None => return Err(fetch_err.context("no cached MCP config available")),
-            }
-        }
-    };
-
-    let mut servers = serde_json::Map::new();
-    let mut servers_synced = 0;
-    let mut servers_blocked = 0;
-
-    // SkillRunner is always entry #1
-    let mut skillrunner_env = serde_json::Map::new();
-    skillrunner_env.insert(
-        "SKILLCLUB_REGISTRY_URL".to_string(),
-        serde_json::Value::String(registry_url.to_string()),
-    );
-    servers.insert(
-        "skillrunner".to_string(),
-        serde_json::json!({
-            "command": skillrunner_path,
-            "args": ["mcp", "serve"],
-            "env": skillrunner_env,
-        }),
-    );
-
-    // Add approved servers, skip blocked ones
-    for entry in &response.servers {
-        if entry.status == "blocked" {
-            servers_blocked += 1;
-            continue;
-        }
-
-        if let Some(config) = &entry.server_config {
-            servers.insert(entry.name.clone(), config.clone());
-        } else {
-            // Build default npx config from package_source
-            let mut args = vec![
-                serde_json::Value::String("-y".to_string()),
-                serde_json::Value::String(entry.package_source.clone()),
-            ];
-            if let Some(pin) = &entry.version_pin {
-                // Replace last arg with pinned version
-                let pinned = format!("{}@{}", entry.package_source, pin);
-                args[1] = serde_json::Value::String(pinned);
-            }
-            servers.insert(
-                entry.name.clone(),
-                serde_json::json!({
-                    "command": "npx",
-                    "args": args,
-                }),
-            );
-        }
-        servers_synced += 1;
-    }
-
-    if system_level {
-        // Enterprise: write standalone managed-mcp.json to system path
-        // Claude Code enters exclusive mode when this file exists.
-        let config = ManagedMcpConfig {
-            mcp_servers: servers,
-        };
-        let config_path = system_managed_mcp_path();
-
-        if dry_run {
-            let json = serde_json::to_string_pretty(&config)?;
-            info!("dry run — would write to {}:\n{}", config_path, json);
-        } else {
-            if let Some(parent) = std::path::Path::new(&config_path).parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let json = serde_json::to_string_pretty(&config)?;
-            fs::write(&config_path, &json)
-                .with_context(|| format!("failed to write {config_path}"))?;
-            info!(path = config_path, servers = servers_synced, "wrote managed-mcp.json");
-        }
-
-        return finish_sync(state, registry, servers_synced, servers_blocked, &response.approval_mode, &config_path);
-    }
-
-    // User-level: merge governed servers into ~/.claude.json mcpServers.
-    // Claude Code only reads mcpServers from ~/.claude.json at the user level.
-    let config_path = claude_json_path();
-
-    if dry_run {
-        info!("dry run — would merge {} servers into {}", servers.len(), config_path);
-        for (name, _) in &servers {
-            info!("  would add/update: {}", name);
-        }
-    } else {
-        merge_into_claude_json(&config_path, &servers)?;
-        info!(path = config_path, servers = servers_synced, "merged servers into claude.json");
-    }
-
-    finish_sync(state, registry, servers_synced, servers_blocked, &response.approval_mode, &config_path)
-}
-
-fn finish_sync(
-    state: &AppState,
-    registry: &RegistryClient,
-    servers_synced: usize,
-    servers_blocked: usize,
-    approval_mode: &str,
-    config_path: &str,
-) -> Result<SyncResult> {
-    // Flush audit buffer on each sync
-    match flush_audit_buffer(state, registry) {
-        Ok(n) if n > 0 => info!(count = n, "flushed audit events during sync"),
-        Ok(_) => {}
-        Err(e) => warn!(error = %e, "failed to flush audit buffer during sync"),
-    }
-
-    Ok(SyncResult {
-        servers_synced,
-        servers_blocked,
-        approval_mode: approval_mode.to_string(),
-        config_path: config_path.to_string(),
-    })
-}
-
-/// Path to ~/.claude.json (Claude Code's user-level config).
-#[deprecated(
-    note = "Replaced by aggregator pattern. Config-file writes are no longer \
-            needed once SkillRunner is the single MCP entry point."
-)]
-fn claude_json_path() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    format!("{}/.claude.json", home)
-}
-
-/// Merge governed MCP servers into ~/.claude.json mcpServers.
-///
-/// Reads the existing config, adds/overwrites entries for governed servers,
-/// and writes back. Non-governed entries the user has manually added are preserved.
-#[deprecated(
-    note = "Replaced by aggregator pattern. Tool delivery via list_changed \
-            eliminates the need to rewrite config files."
-)]
-fn merge_into_claude_json(
-    path: &str,
-    servers: &serde_json::Map<String, serde_json::Value>,
-) -> Result<()> {
-    let mut config: serde_json::Value = if std::path::Path::new(path).exists() {
-        let text = fs::read_to_string(path)?;
-        serde_json::from_str(&text).unwrap_or(serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-
-    let mcp_servers = config
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("~/.claude.json is not a JSON object"))?
-        .entry("mcpServers")
-        .or_insert(serde_json::json!({}));
-
-    let mcp_map = mcp_servers
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("mcpServers is not a JSON object"))?;
-
-    for (name, value) in servers {
-        mcp_map.insert(name.clone(), value.clone());
-    }
-
-    let json = serde_json::to_string_pretty(&config)?;
-    fs::write(path, &json).with_context(|| format!("failed to write {path}"))?;
-
-    Ok(())
-}
-
-/// System-level managed-mcp.json — triggers Claude Code exclusive mode.
-/// Requires admin/root to write.
-#[deprecated(
-    note = "Replaced by aggregator pattern. The system-level config only needs \
-            to contain the SkillRunner entry, written once during MDM deployment."
-)]
-fn system_managed_mcp_path() -> String {
-    if cfg!(target_os = "macos") {
-        "/Library/Application Support/ClaudeCode/managed-mcp.json".to_string()
-    } else {
-        "/etc/claude-code/managed-mcp.json".to_string()
     }
 }
 
@@ -612,6 +369,7 @@ mod tests {
     use crate::state::AppState;
     use camino::Utf8PathBuf;
     use mockito::Server;
+    use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_root(label: &str) -> Utf8PathBuf {
@@ -696,49 +454,6 @@ mod tests {
         assert_eq!(cached.approval_mode, "trust");
         assert_eq!(cached.servers.len(), 1);
         assert_eq!(cached.servers[0].name, "test-server");
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn sync_dry_run_does_not_write_file() {
-        let mut server = Server::new();
-        let mock = server
-            .mock("GET", "/api/runner/mcp-servers")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                r#"{
-                    "approval_mode": "trust",
-                    "servers": [
-                        {
-                            "name": "test-mcp",
-                            "package_source": "test-pkg",
-                            "status": "approved"
-                        }
-                    ]
-                }"#,
-            )
-            .create();
-
-        let root = temp_root("sync-dry");
-        let state = AppState::bootstrap_in(root.clone()).unwrap();
-        let registry = RegistryClient::new(server.url());
-
-        let result = sync_mcp_config(
-            &state,
-            &registry,
-            "/usr/local/bin/skillrunner",
-            &server.url(),
-            true,  // dry run
-            false, // user-level path
-        )
-        .unwrap();
-
-        assert_eq!(result.servers_synced, 1);
-        assert_eq!(result.servers_blocked, 0);
-        assert_eq!(result.approval_mode, "trust");
-        mock.assert();
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1054,46 +769,4 @@ mod tests {
         assert!(entry.priority.is_none());
     }
 
-    #[test]
-    fn sync_falls_back_to_cache_on_network_failure() {
-        let root = temp_root("sync-cache-fallback");
-        let state = AppState::bootstrap_in(root.clone()).unwrap();
-
-        // Pre-populate cache
-        let cached_response = McpServersResponse {
-            approval_mode: "catalog_only".to_string(),
-            servers: vec![McpServerEntry {
-                name: "cached-server".to_string(),
-                package_source: "cached-pkg".to_string(),
-                version_pin: None,
-                status: "approved".to_string(),
-                credential_note: None,
-                server_config: None,
-                server_id: None,
-                transport_type: None,
-                gateway_url: None,
-                tool_visibility: None,
-                visible_tools: None,
-                priority: None,
-            }],
-        };
-        cache_mcp_config(&state, &cached_response).unwrap();
-
-        // Use unreachable registry — should fall back to cache
-        let registry = RegistryClient::new("http://127.0.0.1:1".to_string());
-        let result = sync_mcp_config(
-            &state,
-            &registry,
-            "/usr/local/bin/skillrunner",
-            "http://127.0.0.1:1",
-            true,  // dry run
-            false, // user-level path
-        )
-        .unwrap();
-
-        assert_eq!(result.servers_synced, 1);
-        assert_eq!(result.approval_mode, "catalog_only");
-
-        let _ = fs::remove_dir_all(&root);
-    }
 }

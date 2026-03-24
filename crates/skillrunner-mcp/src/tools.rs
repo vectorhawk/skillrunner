@@ -742,14 +742,7 @@ fn handle_mcp_catalog(state: &AppState, registry_url: &Option<String>) -> ToolCa
     match registry.fetch_mcp_servers() {
         Ok(resp) => {
             // Cache for offline use
-            let _ = mcp_governance::sync_mcp_config(
-                state,
-                &registry,
-                "skillrunner",
-                url,
-                true,  // dry run — just cache, don't write file
-                false, // user-level path
-            );
+            let _ = mcp_governance::fetch_approved_servers(state, &registry);
 
             let formatted: Vec<serde_json::Value> = resp
                 .servers
@@ -852,23 +845,10 @@ fn handle_mcp_request(
 
     match req_status {
         "approved" => {
-            // Auto-approved — trigger immediate sync
-            let skillrunner_path = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.to_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| "skillrunner".to_string());
-
-            let _ = mcp_governance::sync_mcp_config(
-                state,
-                &registry,
-                &skillrunner_path,
-                url,
-                false, // not dry run
-                false, // user-level path
-            );
-
+            // Auto-approved — the aggregator will pick up the new server on its
+            // next refresh cycle (within AGGREGATOR_REFRESH_INTERVAL seconds).
             ToolCallResult::success(format!(
-                "Request for '{}' was auto-approved! The server has been added to your managed MCP config.\n\nPlease restart Claude Code to activate the new MCP server.",
+                "Request for '{}' was auto-approved! The server will be available shortly as the aggregator refreshes its backend list.",
                 server_name
             ))
         }
