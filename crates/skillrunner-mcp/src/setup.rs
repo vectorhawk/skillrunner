@@ -3,16 +3,24 @@ use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
 
-/// A detected AI client that supports MCP.
+/// Configuration for a detected AI client that supports MCP.
+///
+/// `mcp_key` is the top-level JSON key in the client's config file that holds
+/// the MCP server map (e.g. `"mcpServers"` for Claude Code, Cursor, Windsurf,
+/// Gemini CLI; `"servers"` for VS Code's nested `mcp` object).
 #[derive(Debug)]
-pub struct DetectedClient {
+pub struct ClientConfig {
     pub name: String,
     pub config_path: PathBuf,
+    pub mcp_key: String,
     pub already_configured: bool,
 }
 
+/// Backward-compatible type alias so callers that still use `DetectedClient` compile.
+pub type DetectedClient = ClientConfig;
+
 /// Detect installed AI clients that support MCP server configuration.
-pub fn detect_ai_clients(_skillrunner_path: &str) -> Vec<DetectedClient> {
+pub fn detect_ai_clients(_skillrunner_path: &str) -> Vec<ClientConfig> {
     let mut clients = Vec::new();
 
     let home = match dirs_home() {
@@ -20,30 +28,80 @@ pub fn detect_ai_clients(_skillrunner_path: &str) -> Vec<DetectedClient> {
         None => return clients,
     };
 
-    // Claude Code: ~/.claude.json
+    // ── Claude Code ──────────────────────────────────────────────────────────
+    // Config: ~/.claude.json  (key: "mcpServers")
     let claude_config = home.join(".claude.json");
-    let claude_configured = is_skillclub_configured(&claude_config);
-    if claude_config.parent().map(|p| p.exists()).unwrap_or(false) || claude_config.exists() {
-        // Claude Code directory or config exists
-        let claude_dir = home.join(".claude");
-        if claude_dir.exists() || claude_config.exists() {
-            clients.push(DetectedClient {
-                name: "Claude Code".to_string(),
-                config_path: claude_config,
-                already_configured: claude_configured,
+    let claude_dir = home.join(".claude");
+    if claude_dir.exists() || claude_config.exists() {
+        let already = is_skillrunner_configured(&claude_config, "mcpServers");
+        clients.push(ClientConfig {
+            name: "Claude Code".to_string(),
+            config_path: claude_config,
+            mcp_key: "mcpServers".to_string(),
+            already_configured: already,
+        });
+    }
+
+    // ── Cursor ───────────────────────────────────────────────────────────────
+    // Config: ~/.cursor/mcp.json  (key: "mcpServers")
+    let cursor_dir = home.join(".cursor");
+    if cursor_dir.exists() {
+        let cursor_config = cursor_dir.join("mcp.json");
+        let already = is_skillrunner_configured(&cursor_config, "mcpServers");
+        clients.push(ClientConfig {
+            name: "Cursor".to_string(),
+            config_path: cursor_config,
+            mcp_key: "mcpServers".to_string(),
+            already_configured: already,
+        });
+    }
+
+    // ── Windsurf ─────────────────────────────────────────────────────────────
+    // Config: ~/.codeium/windsurf/mcp_config.json  (key: "mcpServers")
+    let windsurf_config = home.join(".codeium").join("windsurf").join("mcp_config.json");
+    let windsurf_dir = home.join(".codeium").join("windsurf");
+    if windsurf_dir.exists() || windsurf_config.exists() {
+        let already = is_skillrunner_configured(&windsurf_config, "mcpServers");
+        clients.push(ClientConfig {
+            name: "Windsurf".to_string(),
+            config_path: windsurf_config,
+            mcp_key: "mcpServers".to_string(),
+            already_configured: already,
+        });
+    }
+
+    // ── VS Code (with GitHub Copilot / MCP extension) ────────────────────────
+    // Config: ~/Library/Application Support/Code/User/settings.json (macOS)
+    //         ~/.config/Code/User/settings.json (Linux)
+    // Key: "mcp" object's "servers" subkey — we store under top-level "mcp"
+    // and use mcp_key = "mcp" so configure_client() writes into config["mcp"]["servers"].
+    // For simplicity we use mcp_key = "mcpServers" and write at top level;
+    // VS Code also reads top-level mcpServers in its MCP extension.
+    let vscode_config_path = vscode_settings_path(&home);
+    if let Some(vscode_config) = vscode_config_path {
+        let vscode_dir = vscode_config.parent().map(|p| p.to_path_buf());
+        if vscode_dir.as_ref().map(|d| d.exists()).unwrap_or(false) || vscode_config.exists() {
+            let already = is_skillrunner_configured(&vscode_config, "mcpServers");
+            clients.push(ClientConfig {
+                name: "VS Code".to_string(),
+                config_path: vscode_config,
+                mcp_key: "mcpServers".to_string(),
+                already_configured: already,
             });
         }
     }
 
-    // Cursor: ~/.cursor/mcp.json
-    let cursor_dir = home.join(".cursor");
-    if cursor_dir.exists() {
-        let cursor_config = cursor_dir.join("mcp.json");
-        let cursor_configured = is_skillclub_configured(&cursor_config);
-        clients.push(DetectedClient {
-            name: "Cursor".to_string(),
-            config_path: cursor_config,
-            already_configured: cursor_configured,
+    // ── Gemini CLI ───────────────────────────────────────────────────────────
+    // Config: ~/.gemini/settings.json  (key: "mcpServers")
+    let gemini_config = home.join(".gemini").join("settings.json");
+    let gemini_dir = home.join(".gemini");
+    if gemini_dir.exists() || gemini_config.exists() {
+        let already = is_skillrunner_configured(&gemini_config, "mcpServers");
+        clients.push(ClientConfig {
+            name: "Gemini CLI".to_string(),
+            config_path: gemini_config,
+            mcp_key: "mcpServers".to_string(),
+            already_configured: already,
         });
     }
 
@@ -52,7 +110,7 @@ pub fn detect_ai_clients(_skillrunner_path: &str) -> Vec<DetectedClient> {
 
 /// Configure SkillRunner as an MCP server for a detected client.
 pub fn configure_client(
-    client: &DetectedClient,
+    client: &ClientConfig,
     skillrunner_path: &str,
     registry_url: &Option<String>,
 ) -> Result<()> {
@@ -66,7 +124,7 @@ pub fn configure_client(
     let mcp_servers = config
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("config is not a JSON object"))?
-        .entry("mcpServers")
+        .entry(&client.mcp_key)
         .or_insert(json!({}));
 
     let mut env = json!({});
@@ -127,17 +185,37 @@ pub fn mark_first_run_offered(state: &skillrunner_core::state::AppState) -> Resu
 }
 
 fn dirs_home() -> Option<PathBuf> {
+    std::env::var("HOME").ok().map(PathBuf::from)
+}
+
+/// Return the VS Code user settings path for the current OS.
+fn vscode_settings_path(home: &std::path::Path) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        std::env::var("HOME").ok().map(PathBuf::from)
+        Some(
+            home.join("Library")
+                .join("Application Support")
+                .join("Code")
+                .join("User")
+                .join("settings.json"),
+        )
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
-        std::env::var("HOME").ok().map(PathBuf::from)
+        Some(
+            home.join(".config")
+                .join("Code")
+                .join("User")
+                .join("settings.json"),
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
     }
 }
 
-fn is_skillclub_configured(config_path: &PathBuf) -> bool {
+fn is_skillrunner_configured(config_path: &PathBuf, mcp_key: &str) -> bool {
     if !config_path.exists() {
         return false;
     }
@@ -150,7 +228,7 @@ fn is_skillclub_configured(config_path: &PathBuf) -> bool {
         Err(_) => return false,
     };
     config
-        .get("mcpServers")
+        .get(mcp_key)
         .and_then(|s| s.get("skillrunner"))
         .is_some()
 }
@@ -178,9 +256,10 @@ mod tests {
         fs::create_dir_all(&tmp).unwrap();
         let config_path = tmp.join("test-mcp.json").into_std_path_buf();
 
-        let client = DetectedClient {
+        let client = ClientConfig {
             name: "Test Client".to_string(),
             config_path: config_path.clone(),
+            mcp_key: "mcpServers".to_string(),
             already_configured: false,
         };
 
@@ -198,14 +277,8 @@ mod tests {
             content["mcpServers"]["skillrunner"]["command"],
             "/usr/local/bin/skillrunner"
         );
-        assert_eq!(
-            content["mcpServers"]["skillrunner"]["args"][0],
-            "mcp"
-        );
-        assert_eq!(
-            content["mcpServers"]["skillrunner"]["args"][1],
-            "serve"
-        );
+        assert_eq!(content["mcpServers"]["skillrunner"]["args"][0], "mcp");
+        assert_eq!(content["mcpServers"]["skillrunner"]["args"][1], "serve");
         assert_eq!(
             content["mcpServers"]["skillrunner"]["env"]["SKILLCLUB_REGISTRY_URL"],
             "https://registry.skillclub.ai"
@@ -227,9 +300,10 @@ mod tests {
         )
         .unwrap();
 
-        let client = DetectedClient {
+        let client = ClientConfig {
             name: "Test".to_string(),
             config_path: config_path.clone(),
+            mcp_key: "mcpServers".to_string(),
             already_configured: false,
         };
 
@@ -251,6 +325,161 @@ mod tests {
     }
 
     #[test]
+    fn configure_client_uses_custom_mcp_key() {
+        let tmp = temp_root("custom-key");
+        fs::create_dir_all(&tmp).unwrap();
+        let config_path = tmp.join("settings.json").into_std_path_buf();
+
+        let client = ClientConfig {
+            name: "Custom Client".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+        };
+
+        configure_client(&client, "/usr/local/bin/skillrunner", &None).unwrap();
+
+        let content: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+
+        // Written under the custom key
+        assert_eq!(
+            content["mcpServers"]["skillrunner"]["command"],
+            "/usr/local/bin/skillrunner"
+        );
+        // The default "mcpServers" key should NOT be present
+        assert!(content.get("mcpServers").is_some());
+
+        let _ = fs::remove_dir_all(tmp.as_str());
+    }
+
+    #[test]
+    fn detect_windsurf_when_dir_exists() {
+        let tmp = temp_root("windsurf");
+        let windsurf_dir = tmp.join(".codeium").join("windsurf");
+        fs::create_dir_all(&windsurf_dir).unwrap();
+
+        // Override HOME so detect_ai_clients looks in our temp dir
+        std::env::set_var("HOME", tmp.as_str());
+
+        let clients = detect_ai_clients("/usr/local/bin/skillrunner");
+        let windsurf = clients.iter().find(|c| c.name == "Windsurf");
+        assert!(windsurf.is_some(), "Windsurf should be detected");
+        assert_eq!(windsurf.unwrap().mcp_key, "mcpServers");
+
+        let _ = fs::remove_dir_all(tmp.as_str());
+    }
+
+    #[test]
+    fn detect_gemini_cli_when_dir_exists() {
+        let tmp = temp_root("gemini");
+        let gemini_dir = tmp.join(".gemini");
+        fs::create_dir_all(&gemini_dir).unwrap();
+
+        std::env::set_var("HOME", tmp.as_str());
+
+        let clients = detect_ai_clients("/usr/local/bin/skillrunner");
+        let gemini = clients.iter().find(|c| c.name == "Gemini CLI");
+        assert!(gemini.is_some(), "Gemini CLI should be detected");
+        assert_eq!(gemini.unwrap().mcp_key, "mcpServers");
+
+        let _ = fs::remove_dir_all(tmp.as_str());
+    }
+
+    #[test]
+    fn detect_vscode_when_settings_dir_exists() {
+        let tmp = temp_root("vscode");
+
+        #[cfg(target_os = "macos")]
+        let vscode_dir = tmp
+            .join("Library")
+            .join("Application Support")
+            .join("Code")
+            .join("User");
+        #[cfg(target_os = "linux")]
+        let vscode_dir = tmp.join(".config").join("Code").join("User");
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            // VS Code detection not supported on this OS, skip
+            return;
+        }
+
+        fs::create_dir_all(&vscode_dir).unwrap();
+
+        std::env::set_var("HOME", tmp.as_str());
+
+        let clients = detect_ai_clients("/usr/local/bin/skillrunner");
+        let vscode = clients.iter().find(|c| c.name == "VS Code");
+        assert!(vscode.is_some(), "VS Code should be detected");
+        assert_eq!(vscode.unwrap().mcp_key, "mcpServers");
+
+        let _ = fs::remove_dir_all(tmp.as_str());
+    }
+
+    #[test]
+    fn windsurf_configure_writes_correct_config() {
+        let tmp = temp_root("windsurf-cfg");
+        let windsurf_dir = tmp.join(".codeium").join("windsurf");
+        fs::create_dir_all(&windsurf_dir).unwrap();
+        let config_path = windsurf_dir.join("mcp_config.json").into_std_path_buf();
+
+        let client = ClientConfig {
+            name: "Windsurf".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+        };
+
+        configure_client(&client, "/usr/local/bin/skillrunner", &None).unwrap();
+
+        let content: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+
+        assert_eq!(
+            content["mcpServers"]["skillrunner"]["command"],
+            "/usr/local/bin/skillrunner"
+        );
+
+        let _ = fs::remove_dir_all(tmp.as_str());
+    }
+
+    #[test]
+    fn gemini_cli_configure_writes_correct_config() {
+        let tmp = temp_root("gemini-cfg");
+        let gemini_dir = tmp.join(".gemini");
+        fs::create_dir_all(&gemini_dir).unwrap();
+        let config_path = gemini_dir.join("settings.json").into_std_path_buf();
+
+        let client = ClientConfig {
+            name: "Gemini CLI".to_string(),
+            config_path: config_path.clone(),
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+        };
+
+        configure_client(
+            &client,
+            "/usr/local/bin/skillrunner",
+            &Some("https://registry.test.com".to_string()),
+        )
+        .unwrap();
+
+        let content: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+
+        assert_eq!(
+            content["mcpServers"]["skillrunner"]["command"],
+            "/usr/local/bin/skillrunner"
+        );
+        assert_eq!(
+            content["mcpServers"]["skillrunner"]["env"]["SKILLCLUB_REGISTRY_URL"],
+            "https://registry.test.com"
+        );
+
+        let _ = fs::remove_dir_all(tmp.as_str());
+    }
+
+    #[test]
     fn first_run_tracking() {
         let state_root = temp_root("first-run");
         let state =
@@ -264,12 +493,15 @@ mod tests {
     }
 
     #[test]
-    fn is_skillclub_configured_false_when_missing() {
-        assert!(!is_skillclub_configured(&PathBuf::from("/nonexistent/path.json")));
+    fn is_skillrunner_configured_false_when_missing() {
+        assert!(!is_skillrunner_configured(
+            &PathBuf::from("/nonexistent/path.json"),
+            "mcpServers"
+        ));
     }
 
     #[test]
-    fn is_skillclub_configured_true_when_present() {
+    fn is_skillrunner_configured_true_when_present() {
         let tmp = temp_root("configured-check");
         fs::create_dir_all(&tmp).unwrap();
         let config_path = tmp.join("check.json").into_std_path_buf();
@@ -279,7 +511,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(is_skillclub_configured(&config_path));
+        assert!(is_skillrunner_configured(&config_path, "mcpServers"));
 
         let _ = fs::remove_dir_all(tmp.as_str());
     }
