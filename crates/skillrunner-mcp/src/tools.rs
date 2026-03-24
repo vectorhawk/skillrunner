@@ -173,6 +173,39 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
 
     if registry_url.is_some() {
         tools.push(ToolDefinition {
+            name: "skillclub_login".to_string(),
+            description: "Log in to the SkillClub registry. Required before publishing skills or accessing registry-gated features. Saves your session so you don't need to log in again.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "email": {
+                        "type": "string",
+                        "description": "Your SkillClub account email address"
+                    },
+                    "password": {
+                        "type": "string",
+                        "description": "Your SkillClub account password"
+                    },
+                    "registry_url": {
+                        "type": "string",
+                        "description": "Optional registry URL override (defaults to the server's configured registry URL)"
+                    }
+                },
+                "required": ["email", "password"]
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "skillclub_logout".to_string(),
+            description: "Log out of the SkillClub registry. Clears stored authentication tokens.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        });
+
+        tools.push(ToolDefinition {
             name: "skillclub_search".to_string(),
             description: "Search the SkillClub skill registry for skills that can be installed. Use this when the user asks 'what skills are available', 'find skills for X', or wants to discover new capabilities. Use an empty query to list all available skills.".to_string(),
             input_schema: serde_json::json!({
@@ -301,6 +334,8 @@ pub fn handle_tool_call(
         "skillclub_author" => handle_author(arguments),
         "skillclub_validate" => handle_validate(arguments),
         "skillclub_publish" => handle_publish(arguments, state, registry_url),
+        "skillclub_login" => handle_login(arguments, state, registry_url),
+        "skillclub_logout" => handle_logout(state, registry_url),
         "skillclub_mcp_catalog" => handle_mcp_catalog(state, registry_url),
         "skillclub_mcp_request" => handle_mcp_request(arguments, state, registry_url),
         "skillclub_mcp_status" => handle_mcp_status(state, registry_url),
@@ -748,17 +783,89 @@ fn try_refresh_auth(
 }
 
 /// Build an elicitation-style prompt that asks the user to authenticate.
-/// Includes both the MCP elicitation format (for clients that support it)
-/// and a CLI fallback instruction.
+/// Directs the user to the `skillclub_login` MCP tool, which can be used
+/// directly without leaving the AI client.
 fn auth_elicitation_prompt(registry_url: &str) -> ToolCallResult {
     ToolCallResult::error(format!(
         "Authentication required.\n\n\
-        To authenticate, please run:\n\
-        ```\n\
-        skillrunner auth login --registry-url {registry_url}\n\
-        ```\n\n\
+        Use the `skillclub_login` tool to log in:\n\
+        - email: your SkillClub email\n\
+        - password: your SkillClub password\n\
+        - registry_url: {registry_url} (pre-filled)\n\n\
         After logging in, retry this command."
     ))
+}
+
+// ── Auth tool handlers ────────────────────────────────────────────────────────
+
+fn handle_login(
+    arguments: &serde_json::Value,
+    state: &AppState,
+    server_registry_url: &Option<String>,
+) -> ToolCallResult {
+    let email = match arguments.get("email").and_then(|v| v.as_str()) {
+        Some(e) => e,
+        None => return ToolCallResult::error("Missing required parameter: email"),
+    };
+
+    let password = match arguments.get("password").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return ToolCallResult::error("Missing required parameter: password"),
+    };
+
+    // registry_url from arguments takes precedence; fall back to server's configured URL.
+    let registry_url_arg = arguments
+        .get("registry_url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let registry_url = match registry_url_arg.as_ref().or(server_registry_url.as_ref()) {
+        Some(u) => u.clone(),
+        None => {
+            return ToolCallResult::error(
+                "No registry URL configured. Pass registry_url as an argument.",
+            )
+        }
+    };
+
+    let auth_client = AuthClient::new(&registry_url);
+
+    let tokens = match auth_client.login(email, password) {
+        Ok(t) => t,
+        Err(e) => return ToolCallResult::error(format!("Login failed: {e}")),
+    };
+
+    if let Err(e) = auth::save_tokens(
+        state,
+        &registry_url,
+        &tokens.access_token,
+        &tokens.refresh_token,
+    ) {
+        return ToolCallResult::error(format!("Failed to save tokens: {e}"));
+    }
+
+    let user_info = match auth_client.me(&tokens.access_token) {
+        Ok(u) => u,
+        Err(e) => return ToolCallResult::error(format!("Login succeeded but failed to fetch user info: {e}")),
+    };
+
+    ToolCallResult::success(format!(
+        "Logged in successfully.\n\
+        Email: {}\n\
+        Display name: {}",
+        user_info.email, user_info.display_name,
+    ))
+}
+
+fn handle_logout(state: &AppState, server_registry_url: &Option<String>) -> ToolCallResult {
+    let registry_url = match server_registry_url {
+        Some(u) => u,
+        None => return ToolCallResult::error("No registry URL configured"),
+    };
+
+    match auth::clear_tokens(state, registry_url) {
+        Ok(()) => ToolCallResult::success("Logged out successfully."),
+        Err(e) => ToolCallResult::error(format!("Failed to clear tokens: {e}")),
+    }
 }
 
 // ── MCP Governance tool handlers ──────────────────────────────────────────────
@@ -1438,5 +1545,273 @@ mod tests {
 
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    // ── Auth tool tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn handle_login_requires_email() {
+        let state_root = temp_root("login-no-email");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let result = handle_login(
+            &serde_json::json!({"password": "secret"}),
+            &state,
+            &Some("http://localhost:8000".to_string()),
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("email"));
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_login_requires_password() {
+        let state_root = temp_root("login-no-password");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let result = handle_login(
+            &serde_json::json!({"email": "user@example.com"}),
+            &state,
+            &Some("http://localhost:8000".to_string()),
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("password"));
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_login_requires_registry_url() {
+        let state_root = temp_root("login-no-registry");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let result = handle_login(
+            &serde_json::json!({"email": "user@example.com", "password": "secret"}),
+            &state,
+            &None,
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("registry"));
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_login_success_returns_user_info() {
+        use mockito::Server;
+        let mut server = Server::new();
+
+        let _mock_login = server
+            .mock("POST", "/portal/auth/login")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"access_token":"tok_abc","refresh_token":"ref_xyz","token_type":"bearer"}"#,
+            )
+            .create();
+
+        let _mock_me = server
+            .mock("GET", "/portal/auth/me")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"id":"user-1","email":"alice@example.com","display_name":"Alice"}"#,
+            )
+            .create();
+
+        let state_root = temp_root("login-success");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let registry_url = server.url();
+
+        let result = handle_login(
+            &serde_json::json!({"email": "alice@example.com", "password": "correct"}),
+            &state,
+            &Some(registry_url.clone()),
+        );
+
+        assert!(
+            result.is_error.is_none(),
+            "expected success, got: {}",
+            result.content[0].text
+        );
+        let text = &result.content[0].text;
+        assert!(text.contains("alice@example.com"), "got: {text}");
+        assert!(text.contains("Alice"), "got: {text}");
+
+        // Verify tokens were persisted
+        let loaded = auth::load_tokens(&state, &registry_url).unwrap();
+        assert!(loaded.is_some(), "tokens should be saved after login");
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.access_token, "tok_abc");
+        assert_eq!(loaded.refresh_token, "ref_xyz");
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_login_forwards_registry_url_arg() {
+        use mockito::Server;
+        let mut server = Server::new();
+
+        let _mock_login = server
+            .mock("POST", "/portal/auth/login")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"access_token":"tok_override","refresh_token":"ref_override","token_type":"bearer"}"#,
+            )
+            .create();
+
+        let _mock_me = server
+            .mock("GET", "/portal/auth/me")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"u2","email":"bob@example.com","display_name":"Bob"}"#)
+            .create();
+
+        let state_root = temp_root("login-url-override");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let override_url = server.url();
+
+        // Pass registry_url as an argument, server config has a different (wrong) URL.
+        let result = handle_login(
+            &serde_json::json!({
+                "email": "bob@example.com",
+                "password": "secret",
+                "registry_url": override_url,
+            }),
+            &state,
+            &Some("http://wrong-server:9999".to_string()),
+        );
+
+        assert!(
+            result.is_error.is_none(),
+            "expected success with URL override, got: {}",
+            result.content[0].text
+        );
+        assert!(result.content[0].text.contains("Bob"));
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_login_bad_credentials_returns_error() {
+        use mockito::Server;
+        let mut server = Server::new();
+
+        let _mock = server
+            .mock("POST", "/portal/auth/login")
+            .with_status(401)
+            .with_body(r#"{"detail":"Invalid credentials"}"#)
+            .create();
+
+        let state_root = temp_root("login-bad-creds");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let result = handle_login(
+            &serde_json::json!({"email": "bad@example.com", "password": "wrong"}),
+            &state,
+            &Some(server.url()),
+        );
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result.content[0].text.contains("Login failed"),
+            "got: {}",
+            result.content[0].text
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_logout_clears_tokens() {
+        let state_root = temp_root("logout-clears");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let registry_url = "http://localhost:8000".to_string();
+
+        // Save some tokens first
+        auth::save_tokens(&state, &registry_url, "tok", "ref").unwrap();
+        assert!(auth::load_tokens(&state, &registry_url).unwrap().is_some());
+
+        let result = handle_logout(&state, &Some(registry_url.clone()));
+        assert!(
+            result.is_error.is_none(),
+            "expected success, got: {}",
+            result.content[0].text
+        );
+        assert!(result.content[0].text.contains("Logged out"));
+
+        // Tokens should be gone
+        assert!(auth::load_tokens(&state, &registry_url).unwrap().is_none());
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_logout_requires_registry_url() {
+        let state_root = temp_root("logout-no-reg");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let result = handle_logout(&state, &None);
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("registry"));
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_logout_succeeds_when_no_tokens_exist() {
+        // Calling logout when already logged out should not error.
+        let state_root = temp_root("logout-no-tokens");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let result = handle_logout(&state, &Some("http://localhost:8000".to_string()));
+        assert!(
+            result.is_error.is_none(),
+            "logout with no stored tokens should succeed: {}",
+            result.content[0].text
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn build_tool_list_includes_login_logout_with_registry() {
+        let state_root = temp_root("tool-list-auth");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let tools = build_tool_list(&state, &Some("http://localhost:8000".to_string()));
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+        assert!(names.contains(&"skillclub_login"), "login tool missing: {names:?}");
+        assert!(names.contains(&"skillclub_logout"), "logout tool missing: {names:?}");
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn build_tool_list_omits_login_logout_without_registry() {
+        let state_root = temp_root("tool-list-auth-no-reg");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let tools = build_tool_list(&state, &None);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+        assert!(!names.contains(&"skillclub_login"), "login should not appear without registry");
+        assert!(!names.contains(&"skillclub_logout"), "logout should not appear without registry");
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn auth_elicitation_prompt_mentions_skillclub_login() {
+        let prompt = auth_elicitation_prompt("http://registry.example.com");
+        assert!(
+            prompt.content[0].text.contains("skillclub_login"),
+            "elicitation prompt should reference skillclub_login tool, got: {}",
+            prompt.content[0].text
+        );
     }
 }
