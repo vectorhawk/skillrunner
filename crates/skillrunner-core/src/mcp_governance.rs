@@ -31,18 +31,15 @@ pub struct McpServersResponse {
 // ── Managed MCP config (written to disk) ─────────────────────────────────────
 
 /// The `managed-mcp.json` structure written for Claude Code / Cursor.
+///
+/// Claude Code's native format only contains `mcpServers`. When written to the
+/// system-level path it triggers exclusive mode; written to the user path it
+/// is additive.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ManagedMcpConfig {
-    /// Governance mode: "allowlist" (default) or "exclusive" (enterprise opt-in)
-    #[serde(default = "default_governance_mode")]
-    pub mcp_governance_mode: String,
     /// MCP server entries keyed by name
     #[serde(rename = "mcpServers")]
     pub mcp_servers: serde_json::Map<String, serde_json::Value>,
-}
-
-fn default_governance_mode() -> String {
-    "allowlist".to_string()
 }
 
 // ── Sync result ──────────────────────────────────────────────────────────────
@@ -149,12 +146,16 @@ impl RegistryClient {
 /// - Caches in local SQLite for offline resilience
 /// - Builds `managed-mcp.json` with SkillRunner always as entry #1
 /// - Blocked servers are excluded from the config
+/// - When `system_level` is true, writes to the OS system path which triggers
+///   Claude Code's exclusive mode (requires admin/root).
+/// - When `system_level` is false, writes to the user-level path (additive mode).
 pub fn sync_mcp_config(
     state: &AppState,
     registry: &RegistryClient,
     skillrunner_path: &str,
     registry_url: &str,
     dry_run: bool,
+    system_level: bool,
 ) -> Result<SyncResult> {
     // Try to fetch from registry, fall back to cache on failure
     let response = match registry.fetch_mcp_servers() {
@@ -186,7 +187,7 @@ pub fn sync_mcp_config(
         serde_json::Value::String(registry_url.to_string()),
     );
     servers.insert(
-        "skillclub".to_string(),
+        "skillrunner".to_string(),
         serde_json::json!({
             "command": skillrunner_path,
             "args": ["mcp", "serve"],
@@ -225,28 +226,55 @@ pub fn sync_mcp_config(
         servers_synced += 1;
     }
 
-    let config = ManagedMcpConfig {
-        mcp_governance_mode: "allowlist".to_string(),
-        mcp_servers: servers,
-    };
+    if system_level {
+        // Enterprise: write standalone managed-mcp.json to system path
+        // Claude Code enters exclusive mode when this file exists.
+        let config = ManagedMcpConfig {
+            mcp_servers: servers,
+        };
+        let config_path = system_managed_mcp_path();
 
-    // Determine output path
-    let config_path = managed_mcp_path();
-
-    if dry_run {
-        let json = serde_json::to_string_pretty(&config)?;
-        info!("dry run — would write to {}:\n{}", config_path, json);
-    } else {
-        // Ensure parent directory exists
-        if let Some(parent) = std::path::Path::new(&config_path).parent() {
-            fs::create_dir_all(parent)?;
+        if dry_run {
+            let json = serde_json::to_string_pretty(&config)?;
+            info!("dry run — would write to {}:\n{}", config_path, json);
+        } else {
+            if let Some(parent) = std::path::Path::new(&config_path).parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let json = serde_json::to_string_pretty(&config)?;
+            fs::write(&config_path, &json)
+                .with_context(|| format!("failed to write {config_path}"))?;
+            info!(path = config_path, servers = servers_synced, "wrote managed-mcp.json");
         }
-        let json = serde_json::to_string_pretty(&config)?;
-        fs::write(&config_path, &json)
-            .with_context(|| format!("failed to write {config_path}"))?;
-        info!(path = config_path, servers = servers_synced, "wrote managed-mcp.json");
+
+        return finish_sync(state, registry, servers_synced, servers_blocked, &response.approval_mode, &config_path);
     }
 
+    // User-level: merge governed servers into ~/.claude.json mcpServers.
+    // Claude Code only reads mcpServers from ~/.claude.json at the user level.
+    let config_path = claude_json_path();
+
+    if dry_run {
+        info!("dry run — would merge {} servers into {}", servers.len(), config_path);
+        for (name, _) in &servers {
+            info!("  would add/update: {}", name);
+        }
+    } else {
+        merge_into_claude_json(&config_path, &servers)?;
+        info!(path = config_path, servers = servers_synced, "merged servers into claude.json");
+    }
+
+    finish_sync(state, registry, servers_synced, servers_blocked, &response.approval_mode, &config_path)
+}
+
+fn finish_sync(
+    state: &AppState,
+    registry: &RegistryClient,
+    servers_synced: usize,
+    servers_blocked: usize,
+    approval_mode: &str,
+    config_path: &str,
+) -> Result<SyncResult> {
     // Flush audit buffer on each sync
     match flush_audit_buffer(state, registry) {
         Ok(n) if n > 0 => info!(count = n, "flushed audit events during sync"),
@@ -257,15 +285,60 @@ pub fn sync_mcp_config(
     Ok(SyncResult {
         servers_synced,
         servers_blocked,
-        approval_mode: response.approval_mode,
-        config_path,
+        approval_mode: approval_mode.to_string(),
+        config_path: config_path.to_string(),
     })
 }
 
-/// Get the path for `managed-mcp.json` (Claude Code format).
-fn managed_mcp_path() -> String {
+/// Path to ~/.claude.json (Claude Code's user-level config).
+fn claude_json_path() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    format!("{}/.claude/managed-mcp.json", home)
+    format!("{}/.claude.json", home)
+}
+
+/// Merge governed MCP servers into ~/.claude.json mcpServers.
+///
+/// Reads the existing config, adds/overwrites entries for governed servers,
+/// and writes back. Non-governed entries the user has manually added are preserved.
+fn merge_into_claude_json(
+    path: &str,
+    servers: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    let mut config: serde_json::Value = if std::path::Path::new(path).exists() {
+        let text = fs::read_to_string(path)?;
+        serde_json::from_str(&text).unwrap_or(serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    let mcp_servers = config
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("~/.claude.json is not a JSON object"))?
+        .entry("mcpServers")
+        .or_insert(serde_json::json!({}));
+
+    let mcp_map = mcp_servers
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("mcpServers is not a JSON object"))?;
+
+    for (name, value) in servers {
+        mcp_map.insert(name.clone(), value.clone());
+    }
+
+    let json = serde_json::to_string_pretty(&config)?;
+    fs::write(path, &json).with_context(|| format!("failed to write {path}"))?;
+
+    Ok(())
+}
+
+/// System-level managed-mcp.json — triggers Claude Code exclusive mode.
+/// Requires admin/root to write.
+fn system_managed_mcp_path() -> String {
+    if cfg!(target_os = "macos") {
+        "/Library/Application Support/ClaudeCode/managed-mcp.json".to_string()
+    } else {
+        "/etc/claude-code/managed-mcp.json".to_string()
+    }
 }
 
 // ── SQLite cache ─────────────────────────────────────────────────────────────
@@ -571,7 +644,8 @@ mod tests {
             &registry,
             "/usr/local/bin/skillrunner",
             &server.url(),
-            true, // dry run
+            true,  // dry run
+            false, // user-level path
         )
         .unwrap();
 
@@ -809,7 +883,8 @@ mod tests {
             &registry,
             "/usr/local/bin/skillrunner",
             "http://127.0.0.1:1",
-            true, // dry run
+            true,  // dry run
+            false, // user-level path
         )
         .unwrap();
 

@@ -747,7 +747,8 @@ fn handle_mcp_catalog(state: &AppState, registry_url: &Option<String>) -> ToolCa
                 &registry,
                 "skillrunner",
                 url,
-                true, // dry run — just cache, don't write file
+                true,  // dry run — just cache, don't write file
+                false, // user-level path
             );
 
             let formatted: Vec<serde_json::Value> = resp
@@ -862,7 +863,8 @@ fn handle_mcp_request(
                 &registry,
                 &skillrunner_path,
                 url,
-                false,
+                false, // not dry run
+                false, // user-level path
             );
 
             ToolCallResult::success(format!(

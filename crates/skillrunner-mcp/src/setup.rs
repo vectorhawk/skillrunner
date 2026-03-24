@@ -74,7 +74,7 @@ pub fn configure_client(
         env["SKILLCLUB_REGISTRY_URL"] = json!(url);
     }
 
-    mcp_servers["skillclub"] = json!({
+    mcp_servers["skillrunner"] = json!({
         "command": skillrunner_path,
         "args": ["mcp", "serve"],
         "env": env,
@@ -151,7 +151,7 @@ fn is_skillclub_configured(config_path: &PathBuf) -> bool {
     };
     config
         .get("mcpServers")
-        .and_then(|s| s.get("skillclub"))
+        .and_then(|s| s.get("skillrunner"))
         .is_some()
 }
 
@@ -195,19 +195,19 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
 
         assert_eq!(
-            content["mcpServers"]["skillclub"]["command"],
+            content["mcpServers"]["skillrunner"]["command"],
             "/usr/local/bin/skillrunner"
         );
         assert_eq!(
-            content["mcpServers"]["skillclub"]["args"][0],
+            content["mcpServers"]["skillrunner"]["args"][0],
             "mcp"
         );
         assert_eq!(
-            content["mcpServers"]["skillclub"]["args"][1],
+            content["mcpServers"]["skillrunner"]["args"][1],
             "serve"
         );
         assert_eq!(
-            content["mcpServers"]["skillclub"]["env"]["SKILLCLUB_REGISTRY_URL"],
+            content["mcpServers"]["skillrunner"]["env"]["SKILLCLUB_REGISTRY_URL"],
             "https://registry.skillclub.ai"
         );
 
@@ -243,7 +243,7 @@ mod tests {
         assert_eq!(content["mcpServers"]["other-server"]["command"], "other");
         // SkillClub added
         assert_eq!(
-            content["mcpServers"]["skillclub"]["command"],
+            content["mcpServers"]["skillrunner"]["command"],
             "/usr/local/bin/skillrunner"
         );
 
@@ -275,7 +275,7 @@ mod tests {
         let config_path = tmp.join("check.json").into_std_path_buf();
         fs::write(
             &config_path,
-            r#"{"mcpServers":{"skillclub":{"command":"skillrunner"}}}"#,
+            r#"{"mcpServers":{"skillrunner":{"command":"skillrunner"}}}"#,
         )
         .unwrap();
 

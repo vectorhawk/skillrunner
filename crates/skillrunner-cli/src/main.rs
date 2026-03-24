@@ -93,6 +93,9 @@ enum McpCommands {
         /// Show what would be synced without writing files
         #[arg(long)]
         dry_run: bool,
+        /// Write to system-level path (enterprise exclusive mode, requires admin/root)
+        #[arg(long)]
+        system: bool,
     },
 }
 
@@ -301,7 +304,7 @@ fn main() -> Result<()> {
                 };
                 run_server(app.state, config)?;
             }
-            McpCommands::Sync { registry_url, dry_run } => {
+            McpCommands::Sync { registry_url, dry_run, system } => {
                 let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
                 let registry = RegistryClient::new(&url);
                 let skillrunner_path = std::env::current_exe()
@@ -315,6 +318,7 @@ fn main() -> Result<()> {
                     &skillrunner_path,
                     &url,
                     dry_run,
+                    system,
                 )?;
 
                 if dry_run {
@@ -326,7 +330,7 @@ fn main() -> Result<()> {
                 println!("Servers synced: {} (blocked: {})", result.servers_synced, result.servers_blocked);
                 println!("\nRestart Claude Code to apply changes.");
             }
-            McpCommands::Setup { registry_url, client, auto: _auto, system: _system } => {
+            McpCommands::Setup { registry_url, client, auto: _auto, system } => {
                 let effective_url = resolve_registry_url(registry_url, managed_registry_url.as_deref());
                 let skillrunner_path = std::env::current_exe()
                     .ok()
@@ -334,7 +338,6 @@ fn main() -> Result<()> {
                     .unwrap_or_else(|| "skillrunner".to_string());
 
                 // --auto: non-interactive mode (current behavior is already non-interactive)
-                // --system: writes system-level managed-mcp.json (future: /etc/skillclub/)
 
                 let clients = detect_ai_clients(&skillrunner_path);
                 if clients.is_empty() {
@@ -373,6 +376,26 @@ fn main() -> Result<()> {
                 }
 
                 mark_first_run_offered(&app.state)?;
+
+                // --system: also write system-level managed-mcp.json for enterprise
+                // exclusive mode. Requires admin/root; will fail with a permission
+                // error if not elevated.
+                if system {
+                    let url = require_registry_url(effective_url.clone(), managed_registry_url.as_deref())?;
+                    let registry = RegistryClient::new(&url);
+                    let result = mcp_governance::sync_mcp_config(
+                        &app.state,
+                        &registry,
+                        &skillrunner_path,
+                        &url,
+                        false, // not dry run
+                        true,  // system_level
+                    )?;
+                    println!("Wrote system-level managed config: {}", result.config_path);
+                    println!("Servers synced: {} (blocked: {})", result.servers_synced, result.servers_blocked);
+                    println!("Claude Code exclusive mode will be active on restart.");
+                }
+
                 println!("\nRestart your AI client to activate SkillRunner MCP.");
             }
         },
