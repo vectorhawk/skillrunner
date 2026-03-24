@@ -1,4 +1,5 @@
 use crate::{
+    aggregator::BackendRegistry,
     protocol::{
         InitializeResult, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, ServerCapabilities,
         ServerInfo, ToolCallParams, ToolsCapability, ToolsListResult, INVALID_PARAMS,
@@ -17,13 +18,79 @@ use skillrunner_core::{
 };
 use std::io;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, error, info};
+use std::time::{Duration, Instant};
+use tracing::{debug, error, info, warn};
+
+/// Minimum interval between automatic aggregator syncs triggered by tools/list.
+const AGGREGATOR_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Configuration for the MCP server.
 pub struct McpServerConfig {
     pub registry_url: Option<String>,
     pub ollama_url: String,
     pub model: String,
+}
+
+/// Mutable state shared across request dispatches within a single server session.
+struct ServerState {
+    /// The backend aggregator — manages all proxied backend connections.
+    aggregator: BackendRegistry,
+    /// Registry client (present when a registry URL is configured).
+    registry_client: Option<RegistryClient>,
+    /// Time of the last successful aggregator sync, for throttling.
+    last_aggregator_sync: Option<Instant>,
+    /// Number of aggregated tools from the last sync (used to detect changes).
+    last_aggregated_tool_count: usize,
+}
+
+impl ServerState {
+    fn new(registry_client: Option<RegistryClient>) -> Self {
+        Self {
+            aggregator: BackendRegistry::new(),
+            registry_client,
+            last_aggregator_sync: None,
+            last_aggregated_tool_count: 0,
+        }
+    }
+
+    /// Attempt a throttled sync of the aggregator with the registry.
+    ///
+    /// Returns `true` if the sync changed the tool count (caller should fire
+    /// `notifications/tools/list_changed`).
+    fn maybe_sync_aggregator(&mut self, app_state: &AppState) -> bool {
+        let should_sync = match self.last_aggregator_sync {
+            None => true,
+            Some(t) => t.elapsed() >= AGGREGATOR_REFRESH_INTERVAL,
+        };
+
+        if !should_sync {
+            return false;
+        }
+
+        let Some(registry) = &self.registry_client else {
+            return false;
+        };
+
+        match self.aggregator.sync(app_state, registry) {
+            Ok(_count) => {
+                self.last_aggregator_sync = Some(Instant::now());
+                let new_count = self.aggregator.all_tools().len();
+                let changed = new_count != self.last_aggregated_tool_count;
+                self.last_aggregated_tool_count = new_count;
+                if changed {
+                    info!(
+                        tools = new_count,
+                        "aggregator tool count changed — will fire list_changed"
+                    );
+                }
+                changed
+            }
+            Err(e) => {
+                warn!(error = %e, "aggregator sync failed");
+                false
+            }
+        }
+    }
 }
 
 /// Run the MCP server over stdio.
@@ -60,13 +127,14 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
 
     info!(
         "MCP server starting (ollama={}, registry={})",
-        if ollama_available {
-            "available"
-        } else {
-            "unavailable"
-        },
+        if ollama_available { "available" } else { "unavailable" },
         config.registry_url.as_deref().unwrap_or("none"),
     );
+
+    let mut server_state = ServerState::new(registry_client);
+
+    // Initial aggregator sync (best-effort — don't block startup on failure)
+    let _ = server_state.maybe_sync_aggregator(&state);
 
     loop {
         // Read next line from stdin (release lock before dispatching)
@@ -108,6 +176,14 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
             continue;
         }
 
+        // On tools/list, attempt a throttled aggregator refresh.
+        // Track whether a sync caused the tool count to change.
+        let aggregator_changed = if request.method == "tools/list" {
+            server_state.maybe_sync_aggregator(&state)
+        } else {
+            false
+        };
+
         // Dispatch the request — during tools/call, this may trigger
         // sampling requests through the shared_io (the lock is not held here)
         let response = dispatch_request(
@@ -115,7 +191,8 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
             &state,
             &config,
             Some(&hybrid_client),
-            registry_client.as_ref(),
+            server_state.registry_client.as_ref(),
+            &server_state.aggregator,
         );
 
         // Write response (lock shared_io)
@@ -124,20 +201,25 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
             io.write_message(&serde_json::to_string(&response)?)?;
         }
 
-        // After install, notify client that tools list changed
-        if request.method == "tools/call" {
-            if let Ok(params) = serde_json::from_value::<ToolCallParams>(request.params.clone()) {
-                if params.name == "skillclub_install" {
-                    let notification =
-                        JsonRpcNotification::new("notifications/tools/list_changed");
-                    let mut io = shared_io.lock().unwrap();
-                    io.write_message(&serde_json::to_string(&notification)?)?;
-                }
-            }
+        // Fire list_changed notifications:
+        // 1. After a skill install (existing behaviour)
+        // 2. After an aggregator sync that changed the tool count
+        let fire_list_changed = aggregator_changed || {
+            request.method == "tools/call"
+                && serde_json::from_value::<ToolCallParams>(request.params.clone())
+                    .map(|p| p.name == "skillclub_install")
+                    .unwrap_or(false)
+        };
+
+        if fire_list_changed {
+            let notification = JsonRpcNotification::new("notifications/tools/list_changed");
+            let mut io = shared_io.lock().unwrap();
+            io.write_message(&serde_json::to_string(&notification)?)?;
         }
     }
 
     info!("MCP server shutting down");
+    server_state.aggregator.shutdown();
     Ok(())
 }
 
@@ -147,16 +229,18 @@ fn dispatch_request(
     config: &McpServerConfig,
     model_client: Option<&dyn ModelClient>,
     registry_client: Option<&RegistryClient>,
+    aggregator: &BackendRegistry,
 ) -> JsonRpcResponse {
     match request.method.as_str() {
         "initialize" => handle_initialize(request),
-        "tools/list" => handle_tools_list(request, state, &config.registry_url),
+        "tools/list" => handle_tools_list(request, state, &config.registry_url, aggregator),
         "tools/call" => handle_tools_call(
             request,
             state,
             config,
             model_client,
             registry_client,
+            aggregator,
         ),
         _ => JsonRpcResponse::error(
             request.id.clone(),
@@ -188,8 +272,35 @@ fn handle_tools_list(
     request: &JsonRpcRequest,
     state: &AppState,
     registry_url: &Option<String>,
+    aggregator: &BackendRegistry,
 ) -> JsonRpcResponse {
-    let tools = build_tool_list(state, registry_url);
+    // Skill + governance tools from the existing layer
+    let mut tools = build_tool_list(state, registry_url);
+
+    // Merge in proxied backend tools from the aggregator
+    let backend_tools = aggregator.all_tools();
+    for bt in backend_tools {
+        // Convert the aggregator's serde_json::Value into a protocol ToolDefinition
+        let name = bt["name"].as_str().unwrap_or("").to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let description = bt["description"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        let input_schema = bt
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}}));
+
+        tools.push(crate::protocol::ToolDefinition {
+            name,
+            description,
+            input_schema,
+        });
+    }
+
     let result = ToolsListResult { tools };
     JsonRpcResponse::success(
         request.id.clone(),
@@ -203,6 +314,7 @@ fn handle_tools_call(
     config: &McpServerConfig,
     model_client: Option<&dyn ModelClient>,
     registry_client: Option<&RegistryClient>,
+    aggregator: &BackendRegistry,
 ) -> JsonRpcResponse {
     let params: ToolCallParams = match serde_json::from_value(request.params.clone()) {
         Ok(p) => p,
@@ -215,7 +327,30 @@ fn handle_tools_call(
         }
     };
 
-    // Build policy client based on registry availability
+    // Try aggregator first for namespaced backend tools
+    if let Some(dispatch_result) = aggregator.dispatch(&params.name, &params.arguments) {
+        return match dispatch_result {
+            Ok(value) => {
+                let call_result = crate::protocol::ToolCallResult::success(
+                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
+                );
+                JsonRpcResponse::success(
+                    request.id.clone(),
+                    serde_json::to_value(call_result).unwrap_or_default(),
+                )
+            }
+            Err(e) => {
+                let call_result =
+                    crate::protocol::ToolCallResult::error(format!("Backend tool error: {e}"));
+                JsonRpcResponse::success(
+                    request.id.clone(),
+                    serde_json::to_value(call_result).unwrap_or_default(),
+                )
+            }
+        };
+    }
+
+    // Fall through to skill / governance tool layer
     let registry_url = &config.registry_url;
     let result = if let Some(url) = registry_url {
         let http_policy = HttpPolicyClient::new(RegistryClient::new(url), state);
@@ -250,16 +385,33 @@ fn handle_tools_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aggregator::{BackendConnection, HttpBackend, ToolDefinition as AggToolDef, ToolVisibility};
+
+    fn temp_state(label: &str) -> (AppState, camino::Utf8PathBuf) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = camino::Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("mcp-server-test-{label}-{nanos}")),
+        )
+        .unwrap();
+        let state = AppState::bootstrap_in(root.clone()).unwrap();
+        (state, root)
+    }
+
+    fn make_request(id: u64, method: &str) -> JsonRpcRequest {
+        JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(serde_json::json!(id)),
+            method: method.to_string(),
+            params: serde_json::json!({}),
+        }
+    }
 
     #[test]
     fn handle_initialize_returns_capabilities() {
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(serde_json::json!(1)),
-            method: "initialize".to_string(),
-            params: serde_json::json!({}),
-        };
-
+        let req = make_request(1, "initialize");
         let resp = handle_initialize(&req);
         let result = resp.result.unwrap();
         assert_eq!(result["protocolVersion"], "2024-11-05");
@@ -268,31 +420,13 @@ mod tests {
     }
 
     #[test]
-    fn handle_tools_list_returns_tools() {
-        let state_root = camino::Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!(
-                "mcp-server-test-tools-list-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            )),
-        )
-        .unwrap();
-        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+    fn handle_tools_list_returns_skill_tools() {
+        let (state, root) = temp_state("tools-list");
 
-        let req = JsonRpcRequest {
-            jsonrpc: "2.0".to_string(),
-            id: Some(serde_json::json!(2)),
-            method: "tools/list".to_string(),
-            params: serde_json::json!({}),
-        };
+        let req = make_request(2, "tools/list");
+        let aggregator = BackendRegistry::new();
 
-        let resp = handle_tools_list(
-            &req,
-            &state,
-            &Some("http://localhost:8000".to_string()),
-        );
+        let resp = handle_tools_list(&req, &state, &Some("http://localhost:8000".to_string()), &aggregator);
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
@@ -300,27 +434,101 @@ mod tests {
         assert!(names.contains(&"skillclub_list"));
         assert!(names.contains(&"skillclub_search"));
 
-        let _ = std::fs::remove_dir_all(&state_root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn handle_tools_list_includes_aggregator_backends() {
+        let (state, root) = temp_state("tools-list-agg");
+
+        // Inject a backend with tools directly into the registry
+        let aggregator = BackendRegistry::new();
+        {
+            let mut inner = aggregator.inner.lock().unwrap();
+            inner.backends.insert(
+                "github".to_string(),
+                BackendConnection::Http(HttpBackend {
+                    server_id: "github".to_string(),
+                    name: "GitHub".to_string(),
+                    url: "http://unused".to_string(),
+                    tools: vec![
+                        AggToolDef {
+                            name: "create_issue".to_string(),
+                            description: Some("Create a GitHub issue".to_string()),
+                            input_schema: None,
+                        },
+                    ],
+                    tool_visibility: ToolVisibility::All,
+                    priority: 50,
+                }),
+            );
+        }
+
+        let req = make_request(3, "tools/list");
+        let resp = handle_tools_list(&req, &state, &None, &aggregator);
+        let result = resp.result.unwrap();
+        let tools = result["tools"].as_array().unwrap();
+
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        // Namespaced aggregator tool should appear
+        assert!(names.contains(&"github__create_issue"), "expected github__create_issue in tool list: {names:?}");
+        // Existing skill tool should still appear
+        assert!(names.contains(&"skillclub_list"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dispatch_routes_namespaced_tool_to_aggregator() {
+        let (_state, root) = temp_state("dispatch-agg");
+
+        // Inject a backend — dispatch will find no tool (no real server) and
+        // return an error result, not None. The key is it doesn't fall through
+        // to the skill layer.
+        let aggregator = BackendRegistry::new();
+        {
+            let mut inner = aggregator.inner.lock().unwrap();
+            inner.backends.insert(
+                "github".to_string(),
+                BackendConnection::Http(HttpBackend {
+                    server_id: "github".to_string(),
+                    name: "GitHub".to_string(),
+                    url: "http://127.0.0.1:1".to_string(), // unreachable
+                    tools: vec![AggToolDef {
+                        name: "create_issue".to_string(),
+                        description: None,
+                        input_schema: None,
+                    }],
+                    tool_visibility: ToolVisibility::All,
+                    priority: 50,
+                }),
+            );
+        }
+
+        // Dispatch a namespaced tool call
+        let dispatch_result = aggregator.dispatch("github__create_issue", &serde_json::json!({"title": "test"}));
+        // Should get Some(Err(...)) because the backend is unreachable, not None
+        assert!(
+            dispatch_result.is_some(),
+            "aggregator should intercept namespaced tool, not return None"
+        );
+        assert!(
+            dispatch_result.unwrap().is_err(),
+            "unreachable backend should return an error"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn dispatch_unknown_method_returns_error() {
-        let state_root = camino::Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!(
-                "mcp-server-test-unknown-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            )),
-        )
-        .unwrap();
-        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let (state, root) = temp_state("unknown-method");
         let config = McpServerConfig {
             registry_url: None,
             ollama_url: "http://localhost:11434".to_string(),
             model: "llama3.2".to_string(),
         };
+        let aggregator = BackendRegistry::new();
 
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -329,10 +537,10 @@ mod tests {
             params: serde_json::json!({}),
         };
 
-        let resp = dispatch_request(&req, &state, &config, None, None);
+        let resp = dispatch_request(&req, &state, &config, None, None, &aggregator);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.as_ref().unwrap().code, METHOD_NOT_FOUND);
 
-        let _ = std::fs::remove_dir_all(&state_root);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

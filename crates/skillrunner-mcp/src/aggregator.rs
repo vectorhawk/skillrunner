@@ -247,22 +247,22 @@ impl BackendConnection {
 // ── Backend registry ──────────────────────────────────────────────────────────
 
 /// Inner state of the registry, protected by a Mutex for thread safety.
-struct RegistryInner {
+pub(crate) struct RegistryInner {
     /// Active backend connections keyed by server_id.
-    backends: HashMap<String, BackendConnection>,
+    pub(crate) backends: HashMap<String, BackendConnection>,
     /// Tool budget tracker (reset on each sync).
-    budget: ToolBudget,
+    pub(crate) budget: ToolBudget,
     /// Time of the last successful sync.
-    last_synced: Option<Instant>,
+    pub(crate) last_synced: Option<Instant>,
     /// Cached approved server list from the most recent successful registry fetch.
-    last_response: Option<McpServersResponse>,
+    pub(crate) last_response: Option<McpServersResponse>,
 }
 
 /// The central MCP aggregator. Manages all backend connections and exposes a
 /// merged, namespaced tool surface to the MCP server loop.
 #[derive(Clone)]
 pub struct BackendRegistry {
-    inner: Arc<Mutex<RegistryInner>>,
+    pub(crate) inner: Arc<Mutex<RegistryInner>>,
     http: reqwest::blocking::Client,
 }
 
