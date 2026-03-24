@@ -6,7 +6,7 @@ use skillrunner_core::{
     auth::{self, AuthClient},
     executor::run_skill,
     import::import_skill_md,
-    install::install_unpacked_skill,
+    install::{install_unpacked_skill, uninstall_skill},
     mcp_governance,
     model::ModelClient,
     policy::PolicyClient,
@@ -39,6 +39,21 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
             "type": "object",
             "properties": {},
             "required": []
+        }),
+    });
+
+    tools.push(ToolDefinition {
+        name: "skillclub_uninstall".to_string(),
+        description: "Uninstall an installed SkillClub skill by its ID. Removes the skill files and database records.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "skill_id": {
+                    "type": "string",
+                    "description": "The ID of the installed skill to uninstall"
+                }
+            },
+            "required": ["skill_id"]
         }),
     });
 
@@ -281,6 +296,7 @@ pub fn handle_tool_call(
         "skillclub_list" => handle_list(state),
         "skillclub_search" => handle_search(arguments, registry_url),
         "skillclub_install" => handle_install(arguments, state, registry_url),
+        "skillclub_uninstall" => handle_uninstall(arguments, state),
         "skillclub_info" => handle_info(arguments, state),
         "skillclub_author" => handle_author(arguments),
         "skillclub_validate" => handle_validate(arguments),
@@ -425,6 +441,21 @@ fn handle_install(
         }
         // Neither provided
         (None, None) => ToolCallResult::error("Provide either 'path' (local install) or 'skill_id' (registry install)"),
+    }
+}
+
+fn handle_uninstall(arguments: &serde_json::Value, state: &AppState) -> ToolCallResult {
+    let skill_id = match arguments.get("skill_id").and_then(|v| v.as_str()) {
+        Some(id) => id,
+        None => return ToolCallResult::error("Missing required parameter: skill_id"),
+    };
+
+    match uninstall_skill(state, skill_id) {
+        Ok(Some(version)) => ToolCallResult::success(format!(
+            "Successfully uninstalled {skill_id}@{version}."
+        )),
+        Ok(None) => ToolCallResult::error(format!("Skill '{skill_id}' is not installed.")),
+        Err(e) => ToolCallResult::error(format!("Failed to uninstall '{skill_id}': {e}")),
     }
 }
 

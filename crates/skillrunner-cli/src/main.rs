@@ -6,7 +6,7 @@ use skillrunner_core::{
     auth::{self, AuthClient},
     executor::run_skill,
     import::import_skill_md,
-    install::install_unpacked_skill,
+    install::{install_unpacked_skill, uninstall_skill},
     managed::load_managed_config,
     mcp_governance,
     ollama::OllamaClient,
@@ -144,6 +144,8 @@ enum SkillCommands {
         #[arg(long)]
         registry_url: Option<String>,
     },
+    /// Uninstall an installed skill
+    Uninstall { skill_id: String },
     List,
     Resolve { skill_id: String },
     Run {
@@ -454,6 +456,12 @@ fn main() -> Result<()> {
                 println!("publisher: {}", skill.manifest.publisher);
                 println!("entrypoint: {}", skill.manifest.entrypoint);
                 println!("steps: {}", skill.workflow.steps.len());
+            }
+            SkillCommands::Uninstall { skill_id } => {
+                match uninstall_skill(&app.state, &skill_id)? {
+                    Some(version) => println!("Uninstalled {}@{}", skill_id, version),
+                    None => println!("Skill '{}' is not installed.", skill_id),
+                }
             }
             SkillCommands::Install { skill_ref, version, registry_url } => {
                 // Heuristic: if skill_ref looks like a path, install from local dir.

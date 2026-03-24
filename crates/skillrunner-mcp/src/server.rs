@@ -264,7 +264,7 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
         let fire_list_changed = aggregator_changed || skills_changed || {
             request.method == "tools/call"
                 && serde_json::from_value::<ToolCallParams>(request.params.clone())
-                    .map(|p| p.name == "skillclub_install")
+                    .map(|p| p.name == "skillclub_install" || p.name == "skillclub_uninstall")
                     .unwrap_or(false)
         };
 
