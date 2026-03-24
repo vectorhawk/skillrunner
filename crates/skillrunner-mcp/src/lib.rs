@@ -1,3 +1,4 @@
+pub mod aggregator;
 pub mod protocol;
 pub mod sampling;
 pub mod server;

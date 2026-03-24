@@ -13,6 +13,7 @@ serde_json.workspace = true
 skillrunner-core = { path = "../skillrunner-core" }
 skillrunner-manifest = { path = "../skillrunner-manifest" }
 rusqlite.workspace = true
+reqwest.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
