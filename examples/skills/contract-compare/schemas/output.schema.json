@@ -6,8 +6,12 @@
     "differences": {
       "type": "array",
       "items": { "type": "string" }
+    },
+    "risk_level": {
+      "type": "string",
+      "enum": ["low", "medium", "high"]
     }
   },
-  "required": ["summary", "differences"],
+  "required": ["summary", "differences", "risk_level"],
   "additionalProperties": false
 }

@@ -282,10 +282,8 @@ impl RegistryClient {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("not authenticated; run `skillrunner auth login` first"))?;
 
-        let url = format!(
-            "{}/portal/skills",
-            self.base_url.trim_end_matches('/')
-        );
+        let base = self.base_url.trim_end_matches('/');
+        let url = format!("{base}/portal/skills");
         debug!(url, archive = %archive_path, "uploading skill");
 
         let file_bytes = std::fs::read(archive_path)
@@ -296,21 +294,37 @@ impl RegistryClient {
             .unwrap_or("bundle.cskill")
             .to_string();
 
-        let form = reqwest::blocking::multipart::Form::new().part(
-            "file",
-            reqwest::blocking::multipart::Part::bytes(file_bytes)
-                .file_name(file_name)
-                .mime_str("application/octet-stream")
-                .context("invalid MIME type")?,
-        );
-
         let resp = self
             .http
             .post(&url)
             .bearer_auth(token)
-            .multipart(form)
+            .multipart(Self::make_upload_form(file_bytes.clone(), file_name.clone())?)
             .send()
             .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        // If skill already exists (409), retry as a new version upload
+        if resp.status() == reqwest::StatusCode::CONFLICT {
+            let skill_id = Self::extract_skill_id_from_filename(&file_name)
+                .ok_or_else(|| anyhow::anyhow!("skill already exists but could not extract skill_id from archive filename"))?;
+            debug!(skill_id, "skill exists, uploading as new version");
+
+            let version_url = format!("{base}/portal/skills/{skill_id}/versions");
+            let resp2 = self
+                .http
+                .post(&version_url)
+                .bearer_auth(token)
+                .multipart(Self::make_upload_form(file_bytes, file_name)?)
+                .send()
+                .with_context(|| format!("failed to reach registry at {version_url}"))?;
+
+            if !resp2.status().is_success() {
+                let status = resp2.status();
+                let body = resp2.text().unwrap_or_default();
+                anyhow::bail!("publish version failed (HTTP {status}): {body}");
+            }
+
+            return resp2.json().context("failed to deserialize publish response");
+        }
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -319,6 +333,41 @@ impl RegistryClient {
         }
 
         resp.json().context("failed to deserialize publish response")
+    }
+
+    fn make_upload_form(file_bytes: Vec<u8>, file_name: String) -> Result<reqwest::blocking::multipart::Form> {
+        Ok(reqwest::blocking::multipart::Form::new().part(
+            "file",
+            reqwest::blocking::multipart::Part::bytes(file_bytes)
+                .file_name(file_name)
+                .mime_str("application/octet-stream")
+                .context("invalid MIME type")?,
+        ))
+    }
+
+    /// Extract skill_id from archive filename like "contract-compare-0.2.0.cskill"
+    fn extract_skill_id_from_filename(filename: &str) -> Option<String> {
+        let stem = filename.strip_suffix(".cskill")?;
+        // Find the last occurrence of "-<semver>" pattern
+        // e.g. "contract-compare-0.2.0" -> "contract-compare"
+        let last_dash = stem.rfind('-')?;
+        // Check if what follows the dash looks like a version number
+        let after = &stem[last_dash + 1..];
+        if after.chars().next().is_none_or(|c| !c.is_ascii_digit()) {
+            return None;
+        }
+        // Walk back past the minor version dash: "compare-0.2.0" -> need to find "compare-0"
+        // Actually the version is "0.2.0" so we just need the last segment starting with a digit
+        // But skill IDs can have dashes, so find where version starts
+        // Version format: X.Y.Z — find the rightmost "-" followed by digit.digit
+        // We already have last_dash pointing at "-0.2.0", which is correct
+        // But we need to handle "my-skill-1.0.0" vs "my-1-skill-1.0.0"
+        // Simple approach: check if after_dash contains dots (version-like)
+        if after.contains('.') {
+            Some(stem[..last_dash].to_string())
+        } else {
+            None
+        }
     }
 }
 

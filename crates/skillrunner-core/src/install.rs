@@ -94,7 +94,7 @@ mod tests {
         install_unpacked_skill(&state, &skill).expect("install should succeed");
 
         let install_root = state.root_dir.join("skills").join("contract-compare");
-        let version_dir = install_root.join("versions").join("0.1.0");
+        let version_dir = install_root.join("versions").join("0.2.0");
         assert!(version_dir.join("manifest.json").exists());
         assert!(version_dir.join("workflow.yaml").exists());
 
@@ -117,7 +117,7 @@ mod tests {
         let version_row: (String, String, String) = conn
             .query_row(
                 "SELECT skill_id, version, source_type FROM skill_versions WHERE skill_id = ?1 AND version = ?2",
-                ["contract-compare", "0.1.0"],
+                ["contract-compare", "0.2.0"],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("skill version row should exist");
@@ -126,7 +126,7 @@ mod tests {
             installed_row,
             (
                 "contract-compare".to_string(),
-                "0.1.0".to_string(),
+                "0.2.0".to_string(),
                 "active".to_string()
             )
         );
@@ -134,7 +134,7 @@ mod tests {
             version_row,
             (
                 "contract-compare".to_string(),
-                "0.1.0".to_string(),
+                "0.2.0".to_string(),
                 "local_dir".to_string()
             )
         );
