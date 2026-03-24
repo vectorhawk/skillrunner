@@ -8,6 +8,7 @@ use skillrunner_core::{
     import::import_skill_md,
     install::install_unpacked_skill,
     managed::load_managed_config,
+    mcp_governance,
     ollama::OllamaClient,
     policy::MockPolicyClient,
     registry::{HttpPolicyClient, RegistryClient},
@@ -80,6 +81,12 @@ enum McpCommands {
         /// Non-interactive mode for automated installs
         #[arg(long)]
         auto: bool,
+    },
+    /// Show aggregator backend status (approved servers from registry)
+    Backends {
+        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        #[arg(long)]
+        registry_url: Option<String>,
     },
 }
 
@@ -236,6 +243,27 @@ fn main() -> Result<()> {
                     }
                 }
             }
+
+            // Aggregator backend status (from cache if available)
+            let effective_url_for_backends = resolve_registry_url(None, managed_registry_url.as_deref());
+            if let Some(url) = effective_url_for_backends {
+                let reg = RegistryClient::new(&url);
+                match mcp_governance::fetch_approved_servers(&app.state, &reg) {
+                    Ok(resp) => {
+                        let approved = resp.servers.iter().filter(|s| s.status != "blocked").count();
+                        let blocked = resp.servers.iter().filter(|s| s.status == "blocked").count();
+                        println!(
+                            "Aggregator:       {} backend(s) approved, {} blocked (run `skillrunner mcp backends` for details)",
+                            approved, blocked
+                        );
+                    }
+                    Err(_) => {
+                        println!("Aggregator:       no backend data (server not yet started or no registry connection)");
+                    }
+                }
+            } else {
+                println!("Aggregator:       not configured (no registry URL)");
+            }
         }
         Commands::Auth { command } => match command {
             AuthCommands::Login { registry_url, email } => {
@@ -336,6 +364,57 @@ fn main() -> Result<()> {
                 mark_first_run_offered(&app.state)?;
 
                 println!("\nRestart your AI client to activate SkillRunner MCP.");
+            }
+            McpCommands::Backends { registry_url } => {
+                let url = resolve_registry_url(registry_url, managed_registry_url.as_deref());
+                match url {
+                    None => {
+                        println!("No registry URL configured. Pass --registry-url or set SKILLCLUB_REGISTRY_URL.");
+                    }
+                    Some(url) => {
+                        let registry = RegistryClient::new(&url);
+                        match mcp_governance::fetch_approved_servers(&app.state, &registry) {
+                            Ok(resp) => {
+                                let approved: Vec<_> = resp.servers.iter()
+                                    .filter(|s| s.status != "blocked")
+                                    .collect();
+                                let blocked: Vec<_> = resp.servers.iter()
+                                    .filter(|s| s.status == "blocked")
+                                    .collect();
+
+                                println!("Approval mode:    {}", resp.approval_mode);
+                                println!("Backends:         {} approved, {} blocked", approved.len(), blocked.len());
+                                println!();
+
+                                if approved.is_empty() {
+                                    println!("No approved backends. Ask your IT admin to approve servers via the SkillClub portal.");
+                                } else {
+                                    println!("{:<25} {:<12} {:<12} {:<8} VISIBILITY", "NAME", "SERVER ID", "TRANSPORT", "PRIORITY");
+                                    println!("{}", "-".repeat(75));
+                                    for s in &approved {
+                                        let server_id = s.server_id.as_deref().unwrap_or(&s.name);
+                                        let transport = s.transport_type.as_deref().unwrap_or("http");
+                                        let priority = s.priority.map(|p| p.to_string()).unwrap_or_else(|| "50".to_string());
+                                        let visibility = s.tool_visibility.as_deref().unwrap_or("all");
+                                        println!("{:<25} {:<12} {:<12} {:<8} {}", s.name, server_id, transport, priority, visibility);
+                                    }
+                                }
+
+                                if !blocked.is_empty() {
+                                    println!();
+                                    println!("Blocked servers ({}):", blocked.len());
+                                    for s in &blocked {
+                                        println!("  {} ({})", s.name, s.package_source);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                println!("Failed to fetch backend list: {e}");
+                                println!("(No cached data available — start the server with --registry-url to populate cache.)");
+                            }
+                        }
+                    }
+                }
             }
         },
         Commands::Skill { command } => match command {
