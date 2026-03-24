@@ -186,6 +186,150 @@ fn query_installed_version(state: &AppState, skill_id: &str) -> Result<Option<St
     Ok(ver)
 }
 
+/// Check all installed skills for available updates from the registry.
+///
+/// For each active installed skill:
+/// - Skips if `manifest.update.auto_update` is false.
+/// - If policy forces an update (installed < minimum_allowed_version), always applies it.
+/// - Otherwise, checks if a newer version is available from the registry and applies it.
+///
+/// Returns the number of skills that were updated.
+pub fn check_skill_updates(
+    state: &AppState,
+    registry: &RegistryClient,
+    policy_client: &dyn crate::policy::PolicyClient,
+) -> Result<usize> {
+    let conn = Connection::open(&state.db_path).context("failed to open state DB")?;
+    let mut stmt = conn.prepare(
+        "SELECT skill_id, active_version, install_root FROM installed_skills WHERE current_status = 'active'",
+    )?;
+
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()
+        .context("failed to read installed skills")?;
+
+    // Drop the connection before doing any installs (which open their own connection).
+    drop(stmt);
+    drop(conn);
+
+    let mut updated = 0usize;
+
+    for (skill_id, active_version, install_root) in rows {
+        let active_path = format!("{install_root}/active");
+        let pkg = match SkillPackage::load_from_dir(&active_path) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(skill_id, error = %e, "failed to load manifest for installed skill; skipping");
+                continue;
+            }
+        };
+
+        // Respect the auto_update flag (default: true).
+        let auto_update = pkg
+            .manifest
+            .update
+            .as_ref()
+            .and_then(|u| u.auto_update)
+            .unwrap_or(true);
+        if !auto_update {
+            tracing::debug!(skill_id, "auto_update=false; skipping");
+            continue;
+        }
+
+        let installed = match Version::parse(&active_version) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(skill_id, version = active_version, error = %e, "invalid semver; skipping");
+                continue;
+            }
+        };
+
+        // Fetch policy to check for forced update.
+        let policy = match policy_client.fetch_policy(&skill_id) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(skill_id, error = %e, "failed to fetch policy; skipping");
+                continue;
+            }
+        };
+
+        // Policy-forced update: installed < minimum_allowed_version.
+        let policy_forced = policy
+            .minimum_allowed_version
+            .as_ref()
+            .map(|min| &installed < min)
+            .unwrap_or(false);
+
+        if policy_forced {
+            // auto_update_if_needed handles the forced case end-to-end.
+            match auto_update_if_needed(state, registry, &skill_id, &policy) {
+                Ok(true) => {
+                    info!(skill_id, "policy-forced update applied");
+                    updated += 1;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(skill_id, error = %e, "policy-forced update failed");
+                }
+            }
+            continue;
+        }
+
+        // Voluntary update: check registry for a newer version.
+        let latest_version = match registry.fetch_skill_detail(&skill_id) {
+            Ok(detail) => match detail.latest_version {
+                Some(v) => v,
+                None => {
+                    tracing::debug!(skill_id, "registry has no published versions; skipping");
+                    continue;
+                }
+            },
+            Err(e) => {
+                tracing::warn!(skill_id, error = %e, "failed to fetch skill detail; skipping");
+                continue;
+            }
+        };
+
+        let latest = match Version::parse(&latest_version) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(skill_id, version = latest_version, error = %e, "invalid semver from registry; skipping");
+                continue;
+            }
+        };
+
+        if latest <= installed {
+            tracing::debug!(skill_id, installed = %installed, latest = %latest, "already up to date");
+            continue;
+        }
+
+        // Newer version available — install it.
+        match install_from_registry(state, registry, &skill_id, Some(&latest_version)) {
+            Ok(_) => {
+                info!(
+                    skill_id,
+                    from = %installed,
+                    to = %latest,
+                    "voluntary update applied"
+                );
+                updated += 1;
+            }
+            Err(e) => {
+                tracing::warn!(skill_id, error = %e, "voluntary update failed");
+            }
+        }
+    }
+
+    Ok(updated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +555,173 @@ mod tests {
 
         meta_mock.assert();
         dl_mock.assert();
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    // ── check_skill_updates tests ─────────────────────────────────────────────
+
+    /// Write a skill bundle with auto_update explicitly set to the given value.
+    fn write_skill_bundle_with_auto_update(root: &Utf8PathBuf, version: &str, auto_update: bool) {
+        fs::create_dir_all(root.join("schemas")).unwrap();
+        fs::create_dir_all(root.join("prompts")).unwrap();
+        fs::write(
+            root.join("manifest.json"),
+            format!(
+                r#"{{
+  "schema_version": "1.0",
+  "id": "test-skill",
+  "name": "Test Skill",
+  "version": "{version}",
+  "publisher": "skillclub",
+  "entrypoint": "workflow.yaml",
+  "inputs_schema": "schemas/input.schema.json",
+  "outputs_schema": "schemas/output.schema.json",
+  "permissions": {{ "filesystem": "none", "network": "none", "clipboard": false }},
+  "execution": {{ "sandbox_profile": "strict", "timeout_seconds": 30, "memory_mb": 256 }},
+  "update": {{ "auto_update": {auto_update} }}
+}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("workflow.yaml"),
+            "name: test_skill\nsteps:\n  - id: run\n    type: llm\n    prompt: prompts/system.txt\n    inputs: {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("prompts/system.txt"), "Do the thing.").unwrap();
+        fs::write(root.join("schemas/input.schema.json"), "{}").unwrap();
+        fs::write(root.join("schemas/output.schema.json"), "{}").unwrap();
+    }
+
+    #[test]
+    fn check_skill_updates_updates_stale_skill() {
+        use mockito::Server;
+
+        let state_root = temp_root("csu-stale");
+        let skill_root = temp_root("csu-stale-skill");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        // Install v0.1.0
+        write_skill_bundle(&skill_root, "0.1.0");
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg).unwrap();
+
+        // Create a v0.2.0 archive to serve
+        let (_tmp, archive_path, sha) = create_skill_archive("0.2.0");
+        let archive_bytes = fs::read(&archive_path).unwrap();
+
+        let mut server = Server::new();
+        let detail_path = "/portal/skills/test-skill";
+        let meta_path = "/skills/test-skill/versions/0.2.0";
+        let download_path = "/download/test-skill-0.2.0.cskill";
+
+        // Mock detail endpoint (latest_version = 0.2.0)
+        let detail_mock = server
+            .mock("GET", detail_path)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"skill_id":"test-skill","name":"Test Skill","latest_version":"0.2.0","publisher_name":null,"description":null}"#)
+            .create();
+
+        // Mock artifact metadata
+        let meta_mock = server
+            .mock("GET", meta_path)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(
+                r#"{{"skill_id":"test-skill","version":"0.2.0","download_url":"{}{download_path}","sha256":"{sha}","size_bytes":{}}}"#,
+                server.url(),
+                archive_bytes.len()
+            ))
+            .create();
+
+        // Mock download
+        let dl_mock = server
+            .mock("GET", download_path)
+            .with_status(200)
+            .with_body(&archive_bytes)
+            .create();
+
+        let policy_client = crate::policy::MockPolicyClient::new(); // default active, no min version
+        let registry = RegistryClient::new(server.url());
+
+        let count = check_skill_updates(&state, &registry, &policy_client).unwrap();
+        assert_eq!(count, 1, "one skill should have been updated");
+
+        // Verify active version in DB
+        let conn = rusqlite::Connection::open(&state.db_path).unwrap();
+        let active_ver: String = conn
+            .query_row(
+                "SELECT active_version FROM installed_skills WHERE skill_id = 'test-skill'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_ver, "0.2.0");
+
+        detail_mock.assert();
+        meta_mock.assert();
+        dl_mock.assert();
+
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    #[test]
+    fn check_skill_updates_skips_current_version() {
+        use mockito::Server;
+
+        let state_root = temp_root("csu-current");
+        let skill_root = temp_root("csu-current-skill");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        // Install v0.2.0 (already at latest)
+        write_skill_bundle(&skill_root, "0.2.0");
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg).unwrap();
+
+        let mut server = Server::new();
+        let detail_path = "/portal/skills/test-skill";
+
+        // Registry says latest is 0.2.0 — same as installed
+        let detail_mock = server
+            .mock("GET", detail_path)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"skill_id":"test-skill","name":"Test Skill","latest_version":"0.2.0","publisher_name":null,"description":null}"#)
+            .create();
+
+        let policy_client = crate::policy::MockPolicyClient::new();
+        let registry = RegistryClient::new(server.url());
+
+        let count = check_skill_updates(&state, &registry, &policy_client).unwrap();
+        assert_eq!(count, 0, "should not update when already at latest version");
+
+        detail_mock.assert();
+
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    #[test]
+    fn check_skill_updates_skips_auto_update_false() {
+        let state_root = temp_root("csu-no-auto");
+        let skill_root = temp_root("csu-no-auto-skill");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        // Install v0.1.0 with auto_update: false
+        write_skill_bundle_with_auto_update(&skill_root, "0.1.0", false);
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg).unwrap();
+
+        // Point registry at a server that should NOT be contacted
+        let registry = RegistryClient::new("http://localhost:0");
+        let policy_client = crate::policy::MockPolicyClient::new();
+
+        let count = check_skill_updates(&state, &registry, &policy_client).unwrap();
+        assert_eq!(count, 0, "should skip skill with auto_update=false");
+
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&skill_root);
     }

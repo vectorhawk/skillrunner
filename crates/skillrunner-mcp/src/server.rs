@@ -15,6 +15,7 @@ use skillrunner_core::{
     policy::MockPolicyClient,
     registry::{HttpPolicyClient, RegistryClient},
     state::AppState,
+    updater::check_skill_updates,
 };
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -41,6 +42,8 @@ struct ServerState {
     last_aggregator_sync: Option<Instant>,
     /// Number of aggregated tools from the last sync (used to detect changes).
     last_aggregated_tool_count: usize,
+    /// Time of the last skill version sync, for throttling.
+    last_skill_sync: Option<Instant>,
 }
 
 impl ServerState {
@@ -50,6 +53,42 @@ impl ServerState {
             registry_client,
             last_aggregator_sync: None,
             last_aggregated_tool_count: 0,
+            last_skill_sync: None,
+        }
+    }
+
+    /// Check all installed skills for available updates, respecting the 300 s throttle.
+    ///
+    /// Returns `true` if any skills were updated (caller should fire
+    /// `notifications/tools/list_changed`).
+    fn maybe_sync_skills(&mut self, app_state: &AppState) -> bool {
+        let should_sync = match self.last_skill_sync {
+            None => true,
+            Some(t) => t.elapsed() >= AGGREGATOR_REFRESH_INTERVAL,
+        };
+
+        if !should_sync {
+            return false;
+        }
+
+        let Some(registry) = &self.registry_client else {
+            return false;
+        };
+
+        let policy_client = HttpPolicyClient::new(RegistryClient::new(&registry.base_url), app_state);
+
+        self.last_skill_sync = Some(Instant::now());
+
+        match check_skill_updates(app_state, registry, &policy_client) {
+            Ok(0) => false,
+            Ok(count) => {
+                info!(count, "background skill sync updated skills — will fire list_changed");
+                true
+            }
+            Err(e) => {
+                warn!(error = %e, "background skill sync failed");
+                false
+            }
         }
     }
 
@@ -176,12 +215,14 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
             continue;
         }
 
-        // On tools/list, attempt a throttled aggregator refresh.
-        // Track whether a sync caused the tool count to change.
-        let aggregator_changed = if request.method == "tools/list" {
-            server_state.maybe_sync_aggregator(&state)
+        // On tools/list, attempt throttled aggregator + skill-version refreshes.
+        // Track whether either sync caused a change that should fire list_changed.
+        let (aggregator_changed, skills_changed) = if request.method == "tools/list" {
+            let agg = server_state.maybe_sync_aggregator(&state);
+            let skills = server_state.maybe_sync_skills(&state);
+            (agg, skills)
         } else {
-            false
+            (false, false)
         };
 
         // Dispatch the request — during tools/call, this may trigger
@@ -204,7 +245,8 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
         // Fire list_changed notifications:
         // 1. After a skill install (existing behaviour)
         // 2. After an aggregator sync that changed the tool count
-        let fire_list_changed = aggregator_changed || {
+        // 3. After background skill-version sync updated one or more skills
+        let fire_list_changed = aggregator_changed || skills_changed || {
             request.method == "tools/call"
                 && serde_json::from_value::<ToolCallParams>(request.params.clone())
                     .map(|p| p.name == "skillclub_install")
@@ -570,6 +612,56 @@ mod tests {
         let resp = dispatch_request(&req, &state, &config, None, None, &aggregator);
         assert!(resp.error.is_some());
         assert_eq!(resp.error.as_ref().unwrap().code, METHOD_NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn maybe_sync_skills_throttled() {
+        let (state, root) = temp_state("sync-skills-throttle");
+
+        // No registry URL → should always return false without touching last_skill_sync.
+        let mut server_state = ServerState::new(None);
+        let result = server_state.maybe_sync_skills(&state);
+        assert!(!result, "no registry URL → should return false");
+        assert!(
+            server_state.last_skill_sync.is_none(),
+            "last_skill_sync should remain None when no registry is configured"
+        );
+
+        // With an unreachable registry, first call should stamp last_skill_sync.
+        let mut server_state2 = ServerState::new(Some(RegistryClient::new("http://localhost:0")));
+        // No skills installed → check_skill_updates returns Ok(0), which is Ok(false).
+        // But the stamp still gets set before the check.
+        let _first = server_state2.maybe_sync_skills(&state);
+        assert!(
+            server_state2.last_skill_sync.is_some(),
+            "last_skill_sync should be stamped after first attempt"
+        );
+
+        // Second call immediately after: elapsed << 300 s → should be throttled.
+        // Manually set last_skill_sync to just now so the throttle fires reliably.
+        server_state2.last_skill_sync = Some(Instant::now());
+        let result_throttled = server_state2.maybe_sync_skills(&state);
+        assert!(
+            !result_throttled,
+            "call within throttle window should return false"
+        );
+
+        // Force the timestamp to look like it was 301 s ago → should attempt again.
+        server_state2.last_skill_sync =
+            Some(Instant::now() - Duration::from_secs(301));
+        // No skills installed so nothing updates, but the call should proceed (not throttle).
+        // Result doesn't matter — we just verify no panic and the stamp is refreshed.
+        let _result_unthrottled = server_state2.maybe_sync_skills(&state);
+        assert!(
+            server_state2
+                .last_skill_sync
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(999)
+                < 2,
+            "last_skill_sync should be refreshed after an unthrottled call"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

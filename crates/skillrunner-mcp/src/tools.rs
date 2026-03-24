@@ -239,13 +239,16 @@ fn skill_to_tool(skill_id: &str, active_path: &str) -> Result<ToolDefinition> {
         .clone()
         .unwrap_or_else(|| format!("SkillClub skill: {}", pkg.manifest.name));
 
+    // Append version to description so updates are visible in the tool listing.
+    let versioned_desc = format!("{} (v{})", base_desc, pkg.manifest.version);
+
     // Enrich description with trigger phrases if present
     let description = if pkg.manifest.triggers.is_empty() {
-        base_desc
+        versioned_desc
     } else {
         format!(
             "{}\n\nUse this tool when the user asks to: {}",
-            base_desc,
+            versioned_desc,
             pkg.manifest.triggers.join(", ")
         )
     };
@@ -1071,7 +1074,7 @@ mod tests {
 
         assert!(skill_tool.is_some(), "installed skill should appear as tool");
         let tool = skill_tool.unwrap();
-        assert_eq!(tool.description, "A test skill for MCP testing");
+        assert_eq!(tool.description, "A test skill for MCP testing (v0.1.0)");
         // The input schema should match the skill's input.schema.json
         assert_eq!(tool.input_schema["type"], "object");
         assert!(tool.input_schema["properties"]["query"].is_object());
