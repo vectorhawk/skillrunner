@@ -13,7 +13,7 @@ use skillrunner_core::{
     policy::MockPolicyClient,
     registry::{HttpPolicyClient, RegistryClient},
     resolver::{resolve_skill, ResolveOutcome},
-    updater::{install_from_registry, package_skill},
+    updater::{check_skill_updates, install_from_registry, package_skill},
     validator::validate_bundle,
 };
 use skillrunner_manifest::SkillPackage;
@@ -84,6 +84,12 @@ enum McpCommands {
     },
     /// Show aggregator backend status (approved servers from registry)
     Backends {
+        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        #[arg(long)]
+        registry_url: Option<String>,
+    },
+    /// Manually trigger a skill sync (check for updates, lifecycle changes)
+    Sync {
         /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
         #[arg(long)]
         registry_url: Option<String>,
@@ -416,6 +422,23 @@ fn main() -> Result<()> {
                             }
                         }
                     }
+                }
+            }
+            McpCommands::Sync { registry_url } => {
+                let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
+                let registry = RegistryClient::new(&url);
+                let policy_client = HttpPolicyClient::new(RegistryClient::new(&url), &app.state);
+
+                println!("Syncing skills from {}...", url);
+                match check_skill_updates(&app.state, &registry, &policy_client) {
+                    Ok(count) => {
+                        if count > 0 {
+                            println!("Updated {} skill(s).", count);
+                        } else {
+                            println!("All skills are up to date.");
+                        }
+                    }
+                    Err(e) => println!("Sync failed: {e}"),
                 }
             }
         },
