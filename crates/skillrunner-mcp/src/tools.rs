@@ -33,7 +33,7 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
     // Add management tools
     tools.push(ToolDefinition {
         name: "skillclub_list".to_string(),
-        description: "List all installed SkillClub skills with their versions and status."
+        description: "List all installed skills available to the user. Use this when the user asks 'what skills do I have', 'what tools are available', or 'what can you do'. Shows skill IDs, versions, and descriptions."
             .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -159,16 +159,16 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
     if registry_url.is_some() {
         tools.push(ToolDefinition {
             name: "skillclub_search".to_string(),
-            description: "Search the SkillClub registry for available skills.".to_string(),
+            description: "Search the SkillClub skill registry for skills that can be installed. Use this when the user asks 'what skills are available', 'find skills for X', or wants to discover new capabilities. Use an empty query to list all available skills.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Search query to find skills (e.g., 'contract', 'analysis')"
+                        "description": "Search query to find skills (e.g., 'contract', 'analysis'). Omit or leave empty to list all available skills."
                     }
                 },
-                "required": ["query"]
+                "required": []
             }),
         });
 

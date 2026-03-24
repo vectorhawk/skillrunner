@@ -101,6 +101,8 @@ pub struct InitializeResult {
     pub protocol_version: String,
     pub capabilities: ServerCapabilities,
     pub server_info: ServerInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
 
 /// An MCP tool definition.
@@ -297,10 +299,33 @@ mod tests {
                 name: "skillrunner".to_string(),
                 version: "0.1.0".to_string(),
             },
+            instructions: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["protocolVersion"], "2024-11-05");
         assert_eq!(json["capabilities"]["tools"]["listChanged"], true);
         assert_eq!(json["serverInfo"]["name"], "skillrunner");
+        // instructions omitted when None
+        assert!(json.get("instructions").is_none());
+    }
+
+    #[test]
+    fn initialize_result_includes_instructions_when_set() {
+        let result = InitializeResult {
+            protocol_version: "2024-11-05".to_string(),
+            capabilities: ServerCapabilities {
+                tools: Some(ToolsCapability { list_changed: true }),
+            },
+            server_info: ServerInfo {
+                name: "skillrunner".to_string(),
+                version: "0.1.0".to_string(),
+            },
+            instructions: Some("Use skillclub_list to show installed skills.".to_string()),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            json["instructions"],
+            "Use skillclub_list to show installed skills."
+        );
     }
 }

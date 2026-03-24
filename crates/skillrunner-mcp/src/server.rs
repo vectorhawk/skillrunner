@@ -260,6 +260,16 @@ fn handle_initialize(request: &JsonRpcRequest) -> JsonRpcResponse {
             name: "skillrunner".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         },
+        instructions: Some(
+            "SkillClub is the user's AI skill platform. \
+             When the user asks about 'skills', 'what skills are available', \
+             'what can you do', or similar queries about capabilities, \
+             use skillclub_list to show installed skills and skillclub_search \
+             to find more in the registry. \
+             Installed skills can be run directly as tools by their skill ID. \
+             Use skillclub_install to add new skills from the registry."
+                .to_string(),
+        ),
     };
 
     JsonRpcResponse::success(
@@ -417,6 +427,26 @@ mod tests {
         assert_eq!(result["protocolVersion"], "2024-11-05");
         assert_eq!(result["serverInfo"]["name"], "skillrunner");
         assert_eq!(result["capabilities"]["tools"]["listChanged"], true);
+    }
+
+    #[test]
+    fn handle_initialize_includes_instructions() {
+        let req = make_request(1, "initialize");
+        let resp = handle_initialize(&req);
+        let result = resp.result.unwrap();
+        let instructions = result["instructions"].as_str().unwrap();
+        assert!(
+            instructions.contains("skillclub_list"),
+            "instructions should mention skillclub_list, got: {instructions}"
+        );
+        assert!(
+            instructions.contains("skillclub_search"),
+            "instructions should mention skillclub_search, got: {instructions}"
+        );
+        assert!(
+            instructions.contains("skillclub_install"),
+            "instructions should mention skillclub_install, got: {instructions}"
+        );
     }
 
     #[test]
