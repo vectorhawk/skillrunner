@@ -969,6 +969,23 @@ fn handle_skill_run(
     model_client: Option<&dyn ModelClient>,
     registry_client: Option<&RegistryClient>,
 ) -> ToolCallResult {
+    // Check if skill is deactivated before attempting execution
+    if let Ok(conn) = Connection::open(&state.db_path) {
+        if let Ok(status) = conn.query_row(
+            "SELECT current_status FROM installed_skills WHERE skill_id = ?1",
+            [skill_id],
+            |row| row.get::<_, String>(0),
+        ) {
+            if status == "deactivated" {
+                return ToolCallResult::error(format!(
+                    "The skill '{}' has been deactivated by your organization's administrator. \
+                     Please contact your IT department to resolve this or request reactivation.",
+                    skill_id
+                ));
+            }
+        }
+    }
+
     match run_skill(state, policy_client, skill_id, arguments, model_client, registry_client) {
         Ok(result) => {
             // Return the last step's output, or a summary if no output
