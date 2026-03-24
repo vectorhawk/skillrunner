@@ -353,10 +353,7 @@ fn handle_search(arguments: &serde_json::Value, registry_url: &Option<String>) -
         None => return ToolCallResult::error("No registry URL configured"),
     };
 
-    let query = match arguments.get("query").and_then(|v| v.as_str()) {
-        Some(q) => q,
-        None => return ToolCallResult::error("Missing required parameter: query"),
-    };
+    let query = arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
 
     let registry = RegistryClient::new(url);
     match registry.search_skills(query) {
@@ -1112,16 +1109,6 @@ mod tests {
         assert!(result.content[0].text.contains("No skills installed"));
 
         let _ = fs::remove_dir_all(&state_root);
-    }
-
-    #[test]
-    fn handle_search_requires_query() {
-        let result = handle_search(
-            &serde_json::json!({}),
-            &Some("http://localhost:8000".to_string()),
-        );
-        assert_eq!(result.is_error, Some(true));
-        assert!(result.content[0].text.contains("query"));
     }
 
     #[test]
