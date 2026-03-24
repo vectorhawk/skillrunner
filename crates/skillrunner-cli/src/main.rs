@@ -66,8 +66,8 @@ enum McpCommands {
         /// Ollama base URL (default: http://localhost:11434)
         #[arg(long, default_value = "http://localhost:11434")]
         ollama_url: String,
-        /// Model name to use via Ollama (default: llama3.2)
-        #[arg(long, default_value = "llama3.2")]
+        /// Model name to use via Ollama (default: auto-detect from Ollama)
+        #[arg(long, default_value = "auto")]
         model: String,
     },
     /// Configure SkillRunner as an MCP server for detected AI clients

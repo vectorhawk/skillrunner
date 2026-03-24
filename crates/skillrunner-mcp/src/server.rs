@@ -147,7 +147,22 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
 
     let registry_client = config.registry_url.as_ref().map(RegistryClient::new);
 
-    let ollama = OllamaClient::new(&config.ollama_url, &config.model);
+    // Auto-detect model from Ollama if not explicitly specified
+    let model_name = if config.model == "auto" {
+        let probe = OllamaClient::new(&config.ollama_url, "");
+        if probe.health_check().reachable {
+            probe
+                .list_models()
+                .ok()
+                .and_then(|m| m.into_iter().next().map(|m| m.name))
+                .unwrap_or_else(|| "llama3.2".to_string())
+        } else {
+            "llama3.2".to_string()
+        }
+    } else {
+        config.model.clone()
+    };
+    let ollama = OllamaClient::new(&config.ollama_url, &model_name);
     let ollama_available = ollama.health_check().reachable;
 
     // Create the sampling client (delegates LLM calls to the AI client)
