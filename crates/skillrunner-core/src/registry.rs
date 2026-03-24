@@ -301,7 +301,7 @@ impl RegistryClient {
                 unknown: vec![],
             });
         }
-        let url = format!("{}/api/runner/skills/status", self.base_url.trim_end_matches('/'));
+        let url = format!("{}/skills/status", self.base_url.trim_end_matches('/'));
         let body = serde_json::json!({ "skill_ids": skill_ids });
         debug!(url, "checking skill lifecycle status");
 

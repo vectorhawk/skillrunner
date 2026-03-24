@@ -188,7 +188,7 @@ fn query_installed_version(state: &AppState, skill_id: &str) -> Result<Option<St
 
 /// Check all installed skills for lifecycle changes and available updates from the registry.
 ///
-/// **Lifecycle phase** (runs first, requires `POST /api/runner/skills/status`):
+/// **Lifecycle phase** (runs first, requires `POST /skills/status`):
 /// - Skills reported as "unpublished" are deactivated.
 /// - Skills in the "unknown" list are fully uninstalled (deleted from registry).
 /// - Skills reported as "published" that are locally deactivated are reactivated.
@@ -834,7 +834,7 @@ mod tests {
 
         // Status endpoint returns "unpublished"
         let status_mock = server
-            .mock("POST", "/api/runner/skills/status")
+            .mock("POST", "/skills/status")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"statuses":{"test-skill":{"status":"unpublished"}},"unknown":[]}"#)
@@ -892,7 +892,7 @@ mod tests {
 
         // Status endpoint returns skill in "unknown" list (deleted from registry)
         let status_mock = server
-            .mock("POST", "/api/runner/skills/status")
+            .mock("POST", "/skills/status")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"statuses":{},"unknown":["test-skill"]}"#)
@@ -962,7 +962,7 @@ mod tests {
 
         // Status endpoint returns skill as "published"
         let status_mock = server
-            .mock("POST", "/api/runner/skills/status")
+            .mock("POST", "/skills/status")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
