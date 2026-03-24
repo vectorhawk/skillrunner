@@ -1,5 +1,5 @@
 use crate::{
-    install::install_unpacked_skill,
+    install::{deactivate_skill, install_unpacked_skill, reactivate_skill, uninstall_skill},
     policy::Policy,
     registry::RegistryClient,
     state::AppState,
@@ -186,25 +186,114 @@ fn query_installed_version(state: &AppState, skill_id: &str) -> Result<Option<St
     Ok(ver)
 }
 
-/// Check all installed skills for available updates from the registry.
+/// Check all installed skills for lifecycle changes and available updates from the registry.
 ///
-/// For each active installed skill:
+/// **Lifecycle phase** (runs first, requires `POST /api/runner/skills/status`):
+/// - Skills reported as "unpublished" are deactivated.
+/// - Skills in the "unknown" list are fully uninstalled (deleted from registry).
+/// - Skills reported as "published" that are locally deactivated are reactivated.
+/// - If the status endpoint is unavailable (old registry / network error), the
+///   lifecycle phase is skipped and all active skills proceed to version updates.
+///
+/// **Version update phase** (runs after lifecycle, only for published+active skills):
 /// - Skips if `manifest.update.auto_update` is false.
 /// - If policy forces an update (installed < minimum_allowed_version), always applies it.
 /// - Otherwise, checks if a newer version is available from the registry and applies it.
 ///
-/// Returns the number of skills that were updated.
+/// Returns the total number of state transitions (lifecycle changes + version updates).
 pub fn check_skill_updates(
     state: &AppState,
     registry: &RegistryClient,
     policy_client: &dyn crate::policy::PolicyClient,
 ) -> Result<usize> {
+    // ── Phase 1: collect all installed skills (active + deactivated) ──────────
+    let conn = Connection::open(&state.db_path).context("failed to open state DB")?;
+    let mut all_stmt = conn.prepare(
+        "SELECT skill_id, current_status FROM installed_skills",
+    )?;
+    let all_installed: Vec<(String, String)> = all_stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<_>>()
+        .context("failed to read installed skills")?;
+    drop(all_stmt);
+    drop(conn);
+
+    let all_skill_ids: Vec<String> = all_installed.iter().map(|(id, _)| id.clone()).collect();
+    let mut changes = 0usize;
+
+    // ── Phase 2: lifecycle check ──────────────────────────────────────────────
+    // `published_ids` is Some(set) when the endpoint succeeded — only skills in
+    // the set are eligible for version updates.  None means "skip lifecycle, update all active".
+    let published_ids: Option<std::collections::HashSet<String>> =
+        match registry.check_skill_status(&all_skill_ids) {
+            Ok(status_resp) => {
+                let mut published = std::collections::HashSet::new();
+                for (skill_id, local_status) in &all_installed {
+                    if status_resp.unknown.contains(skill_id) {
+                        // Skill was deleted from registry — full cleanup.
+                        match uninstall_skill(state, skill_id) {
+                            Ok(Some(_)) => {
+                                info!(skill_id, "sync: skill removed from registry, uninstalled");
+                                changes += 1;
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::warn!(skill_id, error = %e, "sync: failed to uninstall unknown skill");
+                            }
+                        }
+                    } else if let Some(entry) = status_resp.statuses.get(skill_id) {
+                        match entry.status.as_str() {
+                            "unpublished" => {
+                                if local_status == "active" {
+                                    match deactivate_skill(state, skill_id) {
+                                        Ok(true) => {
+                                            info!(skill_id, "sync: skill unpublished, deactivated");
+                                            changes += 1;
+                                        }
+                                        Ok(false) => {}
+                                        Err(e) => {
+                                            tracing::warn!(skill_id, error = %e, "sync: failed to deactivate unpublished skill");
+                                        }
+                                    }
+                                }
+                            }
+                            "published" => {
+                                published.insert(skill_id.clone());
+                                if local_status == "deactivated" {
+                                    match reactivate_skill(state, skill_id) {
+                                        Ok(true) => {
+                                            info!(skill_id, "sync: skill republished, reactivated");
+                                            changes += 1;
+                                        }
+                                        Ok(false) => {}
+                                        Err(e) => {
+                                            tracing::warn!(skill_id, error = %e, "sync: failed to reactivate republished skill");
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Some(published)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "skill lifecycle check unavailable; skipping, proceeding with version updates only"
+                );
+                None
+            }
+        };
+
+    // ── Phase 3: version updates ──────────────────────────────────────────────
+    // Re-query active skills after lifecycle changes may have altered statuses.
     let conn = Connection::open(&state.db_path).context("failed to open state DB")?;
     let mut stmt = conn.prepare(
         "SELECT skill_id, active_version, install_root FROM installed_skills WHERE current_status = 'active'",
     )?;
-
-    let rows: Vec<(String, String, String)> = stmt
+    let active_rows: Vec<(String, String, String)> = stmt
         .query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -214,14 +303,17 @@ pub fn check_skill_updates(
         })?
         .collect::<rusqlite::Result<_>>()
         .context("failed to read installed skills")?;
-
-    // Drop the connection before doing any installs (which open their own connection).
     drop(stmt);
     drop(conn);
 
-    let mut updated = 0usize;
+    for (skill_id, active_version, install_root) in active_rows {
+        // When lifecycle check succeeded, only update skills that are published.
+        if let Some(ref published) = published_ids {
+            if !published.contains(&skill_id) {
+                continue;
+            }
+        }
 
-    for (skill_id, active_version, install_root) in rows {
         let active_path = format!("{install_root}/active");
         let pkg = match SkillPackage::load_from_dir(&active_path) {
             Ok(p) => p,
@@ -268,11 +360,10 @@ pub fn check_skill_updates(
             .unwrap_or(false);
 
         if policy_forced {
-            // auto_update_if_needed handles the forced case end-to-end.
             match auto_update_if_needed(state, registry, &skill_id, &policy) {
                 Ok(true) => {
                     info!(skill_id, "policy-forced update applied");
-                    updated += 1;
+                    changes += 1;
                 }
                 Ok(false) => {}
                 Err(e) => {
@@ -310,7 +401,6 @@ pub fn check_skill_updates(
             continue;
         }
 
-        // Newer version available — install it.
         match install_from_registry(state, registry, &skill_id, Some(&latest_version)) {
             Ok(_) => {
                 info!(
@@ -319,7 +409,7 @@ pub fn check_skill_updates(
                     to = %latest,
                     "voluntary update applied"
                 );
-                updated += 1;
+                changes += 1;
             }
             Err(e) => {
                 tracing::warn!(skill_id, error = %e, "voluntary update failed");
@@ -327,7 +417,7 @@ pub fn check_skill_updates(
         }
     }
 
-    Ok(updated)
+    Ok(changes)
 }
 
 #[cfg(test)]
@@ -722,6 +812,198 @@ mod tests {
         let count = check_skill_updates(&state, &registry, &policy_client).unwrap();
         assert_eq!(count, 0, "should skip skill with auto_update=false");
 
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    // ── lifecycle sync tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_sync_deactivates_unpublished_skill() {
+        use mockito::Server;
+
+        let state_root = temp_root("sync-deactivate");
+        let skill_root = temp_root("sync-deactivate-skill");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        write_skill_bundle(&skill_root, "0.1.0");
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg).unwrap();
+
+        let mut server = Server::new();
+
+        // Status endpoint returns "unpublished"
+        let status_mock = server
+            .mock("POST", "/api/runner/skills/status")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"statuses":{"test-skill":{"status":"unpublished"}},"unknown":[]}"#)
+            .create();
+
+        let registry = RegistryClient::new(server.url());
+        let policy_client = crate::policy::MockPolicyClient::new();
+
+        let count = check_skill_updates(&state, &registry, &policy_client).unwrap();
+        assert_eq!(count, 1, "one lifecycle change (deactivation) should be counted");
+
+        // Verify skill is deactivated in DB
+        let conn = rusqlite::Connection::open(&state.db_path).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT current_status FROM installed_skills WHERE skill_id = 'test-skill'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "deactivated");
+
+        // Verify active symlink is removed
+        let install_root = state.root_dir.join("skills/test-skill");
+        let active_path = install_root.join("active");
+        assert!(
+            !active_path.exists() && !active_path.is_symlink(),
+            "active symlink should be removed after deactivation"
+        );
+
+        // Versioned files should still be present
+        assert!(install_root.join("versions/0.1.0/manifest.json").exists());
+
+        status_mock.assert();
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    #[test]
+    fn test_sync_deletes_unknown_skill() {
+        use mockito::Server;
+
+        let state_root = temp_root("sync-unknown");
+        let skill_root = temp_root("sync-unknown-skill");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        write_skill_bundle(&skill_root, "0.1.0");
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg).unwrap();
+
+        let install_root = state.root_dir.join("skills/test-skill");
+        assert!(install_root.exists(), "skill dir should exist before sync");
+
+        let mut server = Server::new();
+
+        // Status endpoint returns skill in "unknown" list (deleted from registry)
+        let status_mock = server
+            .mock("POST", "/api/runner/skills/status")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"statuses":{},"unknown":["test-skill"]}"#)
+            .create();
+
+        let registry = RegistryClient::new(server.url());
+        let policy_client = crate::policy::MockPolicyClient::new();
+
+        let count = check_skill_updates(&state, &registry, &policy_client).unwrap();
+        assert_eq!(count, 1, "one lifecycle change (uninstall) should be counted");
+
+        // Verify all files are gone
+        assert!(!install_root.exists(), "skill dir should be removed");
+
+        // Verify DB records are gone
+        let conn = rusqlite::Connection::open(&state.db_path).unwrap();
+        let installed_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM installed_skills WHERE skill_id = 'test-skill'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(installed_count, 0, "installed_skills row should be deleted");
+
+        let version_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM skill_versions WHERE skill_id = 'test-skill'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version_count, 0, "skill_versions rows should be deleted");
+
+        status_mock.assert();
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    #[test]
+    fn test_sync_reactivates_republished_skill() {
+        use mockito::Server;
+
+        let state_root = temp_root("sync-reactivate");
+        let skill_root = temp_root("sync-reactivate-skill");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        write_skill_bundle(&skill_root, "0.1.0");
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg).unwrap();
+
+        // Deactivate the skill to set up the test scenario
+        crate::install::deactivate_skill(&state, "test-skill").unwrap();
+
+        let conn = rusqlite::Connection::open(&state.db_path).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT current_status FROM installed_skills WHERE skill_id = 'test-skill'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "deactivated", "skill should be deactivated before sync");
+        drop(conn);
+
+        let mut server = Server::new();
+
+        // Status endpoint returns skill as "published"
+        let status_mock = server
+            .mock("POST", "/api/runner/skills/status")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"statuses":{"test-skill":{"status":"published","latest_version":"0.1.0"}},"unknown":[]}"#,
+            )
+            .create();
+
+        // After reactivation the version update loop will check for updates.
+        // Return same version (0.1.0) so no update is applied.
+        let detail_mock = server
+            .mock("GET", "/portal/skills/test-skill")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"skill_id":"test-skill","name":"Test Skill","latest_version":"0.1.0","publisher_name":null,"description":null}"#,
+            )
+            .create();
+
+        let registry = RegistryClient::new(server.url());
+        let policy_client = crate::policy::MockPolicyClient::new();
+
+        let count = check_skill_updates(&state, &registry, &policy_client).unwrap();
+        assert_eq!(count, 1, "one lifecycle change (reactivation) should be counted");
+
+        // Verify skill is active in DB
+        let conn = rusqlite::Connection::open(&state.db_path).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT current_status FROM installed_skills WHERE skill_id = 'test-skill'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "active");
+
+        // Verify active symlink is restored
+        let active_path = state.root_dir.join("skills/test-skill/active");
+        assert!(active_path.exists(), "active symlink should be restored after reactivation");
+
+        status_mock.assert();
+        detail_mock.assert();
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&skill_root);
     }

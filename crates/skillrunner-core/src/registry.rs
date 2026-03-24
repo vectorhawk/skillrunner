@@ -54,6 +54,21 @@ struct SearchApiResponse {
     items: Vec<SearchResult>,
 }
 
+/// Entry returned per skill by `POST /api/runner/skills/status`.
+#[derive(Debug, Deserialize)]
+pub struct SkillStatusEntry {
+    pub status: String, // "published" | "unpublished"
+    pub latest_version: Option<String>,
+}
+
+/// Response from `POST /api/runner/skills/status`.
+#[derive(Debug, Deserialize)]
+pub struct SkillStatusResponse {
+    pub statuses: std::collections::HashMap<String, SkillStatusEntry>,
+    #[serde(default)]
+    pub unknown: Vec<String>,
+}
+
 /// Skill detail returned by `GET /portal/skills/{skill_id}`.
 #[derive(Debug, Deserialize)]
 pub struct SkillDetail {
@@ -271,6 +286,39 @@ impl RegistryClient {
 
         resp.json()
             .context("failed to deserialize skill detail response")
+    }
+
+    /// Check the lifecycle status of a batch of skills.
+    ///
+    /// Calls `POST /api/runner/skills/status`. Returns an error if the endpoint
+    /// is unreachable or returns a non-success HTTP status (e.g. old registry
+    /// without this endpoint). Callers should handle errors by skipping
+    /// lifecycle checks and proceeding with version updates only.
+    pub fn check_skill_status(&self, skill_ids: &[String]) -> Result<SkillStatusResponse> {
+        if skill_ids.is_empty() {
+            return Ok(SkillStatusResponse {
+                statuses: std::collections::HashMap::new(),
+                unknown: vec![],
+            });
+        }
+        let url = format!("{}/api/runner/skills/status", self.base_url.trim_end_matches('/'));
+        let body = serde_json::json!({ "skill_ids": skill_ids });
+        debug!(url, "checking skill lifecycle status");
+
+        let resp = self
+            .http
+            .post(&url)
+            .json(&body)
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!("registry returned HTTP {status} for skill status check: {body}");
+        }
+
+        resp.json().context("failed to deserialize skill status response")
     }
 
     /// Upload a `.cskill` archive to the registry.
