@@ -149,6 +149,11 @@ impl RegistryClient {
 /// - When `system_level` is true, writes to the OS system path which triggers
 ///   Claude Code's exclusive mode (requires admin/root).
 /// - When `system_level` is false, writes to the user-level path (additive mode).
+#[deprecated(
+    note = "Replaced by aggregator pattern. SkillRunner will be the single MCP \
+            entry in the client config; backend servers are managed internally \
+            via BackendRegistry rather than written to disk."
+)]
 pub fn sync_mcp_config(
     state: &AppState,
     registry: &RegistryClient,
@@ -291,6 +296,10 @@ fn finish_sync(
 }
 
 /// Path to ~/.claude.json (Claude Code's user-level config).
+#[deprecated(
+    note = "Replaced by aggregator pattern. Config-file writes are no longer \
+            needed once SkillRunner is the single MCP entry point."
+)]
 fn claude_json_path() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     format!("{}/.claude.json", home)
@@ -300,6 +309,10 @@ fn claude_json_path() -> String {
 ///
 /// Reads the existing config, adds/overwrites entries for governed servers,
 /// and writes back. Non-governed entries the user has manually added are preserved.
+#[deprecated(
+    note = "Replaced by aggregator pattern. Tool delivery via list_changed \
+            eliminates the need to rewrite config files."
+)]
 fn merge_into_claude_json(
     path: &str,
     servers: &serde_json::Map<String, serde_json::Value>,
@@ -333,6 +346,10 @@ fn merge_into_claude_json(
 
 /// System-level managed-mcp.json — triggers Claude Code exclusive mode.
 /// Requires admin/root to write.
+#[deprecated(
+    note = "Replaced by aggregator pattern. The system-level config only needs \
+            to contain the SkillRunner entry, written once during MDM deployment."
+)]
 fn system_managed_mcp_path() -> String {
     if cfg!(target_os = "macos") {
         "/Library/Application Support/ClaudeCode/managed-mcp.json".to_string()
