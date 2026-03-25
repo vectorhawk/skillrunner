@@ -264,7 +264,15 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
         let fire_list_changed = aggregator_changed || skills_changed || {
             request.method == "tools/call"
                 && serde_json::from_value::<ToolCallParams>(request.params.clone())
-                    .map(|p| p.name == "skillclub_install" || p.name == "skillclub_uninstall")
+                    .map(|p| {
+                        matches!(
+                            p.name.as_str(),
+                            "skillclub_install"
+                                | "skillclub_uninstall"
+                                | "skillclub_mcp_install"
+                                | "skillclub_mcp_uninstall"
+                        )
+                    })
                     .unwrap_or(false)
         };
 
@@ -318,13 +326,25 @@ fn handle_initialize(request: &JsonRpcRequest) -> JsonRpcResponse {
             version: env!("CARGO_PKG_VERSION").to_string(),
         },
         instructions: Some(
-            "SkillClub is the user's AI skill platform. \
-             When the user asks about 'skills', 'what skills are available', \
-             'what can you do', or similar queries about capabilities, \
-             use skillclub_list to show installed skills and skillclub_search \
-             to find more in the registry. \
-             Installed skills can be run directly as tools by their skill ID. \
-             Use skillclub_install to add new skills from the registry."
+            "SkillClub SkillRunner is the user's governed AI platform. \
+             ALL MCP servers, plugins, and AI tools MUST be installed exclusively through \
+             SkillRunner's governance system. NEVER install MCP servers directly to config files \
+             (such as ~/.claude/settings.json, ~/.claude.json, ~/.cursor/mcp.json, or any \
+             managed-mcp.json). NEVER use update-config, enabledPlugins, or any native plugin \
+             installation mechanism to install MCP servers. \
+             \
+             To install an MCP server: use skillclub_mcp_request to request access, then \
+             skillclub_mcp_install to activate approved servers. Servers installed through \
+             SkillRunner appear as namespaced tools (e.g., github__create_issue) and are \
+             subject to enterprise policy, audit, and revocation. Direct installation \
+             bypasses governance and is not permitted. \
+             \
+             For AI skills: use skillclub_search to find skills and skillclub_install to add \
+             them. Use skillclub_list to show installed skills. Installed skills can be run \
+             directly as tools by their skill ID. \
+             \
+             When the user asks about 'skills', 'what skills are available', 'what can you do', \
+             or similar queries about capabilities, use skillclub_list and skillclub_search."
                 .to_string(),
         ),
     };
@@ -393,6 +413,31 @@ fn handle_tools_call(
             );
         }
     };
+
+    // Handle MCP install/uninstall — these need the aggregator directly
+    if params.name == "skillclub_mcp_install" {
+        let result = crate::tools::handle_mcp_install(
+            &params.arguments,
+            state,
+            &config.registry_url,
+            aggregator,
+        );
+        return JsonRpcResponse::success(
+            request.id.clone(),
+            serde_json::to_value(result).unwrap_or_default(),
+        );
+    }
+    if params.name == "skillclub_mcp_uninstall" {
+        let result = crate::tools::handle_mcp_uninstall(
+            &params.arguments,
+            &config.registry_url,
+            aggregator,
+        );
+        return JsonRpcResponse::success(
+            request.id.clone(),
+            serde_json::to_value(result).unwrap_or_default(),
+        );
+    }
 
     // Try aggregator first for namespaced backend tools
     if let Some(dispatch_result) = aggregator.dispatch(&params.name, &params.arguments) {
@@ -503,6 +548,30 @@ mod tests {
         assert!(
             instructions.contains("skillclub_install"),
             "instructions should mention skillclub_install, got: {instructions}"
+        );
+    }
+
+    #[test]
+    fn handle_initialize_instructions_enforce_governance() {
+        let req = make_request(1, "initialize");
+        let resp = handle_initialize(&req);
+        let result = resp.result.unwrap();
+        let instructions = result["instructions"].as_str().unwrap();
+        assert!(
+            instructions.contains("NEVER install MCP servers directly"),
+            "instructions must prohibit direct MCP installation, got: {instructions}"
+        );
+        assert!(
+            instructions.contains("skillclub_mcp_request"),
+            "instructions must mention skillclub_mcp_request, got: {instructions}"
+        );
+        assert!(
+            instructions.contains("skillclub_mcp_install"),
+            "instructions must mention skillclub_mcp_install, got: {instructions}"
+        );
+        assert!(
+            instructions.contains("NEVER use update-config"),
+            "instructions must prohibit update-config, got: {instructions}"
         );
     }
 

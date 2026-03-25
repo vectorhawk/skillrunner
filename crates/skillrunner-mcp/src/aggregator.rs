@@ -503,6 +503,34 @@ impl BackendRegistry {
         self.inner.lock().unwrap().backends.len()
     }
 
+    /// Check whether a backend with the given ID is active.
+    pub fn has_backend(&self, server_id: &str) -> bool {
+        self.inner.lock().unwrap().backends.contains_key(server_id)
+    }
+
+    /// Remove a single backend by ID. Returns true if a backend was removed.
+    pub fn remove_backend(&self, server_id: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let removed = inner.backends.remove(server_id).is_some();
+        if removed {
+            info!(server_id = %server_id, "removed backend from aggregator");
+        }
+        removed
+    }
+
+    /// Get tool names for a specific backend.
+    pub fn backend_tools(&self, server_id: &str) -> Vec<String> {
+        let inner = self.inner.lock().unwrap();
+        match inner.backends.get(server_id) {
+            Some(conn) => conn
+                .tools()
+                .iter()
+                .map(|t| format!("{}__{}", server_id, t.name))
+                .collect(),
+            None => vec![],
+        }
+    }
+
     /// IDs of backends that had tools truncated due to the tool budget.
     pub fn truncated_backends(&self) -> Vec<String> {
         self.inner
@@ -651,7 +679,7 @@ fn effective_server_id(entry: &McpServerEntry) -> String {
 }
 
 /// Convert a display name into a valid identifier (lowercase, dashes only).
-fn sanitize_id(name: &str) -> String {
+pub fn sanitize_id(name: &str) -> String {
     name.to_lowercase()
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '-' })
@@ -892,5 +920,101 @@ mod tests {
         assert_eq!(registry.backend_count(), 1);
         registry.shutdown();
         assert_eq!(registry.backend_count(), 0);
+    }
+
+    #[test]
+    fn has_backend_returns_false_when_empty() {
+        let registry = BackendRegistry::new();
+        assert!(!registry.has_backend("test"));
+    }
+
+    #[test]
+    fn has_backend_returns_true_for_existing() {
+        let registry = BackendRegistry::new();
+        {
+            let mut inner = registry.inner.lock().unwrap();
+            inner.backends.insert(
+                "playwright".to_string(),
+                BackendConnection::Http(HttpBackend {
+                    server_id: "playwright".to_string(),
+                    name: "Playwright".to_string(),
+                    url: "http://unused".to_string(),
+                    tools: vec![],
+                    tool_visibility: ToolVisibility::All,
+                    priority: 50,
+                }),
+            );
+        }
+        assert!(registry.has_backend("playwright"));
+        assert!(!registry.has_backend("github"));
+    }
+
+    #[test]
+    fn remove_backend_returns_false_when_not_found() {
+        let registry = BackendRegistry::new();
+        assert!(!registry.remove_backend("nonexistent"));
+    }
+
+    #[test]
+    fn remove_backend_removes_and_returns_true() {
+        let registry = BackendRegistry::new();
+        {
+            let mut inner = registry.inner.lock().unwrap();
+            inner.backends.insert(
+                "sentry".to_string(),
+                BackendConnection::Http(HttpBackend {
+                    server_id: "sentry".to_string(),
+                    name: "Sentry".to_string(),
+                    url: "http://unused".to_string(),
+                    tools: vec![],
+                    tool_visibility: ToolVisibility::All,
+                    priority: 50,
+                }),
+            );
+        }
+        assert_eq!(registry.backend_count(), 1);
+        assert!(registry.remove_backend("sentry"));
+        assert_eq!(registry.backend_count(), 0);
+        assert!(!registry.has_backend("sentry"));
+    }
+
+    #[test]
+    fn backend_tools_returns_namespaced_names() {
+        let registry = BackendRegistry::new();
+        {
+            let mut inner = registry.inner.lock().unwrap();
+            inner.backends.insert(
+                "github".to_string(),
+                BackendConnection::Http(HttpBackend {
+                    server_id: "github".to_string(),
+                    name: "GitHub".to_string(),
+                    url: "http://unused".to_string(),
+                    tools: vec![
+                        ToolDefinition {
+                            name: "create_issue".to_string(),
+                            description: Some("Create issue".to_string()),
+                            input_schema: None,
+                        },
+                        ToolDefinition {
+                            name: "list_repos".to_string(),
+                            description: None,
+                            input_schema: None,
+                        },
+                    ],
+                    tool_visibility: ToolVisibility::All,
+                    priority: 50,
+                }),
+            );
+        }
+        let tools = registry.backend_tools("github");
+        assert_eq!(tools.len(), 2);
+        assert!(tools.contains(&"github__create_issue".to_string()));
+        assert!(tools.contains(&"github__list_repos".to_string()));
+    }
+
+    #[test]
+    fn backend_tools_returns_empty_for_unknown() {
+        let registry = BackendRegistry::new();
+        assert!(registry.backend_tools("unknown").is_empty());
     }
 }

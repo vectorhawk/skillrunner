@@ -169,6 +169,41 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
                 "required": []
             }),
         });
+
+        tools.push(ToolDefinition {
+            name: "skillclub_mcp_install".to_string(),
+            description: "Activate an approved MCP server through SkillRunner's governance system. \
+                This forces an immediate sync with the registry and makes the server's tools \
+                available right away. The server must already be approved via skillclub_mcp_request."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "server_name": {
+                        "type": "string",
+                        "description": "Name of the approved MCP server to activate"
+                    }
+                },
+                "required": ["server_name"]
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "skillclub_mcp_uninstall".to_string(),
+            description: "Remove a governed MCP server from SkillRunner. \
+                This deactivates the server and removes its tools immediately."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "server_name": {
+                        "type": "string",
+                        "description": "Name of the MCP server to deactivate"
+                    }
+                },
+                "required": ["server_name"]
+            }),
+        });
     }
 
     if registry_url.is_some() {
@@ -983,15 +1018,17 @@ fn handle_mcp_request(
 
     match req_status {
         "approved" => {
-            // Auto-approved — the aggregator will pick up the new server on its
-            // next refresh cycle (within AGGREGATOR_REFRESH_INTERVAL seconds).
             ToolCallResult::success(format!(
-                "Request for '{}' was auto-approved! The server will be available shortly as the aggregator refreshes its backend list.",
-                server_name
+                "Request for '{}' was approved! \
+                 Use `skillclub_mcp_install` with server_name '{}' to activate it now.",
+                server_name, server_name
             ))
         }
         "pending" => ToolCallResult::success(format!(
-            "Request for '{}' has been submitted and is pending IT review.\n\nYour admin will review it in the SkillClub portal. Run `skillclub_mcp_status` to check on it later.",
+            "Request for '{}' has been submitted and is pending IT review.\n\n\
+             Your admin will review it in the SkillClub portal. \
+             Run `skillclub_mcp_status` to check on it later, then use \
+             `skillclub_mcp_install` to activate it once approved.",
             server_name
         )),
         _ => ToolCallResult::success(format!(
@@ -1063,6 +1100,91 @@ fn handle_mcp_status(state: &AppState, registry_url: &Option<String>) -> ToolCal
             Ok(text) => ToolCallResult::success(text),
             Err(e) => ToolCallResult::error(format!("Failed to serialize: {e}")),
         }
+    }
+}
+
+// ── MCP install/uninstall handlers (need aggregator access) ──────────────────
+
+/// Activate an approved MCP server by forcing an immediate aggregator sync.
+/// Called from server.rs which has access to the aggregator.
+pub fn handle_mcp_install(
+    arguments: &serde_json::Value,
+    state: &AppState,
+    registry_url: &Option<String>,
+    aggregator: &crate::aggregator::BackendRegistry,
+) -> ToolCallResult {
+    let url = match registry_url {
+        Some(u) => u,
+        None => return ToolCallResult::error("No registry URL configured"),
+    };
+
+    let server_name = match arguments.get("server_name").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return ToolCallResult::error("Missing required parameter: server_name"),
+    };
+
+    let server_id = crate::aggregator::sanitize_id(server_name);
+
+    // Force an immediate sync with the registry
+    let registry_client = RegistryClient::new(url);
+    if let Err(e) = aggregator.sync(state, &registry_client) {
+        return ToolCallResult::error(format!(
+            "Failed to sync with registry: {e}. Check your network connection and registry URL."
+        ));
+    }
+
+    // Check if the server is now in the aggregator
+    if aggregator.has_backend(&server_id) {
+        let tools = aggregator.backend_tools(&server_id);
+        let tool_list = if tools.is_empty() {
+            "No tools were exposed by this server.".to_string()
+        } else {
+            tools.join(", ")
+        };
+        ToolCallResult::success(format!(
+            "MCP server '{}' is now active through SkillRunner governance.\n\nAvailable tools: {}",
+            server_name, tool_list
+        ))
+    } else {
+        // Server not in approved list — check if it's blocked or just not approved
+        ToolCallResult::error(format!(
+            "Server '{}' is not in the approved server list. \
+             It may be pending approval, blocked, or not yet requested.\n\n\
+             Use skillclub_mcp_request to request access, then retry skillclub_mcp_install \
+             after approval.",
+            server_name
+        ))
+    }
+}
+
+/// Remove a governed MCP server from the aggregator.
+/// Called from server.rs which has access to the aggregator.
+pub fn handle_mcp_uninstall(
+    arguments: &serde_json::Value,
+    registry_url: &Option<String>,
+    aggregator: &crate::aggregator::BackendRegistry,
+) -> ToolCallResult {
+    if registry_url.is_none() {
+        return ToolCallResult::error("No registry URL configured");
+    }
+
+    let server_name = match arguments.get("server_name").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return ToolCallResult::error("Missing required parameter: server_name"),
+    };
+
+    let server_id = crate::aggregator::sanitize_id(server_name);
+
+    if aggregator.remove_backend(&server_id) {
+        ToolCallResult::success(format!(
+            "MCP server '{}' has been deactivated. Its tools are no longer available.",
+            server_name
+        ))
+    } else {
+        ToolCallResult::error(format!(
+            "No active MCP server found with name '{}'. Use skillclub_mcp_status to see your servers.",
+            server_name
+        ))
     }
 }
 
@@ -1813,5 +1935,334 @@ mod tests {
             "elicitation prompt should reference skillclub_login tool, got: {}",
             prompt.content[0].text
         );
+    }
+
+    // ── Governance edge case tests ───────────────────────────────────────────
+
+    #[test]
+    fn build_tool_list_includes_mcp_install_uninstall_with_registry() {
+        let state_root = temp_root("tool-list-mcp-install");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let tools = build_tool_list(&state, &Some("http://localhost:8000".to_string()));
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+        assert!(
+            names.contains(&"skillclub_mcp_install"),
+            "mcp_install tool missing: {names:?}"
+        );
+        assert!(
+            names.contains(&"skillclub_mcp_uninstall"),
+            "mcp_uninstall tool missing: {names:?}"
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn build_tool_list_omits_mcp_install_uninstall_without_registry() {
+        let state_root = temp_root("tool-list-mcp-install-no-reg");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let tools = build_tool_list(&state, &None);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+        assert!(
+            !names.contains(&"skillclub_mcp_install"),
+            "mcp_install should not appear without registry"
+        );
+        assert!(
+            !names.contains(&"skillclub_mcp_uninstall"),
+            "mcp_uninstall should not appear without registry"
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_mcp_install_requires_server_name() {
+        let state_root = temp_root("mcp-install-no-name");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let aggregator = crate::aggregator::BackendRegistry::new();
+        let registry_url = Some("http://localhost:8000".to_string());
+
+        let result = handle_mcp_install(
+            &serde_json::json!({}),
+            &state,
+            &registry_url,
+            &aggregator,
+        );
+        assert!(result.is_error.unwrap_or(false));
+        assert!(result.content[0].text.contains("server_name"));
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_mcp_install_requires_registry_url() {
+        let state_root = temp_root("mcp-install-no-reg");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let aggregator = crate::aggregator::BackendRegistry::new();
+
+        let result = handle_mcp_install(
+            &serde_json::json!({"server_name": "playwright"}),
+            &state,
+            &None,
+            &aggregator,
+        );
+        assert!(result.is_error.unwrap_or(false));
+        assert!(result.content[0].text.contains("No registry URL"));
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_mcp_install_without_approval_returns_error() {
+        // Server not in aggregator (no approved servers) → error
+        let state_root = temp_root("mcp-install-no-approval");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let aggregator = crate::aggregator::BackendRegistry::new();
+
+        // Use a mock server that returns empty approved list
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("GET", "/api/runner/mcp-servers")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"approval_mode": "strict", "servers": []}"#)
+            .create();
+
+        let registry_url = Some(server.url());
+
+        let result = handle_mcp_install(
+            &serde_json::json!({"server_name": "unapproved-server"}),
+            &state,
+            &registry_url,
+            &aggregator,
+        );
+        assert!(
+            result.is_error.unwrap_or(false),
+            "should error for unapproved server, got: {}",
+            result.content[0].text
+        );
+        // After sync succeeds with empty list, server won't be in aggregator
+        assert!(
+            result.content[0].text.contains("not in the approved server list"),
+            "error should mention approval, got: {}",
+            result.content[0].text
+        );
+        // Should not be in the aggregator
+        assert!(!aggregator.has_backend("unapproved-server"));
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_mcp_install_sync_failure_returns_error() {
+        // Registry unreachable and no cache → sync fails → error
+        let state_root = temp_root("mcp-install-offline");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let aggregator = crate::aggregator::BackendRegistry::new();
+
+        // Point to unreachable registry with no cache
+        let registry_url = Some("http://127.0.0.1:1".to_string());
+
+        let result = handle_mcp_install(
+            &serde_json::json!({"server_name": "some-server"}),
+            &state,
+            &registry_url,
+            &aggregator,
+        );
+        assert!(
+            result.is_error.unwrap_or(false),
+            "should error when sync fails, got: {}",
+            result.content[0].text
+        );
+        assert!(
+            result.content[0].text.contains("Failed to sync"),
+            "error should mention sync failure, got: {}",
+            result.content[0].text
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_mcp_install_blocked_server_returns_error() {
+        // Server is in the list but status is "blocked" → aggregator filters it → error
+        let state_root = temp_root("mcp-install-blocked");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let aggregator = crate::aggregator::BackendRegistry::new();
+
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("GET", "/api/runner/mcp-servers")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"approval_mode": "strict", "servers": [{"name": "Bad Server", "status": "blocked", "package_source": "http://localhost:9999"}]}"#)
+            .create();
+
+        let registry_url = Some(server.url());
+
+        let result = handle_mcp_install(
+            &serde_json::json!({"server_name": "Bad Server"}),
+            &state,
+            &registry_url,
+            &aggregator,
+        );
+        assert!(
+            result.is_error.unwrap_or(false),
+            "blocked server should return error, got: {}",
+            result.content[0].text
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_mcp_uninstall_requires_server_name() {
+        let aggregator = crate::aggregator::BackendRegistry::new();
+        let registry_url = Some("http://localhost:8000".to_string());
+
+        let result = handle_mcp_uninstall(
+            &serde_json::json!({}),
+            &registry_url,
+            &aggregator,
+        );
+        assert!(result.is_error.unwrap_or(false));
+        assert!(result.content[0].text.contains("server_name"));
+    }
+
+    #[test]
+    fn handle_mcp_uninstall_requires_registry_url() {
+        let aggregator = crate::aggregator::BackendRegistry::new();
+
+        let result = handle_mcp_uninstall(
+            &serde_json::json!({"server_name": "test"}),
+            &None,
+            &aggregator,
+        );
+        assert!(result.is_error.unwrap_or(false));
+        assert!(result.content[0].text.contains("No registry URL"));
+    }
+
+    #[test]
+    fn handle_mcp_uninstall_nonexistent_server_returns_error() {
+        let aggregator = crate::aggregator::BackendRegistry::new();
+        let registry_url = Some("http://localhost:8000".to_string());
+
+        let result = handle_mcp_uninstall(
+            &serde_json::json!({"server_name": "nonexistent"}),
+            &registry_url,
+            &aggregator,
+        );
+        assert!(
+            result.is_error.unwrap_or(false),
+            "should error for nonexistent server"
+        );
+        assert!(
+            result.content[0].text.contains("No active MCP server"),
+            "got: {}",
+            result.content[0].text
+        );
+    }
+
+    #[test]
+    fn handle_mcp_uninstall_removes_active_backend() {
+        use crate::aggregator::{BackendConnection, HttpBackend, ToolVisibility};
+
+        let aggregator = crate::aggregator::BackendRegistry::new();
+        let registry_url = Some("http://localhost:8000".to_string());
+
+        // Manually add a backend
+        {
+            let mut inner = aggregator.inner.lock().unwrap();
+            inner.backends.insert(
+                "playwright".to_string(),
+                BackendConnection::Http(HttpBackend {
+                    server_id: "playwright".to_string(),
+                    name: "Playwright".to_string(),
+                    url: "http://localhost:9999".to_string(),
+                    tools: vec![],
+                    tool_visibility: ToolVisibility::All,
+                    priority: 50,
+                }),
+            );
+        }
+        assert_eq!(aggregator.backend_count(), 1);
+
+        let result = handle_mcp_uninstall(
+            &serde_json::json!({"server_name": "Playwright"}),
+            &registry_url,
+            &aggregator,
+        );
+        assert!(
+            result.is_error.is_none() || !result.is_error.unwrap(),
+            "should succeed, got: {}",
+            result.content[0].text
+        );
+        assert!(result.content[0].text.contains("deactivated"));
+        assert_eq!(aggregator.backend_count(), 0);
+    }
+
+    #[test]
+    fn handle_mcp_request_approved_suggests_mcp_install() {
+        let state_root = temp_root("mcp-req-approved");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/portal/mcp/requests")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"status": "approved", "server_name": "Playwright"}"#)
+            .create();
+
+        let mock_url = server.url();
+        // Save auth tokens against the mock server URL
+        auth::save_tokens(&state, &mock_url, "tok_test", "ref_test").unwrap();
+
+        let result = handle_mcp_request(
+            &serde_json::json!({"server_name": "Playwright"}),
+            &state,
+            &Some(mock_url),
+        );
+        assert!(
+            result.content[0].text.contains("skillclub_mcp_install"),
+            "approved response should mention skillclub_mcp_install, got: {}",
+            result.content[0].text
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_mcp_request_pending_suggests_mcp_install_after_approval() {
+        let state_root = temp_root("mcp-req-pending");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/portal/mcp/requests")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"status": "pending", "server_name": "Slack"}"#)
+            .create();
+
+        let mock_url = server.url();
+        auth::save_tokens(&state, &mock_url, "tok_test", "ref_test").unwrap();
+
+        let result = handle_mcp_request(
+            &serde_json::json!({"server_name": "Slack"}),
+            &state,
+            &Some(mock_url),
+        );
+        assert!(
+            result.content[0].text.contains("skillclub_mcp_install"),
+            "pending response should mention skillclub_mcp_install, got: {}",
+            result.content[0].text
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
     }
 }
