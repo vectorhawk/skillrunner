@@ -4,5 +4,5 @@ steps:
     type: llm
     prompt: prompts/transform.txt
     inputs:
-      text: text
+      text: input.text
     output_schema: schemas/output.schema.json

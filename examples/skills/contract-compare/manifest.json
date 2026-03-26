@@ -2,7 +2,7 @@
   "schema_version": "1.0",
   "id": "contract-compare",
   "name": "Contract Compare",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "skillclub",
   "description": "Compare two contracts, summarize changes, and assess risk level.",
   "entrypoint": "workflow.yaml",
