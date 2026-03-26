@@ -330,28 +330,34 @@ fn main() -> Result<()> {
                 };
                 run_server(app.state, config)?;
             }
-            McpCommands::Setup { registry_url, client, auto: _auto } => {
+            McpCommands::Setup { registry_url, client, auto } => {
                 let effective_url = resolve_registry_url(registry_url, managed_registry_url.as_deref());
                 let skillrunner_path = std::env::current_exe()
                     .ok()
                     .and_then(|p| p.to_str().map(|s| s.to_string()))
                     .unwrap_or_else(|| "skillrunner".to_string());
 
-                // --auto: non-interactive mode (current behavior is already non-interactive)
-
                 let clients = detect_ai_clients(&skillrunner_path);
                 if clients.is_empty() {
-                    println!("No AI clients detected (looked for Claude Code, Cursor).");
+                    if !auto {
+                        println!("No AI clients detected (looked for Claude Code, Cursor, Windsurf, VS Code, Gemini CLI).");
+                    }
                     return Ok(());
                 }
 
+                let mut configured = 0u32;
                 for detected in &clients {
                     let should_configure = match client.as_str() {
                         "all" => true,
                         "claude" => detected.name == "Claude Code",
                         "cursor" => detected.name == "Cursor",
+                        "windsurf" => detected.name == "Windsurf",
+                        "vscode" => detected.name == "VS Code",
+                        "gemini" => detected.name == "Gemini CLI",
                         _ => {
-                            println!("Unknown client '{}'. Use: claude, cursor, or all", client);
+                            if !auto {
+                                println!("Unknown client '{}'. Use: claude, cursor, windsurf, vscode, gemini, or all", client);
+                            }
                             return Ok(());
                         }
                     };
@@ -361,23 +367,37 @@ fn main() -> Result<()> {
                     }
 
                     if detected.already_configured {
-                        println!("  {} — already configured ✓", detected.name);
+                        if !auto {
+                            println!("  {} — already configured ✓", detected.name);
+                        }
+                        configured += 1;
                         continue;
                     }
 
                     match configure_client(detected, &skillrunner_path, &effective_url) {
-                        Ok(()) => println!(
-                            "  {} — configured ✓ ({})",
-                            detected.name,
-                            detected.config_path.display()
-                        ),
-                        Err(e) => println!("  {} — failed: {e}", detected.name),
+                        Ok(()) => {
+                            configured += 1;
+                            if !auto {
+                                println!(
+                                    "  {} — configured ✓ ({})",
+                                    detected.name,
+                                    detected.config_path.display()
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if !auto {
+                                println!("  {} — failed: {e}", detected.name);
+                            }
+                        }
                     }
                 }
 
                 mark_first_run_offered(&app.state)?;
 
-                println!("\nRestart your AI client to activate SkillRunner MCP.");
+                if !auto && configured > 0 {
+                    println!("\nRestart your AI client to activate SkillRunner MCP.");
+                }
             }
             McpCommands::Backends { registry_url } => {
                 let url = resolve_registry_url(registry_url, managed_registry_url.as_deref());

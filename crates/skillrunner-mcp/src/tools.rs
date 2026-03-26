@@ -257,7 +257,7 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
 
         tools.push(ToolDefinition {
             name: "skillclub_publish".to_string(),
-            description: "Package and publish a skill bundle to the SkillClub registry. Requires authentication.".to_string(),
+            description: "Package and publish a skill bundle to the SkillClub registry. Requires authentication. If the version already exists, bump the version in manifest.json and retry.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -770,6 +770,16 @@ fn handle_publish(
         }
         Err(e) => {
             let _ = fs::remove_file(&archive_path);
+            let err_msg = e.to_string();
+
+            // Detect "version already exists" and suggest bumping
+            if err_msg.contains("already exists") && err_msg.contains("ersion") {
+                return ToolCallResult::error(format!(
+                    "{err_msg}\n\nTo publish a new version, bump the version in manifest.json \
+                     (e.g., 0.1.0 → 0.2.0) and run skillclub_publish again."
+                ));
+            }
+
             return ToolCallResult::error(format!("Failed to publish: {e}"));
         }
     };
