@@ -345,7 +345,10 @@ impl BackendRegistry {
                     priority,
                 })
             } else {
-                // HTTP backend — URL from gateway_url, server_config URL, or package_source
+                // HTTP backend — URL from gateway_url or server_config URL.
+                // Skip backends that only have a package_source (npm name) but no
+                // actual reachable URL — they are catalog entries awaiting gateway
+                // configuration or local stdio setup.
                 let url = entry
                     .gateway_url
                     .clone()
@@ -354,17 +357,26 @@ impl BackendRegistry {
                             .server_config
                             .as_ref()
                             .and_then(|c| c.get("url").and_then(|u| u.as_str()).map(String::from))
-                    })
-                    .unwrap_or_else(|| entry.package_source.clone());
+                    });
 
-                BackendConnection::Http(HttpBackend {
-                    server_id: server_id.clone(),
-                    name: entry.name.clone(),
-                    url,
-                    tools: vec![], // populated by fetch_tools_from_backend
-                    tool_visibility: visibility,
-                    priority,
-                })
+                match url {
+                    Some(url) => BackendConnection::Http(HttpBackend {
+                        server_id: server_id.clone(),
+                        name: entry.name.clone(),
+                        url,
+                        tools: vec![], // populated by fetch_tools_from_backend
+                        tool_visibility: visibility,
+                        priority,
+                    }),
+                    None => {
+                        debug!(
+                            server_id = %server_id,
+                            package_source = %entry.package_source,
+                            "skipping backend — no gateway_url or server_config url configured"
+                        );
+                        continue;
+                    }
+                }
             };
 
             // Fetch tool list from the backend (best-effort; empty tools on failure).

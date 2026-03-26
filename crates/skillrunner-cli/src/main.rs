@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use skillrunner_core::{
@@ -9,7 +9,7 @@ use skillrunner_core::{
     install::{install_unpacked_skill, uninstall_skill},
     managed::load_managed_config,
     mcp_governance,
-    ollama::OllamaClient,
+    ollama::{resolve_model, OllamaClient},
     policy::MockPolicyClient,
     registry::{HttpPolicyClient, RegistryClient},
     resolver::{resolve_skill, ResolveOutcome},
@@ -106,6 +106,9 @@ enum AuthCommands {
         /// Email address
         #[arg(long)]
         email: Option<String>,
+        /// Password (use for non-interactive/CI environments without a TTY)
+        #[arg(long)]
+        password: Option<String>,
     },
     /// Log out from the SkillClub registry
     Logout {
@@ -274,7 +277,7 @@ fn main() -> Result<()> {
             }
         }
         Commands::Auth { command } => match command {
-            AuthCommands::Login { registry_url, email } => {
+            AuthCommands::Login { registry_url, email, password } => {
                 let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
 
                 let email = match email {
@@ -287,7 +290,10 @@ fn main() -> Result<()> {
                     }
                 };
 
-                let password = rpassword::read_password_from_tty(Some("Password: "))?;
+                let password = match password {
+                    Some(p) => p,
+                    None => rpassword::read_password_from_tty(Some("Password: "))?,
+                };
                 let auth_client = AuthClient::new(&url);
                 let tokens = auth_client.login(&email, &password)?;
                 auth::save_tokens(&app.state, &url, &tokens.access_token, &tokens.refresh_token)?;
@@ -605,7 +611,20 @@ fn main() -> Result<()> {
                 let input_json: serde_json::Value = serde_json::from_str(&input_text)
                     .map_err(|e| anyhow::anyhow!("{input} is not valid JSON: {e}"))?;
 
-                let ollama = OllamaClient::new(ollama_url, model);
+                // When not in stub mode, resolve the model against what Ollama
+                // actually has available.  If the requested model is missing we
+                // fall back to the first installed model rather than failing
+                // with a 404 at generate time.  In stub mode we skip the
+                // network call entirely.
+                let effective_model = if stub {
+                    model.clone()
+                } else {
+                    let probe = OllamaClient::new(&ollama_url, "");
+                    resolve_model(&probe, &model)
+                        .with_context(|| format!("failed to resolve model '{model}' from Ollama at {ollama_url}"))?
+                };
+
+                let ollama = OllamaClient::new(ollama_url, effective_model);
                 let model_client: Option<&dyn skillrunner_core::model::ModelClient> = if stub {
                     None
                 } else {

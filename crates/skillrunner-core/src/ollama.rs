@@ -161,6 +161,51 @@ impl ModelClient for OllamaClient {
     }
 }
 
+// ── Model resolution ──────────────────────────────────────────────────────────
+
+/// Resolve the model name to use for an Ollama request.
+///
+/// Priority order:
+/// 1. If `requested` matches a model name in Ollama's available list → use it
+/// 2. If Ollama has exactly one model available → use it (unambiguous fallback)
+/// 3. If Ollama has multiple models but `requested` is not in the list → use the
+///    first available model and emit a warning so the operator knows
+/// 4. If Ollama has no models → return an error
+///
+/// When `requested` is empty (e.g. the flag was not passed) the function skips
+/// the match check and falls straight through to steps 2–4.
+pub fn resolve_model<T: AsRef<str>>(client: &OllamaClient, requested: T) -> Result<String> {
+    let requested = requested.as_ref();
+    let models = client
+        .list_models()
+        .context("failed to list Ollama models for model resolution")?;
+
+    if models.is_empty() {
+        anyhow::bail!(
+            "Ollama has no models installed — run `ollama pull <model>` to install one"
+        );
+    }
+
+    let available: Vec<&str> = models.iter().map(|m| m.name.as_str()).collect();
+
+    // If the requested name is non-empty and present in the list, use it directly.
+    if !requested.is_empty() {
+        if available.contains(&requested) {
+            return Ok(requested.to_string());
+        }
+        // Requested model not found — fall back to first available and warn.
+        tracing::warn!(
+            requested_model = requested,
+            available = ?available,
+            "requested model is not available in Ollama; falling back to first available model"
+        );
+    }
+
+    // Use the first available model (covers both the "no preference" and
+    // "fallback" cases handled above).
+    Ok(models.into_iter().next().map(|m| m.name).expect("non-empty list checked above"))
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -322,5 +367,66 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.text, r#"{"key":"value"}"#);
+    }
+
+    // ── resolve_model tests ──────────────────────────────────────────────────
+
+    fn mock_tags(server: &mut mockito::Server, body: &str) -> mockito::Mock {
+        server
+            .mock("GET", "/api/tags")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create()
+    }
+
+    #[test]
+    fn resolve_model_returns_requested_when_present() {
+        let mut server = mockito::Server::new();
+        let _m = mock_tags(
+            &mut server,
+            r#"{"models":[{"name":"llama3.2:latest","size":0},{"name":"deepseek-coder-v2:latest","size":0}]}"#,
+        );
+        let client = OllamaClient::new(server.url(), "");
+        let result = resolve_model(&client, "deepseek-coder-v2:latest").unwrap();
+        assert_eq!(result, "deepseek-coder-v2:latest");
+    }
+
+    #[test]
+    fn resolve_model_falls_back_to_first_available_when_requested_not_found() {
+        let mut server = mockito::Server::new();
+        let _m = mock_tags(
+            &mut server,
+            r#"{"models":[{"name":"deepseek-coder-v2:latest","size":0}]}"#,
+        );
+        let client = OllamaClient::new(server.url(), "");
+        // "llama3.2" is not in the list; should fall back to deepseek-coder-v2
+        let result = resolve_model(&client, "llama3.2").unwrap();
+        assert_eq!(result, "deepseek-coder-v2:latest");
+    }
+
+    #[test]
+    fn resolve_model_uses_first_model_when_no_preference_given() {
+        let mut server = mockito::Server::new();
+        let _m = mock_tags(
+            &mut server,
+            r#"{"models":[{"name":"mistral:latest","size":0},{"name":"llama3.2:latest","size":0}]}"#,
+        );
+        let client = OllamaClient::new(server.url(), "");
+        // empty string = no preference
+        let result = resolve_model(&client, "").unwrap();
+        assert_eq!(result, "mistral:latest");
+    }
+
+    #[test]
+    fn resolve_model_errors_when_no_models_available() {
+        let mut server = mockito::Server::new();
+        let _m = mock_tags(&mut server, r#"{"models":[]}"#);
+        let client = OllamaClient::new(server.url(), "");
+        let err = resolve_model(&client, "llama3.2").expect_err("should fail with empty list");
+        assert!(
+            err.to_string().contains("no models installed"),
+            "got: {err}"
+        );
     }
 }
