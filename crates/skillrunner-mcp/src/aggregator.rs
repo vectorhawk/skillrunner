@@ -577,10 +577,9 @@ impl BackendRegistry {
     fn fetch_tools_from_backend(&self, conn: &BackendConnection) -> Result<Vec<ToolDefinition>> {
         match conn {
             BackendConnection::Http(http) => {
-                let tools_url = format!(
-                    "{}/tools/list",
-                    http.url.trim_end_matches('/')
-                );
+                // MCP Streamable HTTP: POST JSON-RPC to the endpoint URL directly.
+                // The method is in the request body, not appended to the path.
+                let tools_url = http.url.trim_end_matches('/').to_string();
                 debug!(url = %tools_url, "fetching tools from HTTP backend");
 
                 let mut req = self
@@ -633,7 +632,8 @@ impl BackendRegistry {
 
     /// Call a tool on an HTTP backend and return the result.
     fn call_http_tool(&self, base_url: &str, tool_name: &str, args: &Value, auth_token: Option<&str>) -> Result<Value> {
-        let call_url = format!("{}/tools/call", base_url.trim_end_matches('/'));
+        // MCP Streamable HTTP: POST JSON-RPC to the endpoint URL directly.
+        let call_url = base_url.trim_end_matches('/').to_string();
         debug!(url = %call_url, tool = %tool_name, "dispatching tool call to HTTP backend");
 
         let mut req = self
