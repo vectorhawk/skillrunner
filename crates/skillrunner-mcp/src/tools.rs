@@ -2215,6 +2215,7 @@ mod tests {
                     tools: vec![],
                     tool_visibility: ToolVisibility::All,
                     priority: 50,
+                    auth_token: None,
                 }),
             );
         }

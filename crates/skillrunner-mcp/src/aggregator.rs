@@ -141,6 +141,8 @@ pub struct HttpBackend {
     pub tool_visibility: ToolVisibility,
     /// Priority for budget allocation.
     pub priority: u8,
+    /// Optional Bearer token for gateway-authenticated backends.
+    pub auth_token: Option<String>,
 }
 
 /// A stdio MCP backend — managed as a child process.
@@ -294,6 +296,12 @@ impl BackendRegistry {
     pub fn sync(&self, state: &AppState, registry_client: &RegistryClient) -> Result<usize> {
         let response = fetch_approved_servers(state, registry_client)?;
 
+        // Load portal auth token for gateway-routed backends
+        let gateway_token = skillrunner_core::auth::load_tokens(state, &registry_client.base_url)
+            .ok()
+            .flatten()
+            .map(|t| t.access_token);
+
         let mut inner = self.inner.lock().unwrap();
         inner.budget.reset();
 
@@ -360,14 +368,23 @@ impl BackendRegistry {
                     });
 
                 match url {
-                    Some(url) => BackendConnection::Http(HttpBackend {
-                        server_id: server_id.clone(),
-                        name: entry.name.clone(),
-                        url,
-                        tools: vec![], // populated by fetch_tools_from_backend
-                        tool_visibility: visibility,
-                        priority,
-                    }),
+                    Some(url) => {
+                        // Gateway-routed backends get the portal JWT
+                        let token = if transport == "gateway" {
+                            gateway_token.clone()
+                        } else {
+                            None
+                        };
+                        BackendConnection::Http(HttpBackend {
+                            server_id: server_id.clone(),
+                            name: entry.name.clone(),
+                            url,
+                            tools: vec![],
+                            tool_visibility: visibility,
+                            priority,
+                            auth_token: token,
+                        })
+                    }
                     None => {
                         debug!(
                             server_id = %server_id,
@@ -477,7 +494,7 @@ impl BackendRegistry {
 
         let result = match backend {
             BackendConnection::Http(http) => {
-                self.call_http_tool(&http.url, original_tool, args)
+                self.call_http_tool(&http.url, original_tool, args, http.auth_token.as_deref())
             }
             BackendConnection::Stdio(_stdio) => {
                 // Stdio dispatch is stubbed — full child-process management
@@ -566,7 +583,7 @@ impl BackendRegistry {
                 );
                 debug!(url = %tools_url, "fetching tools from HTTP backend");
 
-                let resp = self
+                let mut req = self
                     .http
                     .post(&tools_url)
                     .json(&serde_json::json!({
@@ -574,7 +591,13 @@ impl BackendRegistry {
                         "id": 1,
                         "method": "tools/list",
                         "params": {}
-                    }))
+                    }));
+
+                if let Some(token) = &http.auth_token {
+                    req = req.header("authorization", format!("Bearer {token}"));
+                }
+
+                let resp = req
                     .send()
                     .with_context(|| format!("failed to reach backend at {tools_url}"))?;
 
@@ -609,11 +632,11 @@ impl BackendRegistry {
     }
 
     /// Call a tool on an HTTP backend and return the result.
-    fn call_http_tool(&self, base_url: &str, tool_name: &str, args: &Value) -> Result<Value> {
+    fn call_http_tool(&self, base_url: &str, tool_name: &str, args: &Value, auth_token: Option<&str>) -> Result<Value> {
         let call_url = format!("{}/tools/call", base_url.trim_end_matches('/'));
         debug!(url = %call_url, tool = %tool_name, "dispatching tool call to HTTP backend");
 
-        let resp = self
+        let mut req = self
             .http
             .post(&call_url)
             .json(&serde_json::json!({
@@ -624,7 +647,13 @@ impl BackendRegistry {
                     "name": tool_name,
                     "arguments": args,
                 }
-            }))
+            }));
+
+        if let Some(token) = auth_token {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+
+        let resp = req
             .send()
             .with_context(|| format!("failed to reach backend at {call_url}"))?;
 
@@ -884,6 +913,7 @@ mod tests {
                     ],
                     tool_visibility: ToolVisibility::All,
                     priority: 50,
+                    auth_token: None,
                 }),
             );
         }
@@ -926,6 +956,7 @@ mod tests {
                     tools: vec![],
                     tool_visibility: ToolVisibility::All,
                     priority: 50,
+                    auth_token: None,
                 }),
             );
         }
@@ -954,6 +985,7 @@ mod tests {
                     tools: vec![],
                     tool_visibility: ToolVisibility::All,
                     priority: 50,
+                    auth_token: None,
                 }),
             );
         }
@@ -981,6 +1013,7 @@ mod tests {
                     tools: vec![],
                     tool_visibility: ToolVisibility::All,
                     priority: 50,
+                    auth_token: None,
                 }),
             );
         }
@@ -1015,6 +1048,7 @@ mod tests {
                     ],
                     tool_visibility: ToolVisibility::All,
                     priority: 50,
+                    auth_token: None,
                 }),
             );
         }

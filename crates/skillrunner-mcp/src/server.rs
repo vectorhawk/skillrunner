@@ -726,6 +726,7 @@ mod tests {
                     ],
                     tool_visibility: ToolVisibility::All,
                     priority: 50,
+                    auth_token: None,
                 }),
             );
         }
@@ -767,6 +768,7 @@ mod tests {
                     }],
                     tool_visibility: ToolVisibility::All,
                     priority: 50,
+                    auth_token: None,
                 }),
             );
         }
