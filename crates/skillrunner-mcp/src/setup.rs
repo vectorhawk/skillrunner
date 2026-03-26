@@ -215,6 +215,71 @@ fn vscode_settings_path(home: &std::path::Path) -> Option<PathBuf> {
     }
 }
 
+/// An MCP server entry found in a client's config file that is NOT managed by SkillRunner.
+#[derive(Debug, Clone)]
+pub struct UnmanagedServer {
+    /// Name/key of the server in the config file (e.g. "github-mcp").
+    pub server_name: String,
+    /// Which AI client config file contained this entry.
+    pub config_path: String,
+    /// Which AI client (e.g. "Claude Code", "Cursor").
+    pub client_name: String,
+}
+
+/// Scan all detected AI client config files and return MCP servers not managed by SkillRunner.
+///
+/// A server is "managed" if its key is `"skillrunner"`. Everything else is unmanaged.
+pub fn detect_unmanaged_servers() -> Vec<UnmanagedServer> {
+    let clients = detect_ai_clients("");
+    let mut unmanaged = Vec::new();
+
+    for client in &clients {
+        if !client.config_path.exists() {
+            continue;
+        }
+        let text = match fs::read_to_string(&client.config_path) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let config: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let servers = match config.get(&client.mcp_key).and_then(|v| v.as_object()) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        for key in servers.keys() {
+            if key == "skillrunner" {
+                continue;
+            }
+            unmanaged.push(UnmanagedServer {
+                server_name: key.clone(),
+                config_path: client.config_path.display().to_string(),
+                client_name: client.name.clone(),
+            });
+        }
+    }
+
+    unmanaged
+}
+
+/// Get the machine hostname for audit event identification.
+pub fn get_machine_id() -> String {
+    // Try HOSTNAME env var first (common on Linux), then shell out
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .or_else(|_| {
+            std::process::Command::new("hostname")
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .map_err(|_| std::env::VarError::NotPresent)
+        })
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
 fn is_skillrunner_configured(config_path: &PathBuf, mcp_key: &str) -> bool {
     if !config_path.exists() {
         return false;
@@ -490,6 +555,72 @@ mod tests {
         assert!(first_run_offered(&state));
 
         let _ = fs::remove_dir_all(state_root.as_str());
+    }
+
+    #[test]
+    fn detect_unmanaged_servers_finds_non_skillrunner_entries() {
+        let tmp = temp_root("unmanaged");
+        fs::create_dir_all(tmp.join(".claude")).unwrap();
+
+        // Write a config with skillrunner + two other servers
+        let config_path = tmp.join(".claude.json");
+        fs::write(
+            &config_path,
+            r#"{
+                "mcpServers": {
+                    "skillrunner": {"command": "skillrunner", "args": ["mcp", "serve"]},
+                    "github-mcp": {"command": "npx", "args": ["@modelcontextprotocol/server-github"]},
+                    "slack-mcp": {"command": "npx", "args": ["@modelcontextprotocol/server-slack"]}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        std::env::set_var("HOME", tmp.as_str());
+
+        let unmanaged = detect_unmanaged_servers();
+        let claude_unmanaged: Vec<_> = unmanaged
+            .iter()
+            .filter(|u| u.client_name == "Claude Code")
+            .collect();
+
+        assert_eq!(claude_unmanaged.len(), 2);
+        let names: Vec<&str> = claude_unmanaged.iter().map(|u| u.server_name.as_str()).collect();
+        assert!(names.contains(&"github-mcp"));
+        assert!(names.contains(&"slack-mcp"));
+
+        let _ = fs::remove_dir_all(tmp.as_str());
+    }
+
+    #[test]
+    fn detect_unmanaged_servers_empty_when_only_skillrunner() {
+        let tmp = temp_root("unmanaged-empty");
+        fs::create_dir_all(tmp.join(".claude")).unwrap();
+
+        let config_path = tmp.join(".claude.json");
+        fs::write(
+            &config_path,
+            r#"{"mcpServers": {"skillrunner": {"command": "skillrunner"}}}"#,
+        )
+        .unwrap();
+
+        std::env::set_var("HOME", tmp.as_str());
+
+        let unmanaged = detect_unmanaged_servers();
+        let claude_unmanaged: Vec<_> = unmanaged
+            .iter()
+            .filter(|u| u.client_name == "Claude Code")
+            .collect();
+        assert!(claude_unmanaged.is_empty());
+
+        let _ = fs::remove_dir_all(tmp.as_str());
+    }
+
+    #[test]
+    fn get_machine_id_returns_non_empty() {
+        let id = get_machine_id();
+        assert!(!id.is_empty());
+        assert_ne!(id, "unknown");
     }
 
     #[test]

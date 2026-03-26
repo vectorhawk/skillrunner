@@ -10,6 +10,7 @@ use crate::{
 };
 use anyhow::Result;
 use skillrunner_core::{
+    mcp_governance::{buffer_audit_event, flush_audit_buffer, AuditEvent},
     model::ModelClient,
     ollama::OllamaClient,
     policy::MockPolicyClient,
@@ -44,6 +45,12 @@ struct ServerState {
     last_aggregated_tool_count: usize,
     /// Time of the last skill version sync, for throttling.
     last_skill_sync: Option<Instant>,
+    /// Time of the last audit buffer flush.
+    last_audit_flush: Option<Instant>,
+    /// Time of the last unmanaged server scan.
+    last_unmanaged_scan: Option<Instant>,
+    /// Cached machine hostname for audit events.
+    machine_id: String,
 }
 
 impl ServerState {
@@ -54,6 +61,9 @@ impl ServerState {
             last_aggregator_sync: None,
             last_aggregated_tool_count: 0,
             last_skill_sync: None,
+            last_audit_flush: None,
+            last_unmanaged_scan: None,
+            machine_id: crate::setup::get_machine_id(),
         }
     }
 
@@ -89,6 +99,76 @@ impl ServerState {
                 warn!(error = %e, "background skill sync failed");
                 false
             }
+        }
+    }
+
+    /// Flush buffered audit events to the registry on the same 300 s throttle.
+    fn maybe_flush_audit(&mut self, app_state: &AppState) {
+        let should_flush = match self.last_audit_flush {
+            None => true,
+            Some(t) => t.elapsed() >= AGGREGATOR_REFRESH_INTERVAL,
+        };
+
+        if !should_flush {
+            return;
+        }
+
+        let Some(registry) = &self.registry_client else {
+            return;
+        };
+
+        self.last_audit_flush = Some(Instant::now());
+
+        match flush_audit_buffer(app_state, registry) {
+            Ok(0) => {}
+            Ok(n) => info!(count = n, "flushed audit events to registry"),
+            Err(e) => warn!(error = %e, "audit flush failed"),
+        }
+    }
+
+    /// Scan AI client configs for unmanaged MCP servers and emit audit events.
+    fn maybe_scan_unmanaged(&mut self, app_state: &AppState) {
+        let should_scan = match self.last_unmanaged_scan {
+            None => true,
+            Some(t) => t.elapsed() >= AGGREGATOR_REFRESH_INTERVAL,
+        };
+
+        if !should_scan {
+            return;
+        }
+
+        // Only emit events if we have a registry to upload to
+        if self.registry_client.is_none() {
+            return;
+        }
+
+        self.last_unmanaged_scan = Some(Instant::now());
+
+        let unmanaged = crate::setup::detect_unmanaged_servers();
+        for server in &unmanaged {
+            let event = AuditEvent {
+                server_name: Some(server.server_name.clone()),
+                user_id: None,
+                user_email: None,
+                machine_id: Some(self.machine_id.clone()),
+                event_type: "unmanaged_server_detected".to_string(),
+                tool_name: None,
+                metadata: Some(serde_json::json!({
+                    "config_path": server.config_path,
+                    "client_name": server.client_name,
+                })),
+                org_id: "default".to_string(),
+            };
+            if let Err(e) = buffer_audit_event(app_state, &event) {
+                warn!(error = %e, server = %server.server_name, "failed to buffer unmanaged server event");
+            }
+        }
+
+        if !unmanaged.is_empty() {
+            info!(
+                count = unmanaged.len(),
+                "detected unmanaged MCP servers — audit events buffered"
+            );
         }
     }
 
@@ -187,8 +267,9 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
 
     let mut server_state = ServerState::new(registry_client);
 
-    // Initial aggregator sync (best-effort — don't block startup on failure)
+    // Initial syncs (best-effort — don't block startup on failure)
     let _ = server_state.maybe_sync_aggregator(&state);
+    server_state.maybe_scan_unmanaged(&state);
 
     loop {
         // Read next line from stdin (release lock before dispatching)
@@ -235,6 +316,8 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
         let (aggregator_changed, skills_changed) = if request.method == "tools/list" {
             let agg = server_state.maybe_sync_aggregator(&state);
             let skills = server_state.maybe_sync_skills(&state);
+            server_state.maybe_scan_unmanaged(&state);
+            server_state.maybe_flush_audit(&state);
             (agg, skills)
         } else {
             (false, false)
@@ -249,6 +332,7 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
             Some(&hybrid_client),
             server_state.registry_client.as_ref(),
             &server_state.aggregator,
+            &server_state.machine_id,
         );
 
         // Write response (lock shared_io)
@@ -288,6 +372,26 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
     Ok(())
 }
 
+/// Emit an audit event for a proxied backend tool call.
+fn emit_tool_called_event(state: &AppState, tool_name: &str, machine_id: &str) {
+    // Parse server_id from the namespaced tool name (e.g. "github__create_issue" → "github")
+    let server_name = tool_name.split("__").next().map(String::from);
+
+    let event = AuditEvent {
+        server_name,
+        user_id: None,
+        user_email: None,
+        machine_id: Some(machine_id.to_string()),
+        event_type: "tool_called".to_string(),
+        tool_name: Some(tool_name.to_string()),
+        metadata: None,
+        org_id: "default".to_string(),
+    };
+    if let Err(e) = buffer_audit_event(state, &event) {
+        warn!(error = %e, tool = %tool_name, "failed to buffer tool_called audit event");
+    }
+}
+
 fn dispatch_request(
     request: &JsonRpcRequest,
     state: &AppState,
@@ -295,6 +399,7 @@ fn dispatch_request(
     model_client: Option<&dyn ModelClient>,
     registry_client: Option<&RegistryClient>,
     aggregator: &BackendRegistry,
+    machine_id: &str,
 ) -> JsonRpcResponse {
     match request.method.as_str() {
         "initialize" => handle_initialize(request),
@@ -306,6 +411,7 @@ fn dispatch_request(
             model_client,
             registry_client,
             aggregator,
+            machine_id,
         ),
         _ => JsonRpcResponse::error(
             request.id.clone(),
@@ -402,6 +508,7 @@ fn handle_tools_call(
     model_client: Option<&dyn ModelClient>,
     registry_client: Option<&RegistryClient>,
     aggregator: &BackendRegistry,
+    machine_id: &str,
 ) -> JsonRpcResponse {
     let params: ToolCallParams = match serde_json::from_value(request.params.clone()) {
         Ok(p) => p,
@@ -441,6 +548,9 @@ fn handle_tools_call(
 
     // Try aggregator first for namespaced backend tools
     if let Some(dispatch_result) = aggregator.dispatch(&params.name, &params.arguments) {
+        // Emit tool_called audit event for proxied backend tools
+        emit_tool_called_event(state, &params.name, machine_id);
+
         return match dispatch_result {
             Ok(value) => {
                 let call_result = crate::protocol::ToolCallResult::success(
@@ -693,7 +803,7 @@ mod tests {
             params: serde_json::json!({}),
         };
 
-        let resp = dispatch_request(&req, &state, &config, None, None, &aggregator);
+        let resp = dispatch_request(&req, &state, &config, None, None, &aggregator, "test-machine");
         assert!(resp.error.is_some());
         assert_eq!(resp.error.as_ref().unwrap().code, METHOD_NOT_FOUND);
 
