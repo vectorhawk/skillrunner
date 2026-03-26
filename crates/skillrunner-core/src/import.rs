@@ -162,12 +162,22 @@ fn build_manifest_json(id: &str, fm: &SkillMdFrontmatter) -> String {
         })
         .unwrap_or_default();
 
-    let triggers_line = if fm.triggers.is_empty() {
+    // Auto-generate triggers from description when none are provided
+    let triggers = if fm.triggers.is_empty() {
+        generate_triggers_from_description(
+            fm.description.as_deref().unwrap_or(""),
+            &fm.name,
+        )
+    } else {
+        fm.triggers.clone()
+    };
+
+    let triggers_line = if triggers.is_empty() {
         String::new()
     } else {
         format!(
             "\n  \"triggers\": {},",
-            serde_json::to_string(&fm.triggers).expect("triggers are valid JSON")
+            serde_json::to_string(&triggers).expect("triggers are valid JSON")
         )
     };
 
@@ -203,6 +213,63 @@ fn build_manifest_json(id: &str, fm: &SkillMdFrontmatter) -> String {
         name = serde_json::to_string(&fm.name).expect("name is valid JSON string"),
         description = serde_json::to_string(&description).expect("description is valid JSON string"),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Trigger auto-generation
+// ---------------------------------------------------------------------------
+
+/// Generate trigger phrases from a skill's description and name.
+///
+/// This is a simple keyword-extraction approach: split the description on
+/// commas/conjunctions into clauses, lowercase them, strip leading articles
+/// and filler, and use each clause as a trigger phrase. The skill name
+/// (kebab-cased to spaces) is always included as a fallback trigger.
+pub fn generate_triggers_from_description(description: &str, name: &str) -> Vec<String> {
+    let mut triggers = Vec::new();
+
+    // Add the skill name as a natural-language trigger
+    let name_trigger = name.to_lowercase().replace('-', " ");
+    if !name_trigger.is_empty() {
+        triggers.push(name_trigger);
+    }
+
+    if description.is_empty() {
+        return triggers;
+    }
+
+    // Split description on commas and "and" to extract clause-level phrases
+    let clauses: Vec<&str> = description
+        .split([',', '.'])
+        .flat_map(|s| s.split(" and "))
+        .collect();
+
+    for clause in clauses {
+        let trimmed = clause.trim().to_lowercase();
+        if trimmed.is_empty() || trimmed.len() < 5 {
+            continue;
+        }
+
+        // Strip leading articles and filler words
+        let cleaned = trimmed
+            .trim_start_matches("a ")
+            .trim_start_matches("an ")
+            .trim_start_matches("the ")
+            .trim_start_matches("this skill ")
+            .trim_start_matches("will ")
+            .trim_start_matches("can ")
+            .trim_start_matches("helps ")
+            .trim_start_matches("that ")
+            .trim();
+
+        if cleaned.len() >= 5 && !triggers.contains(&cleaned.to_string()) {
+            triggers.push(cleaned.to_string());
+        }
+    }
+
+    // Cap at 5 triggers to avoid noise
+    triggers.truncate(5);
+    triggers
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +411,87 @@ It can span multiple lines.
         assert_eq!(to_skill_id("Frontend Design"), "frontend-design");
         assert_eq!(to_skill_id("my_skill"), "my-skill");
         assert_eq!(to_skill_id("already-kebab"), "already-kebab");
+    }
+
+    #[test]
+    fn generate_triggers_from_description_extracts_clauses() {
+        let triggers = generate_triggers_from_description(
+            "Compare two contracts, summarize changes, and assess risk level.",
+            "contract-compare",
+        );
+        assert!(triggers.contains(&"contract compare".to_string()));
+        assert!(triggers.len() >= 2, "should have at least name + one clause, got: {triggers:?}");
+    }
+
+    #[test]
+    fn generate_triggers_uses_name_as_fallback() {
+        let triggers = generate_triggers_from_description("", "my-skill");
+        assert_eq!(triggers, vec!["my skill"]);
+    }
+
+    #[test]
+    fn generate_triggers_strips_filler() {
+        let triggers = generate_triggers_from_description(
+            "This skill will help with code review and find bugs",
+            "code-review",
+        );
+        assert!(triggers.contains(&"code review".to_string()));
+        // "This skill will help with code review" should be cleaned
+        let has_help = triggers.iter().any(|t| t.contains("help with"));
+        assert!(has_help, "should extract 'help with code review', got: {triggers:?}");
+    }
+
+    #[test]
+    fn generate_triggers_caps_at_five() {
+        let triggers = generate_triggers_from_description(
+            "one thing, two thing, three thing, four thing, five thing, six thing, seven thing",
+            "many-triggers",
+        );
+        assert!(triggers.len() <= 5, "should cap at 5, got: {}", triggers.len());
+    }
+
+    #[test]
+    fn import_auto_generates_triggers_when_missing() {
+        let dir = temp_dir("auto-triggers");
+        let skill_md = "\
+---
+name: Contract Compare
+description: Compare two contracts and summarize changes.
+---
+
+You are a contract analysis expert.
+";
+        let path = write_skill_md(&dir, skill_md);
+        import_skill_md(&path).unwrap();
+
+        let manifest_text = fs::read_to_string(dir.join("manifest.json")).unwrap();
+        assert!(manifest_text.contains("\"triggers\""), "manifest should contain auto-generated triggers, got:\n{manifest_text}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_preserves_explicit_triggers() {
+        let dir = temp_dir("explicit-triggers");
+        let skill_md = "\
+---
+name: My Skill
+description: Does things.
+triggers:
+  - do the thing
+  - make it happen
+---
+
+System prompt here.
+";
+        let path = write_skill_md(&dir, skill_md);
+        import_skill_md(&path).unwrap();
+
+        let manifest_text = fs::read_to_string(dir.join("manifest.json")).unwrap();
+        assert!(manifest_text.contains("do the thing"));
+        assert!(manifest_text.contains("make it happen"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

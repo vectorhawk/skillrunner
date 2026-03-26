@@ -5,6 +5,7 @@
   "version": "0.3.0",
   "publisher": "skillclub",
   "description": "Transform ordinary text into fancy Regency era English as if written in Regency-era England.",
+  "triggers": ["make it fancy", "regency english", "transform text to regency", "fancy text", "old english style"],
   "entrypoint": "workflow.yaml",
   "inputs_schema": "schemas/input.schema.json",
   "outputs_schema": "schemas/output.schema.json",

@@ -5,6 +5,7 @@
   "version": "0.3.0",
   "publisher": "skillclub",
   "description": "Compare two contracts, summarize changes, and assess risk level.",
+  "triggers": ["compare contracts", "diff legal docs", "contract review", "summarize contract changes", "assess contract risk"],
   "entrypoint": "workflow.yaml",
   "inputs_schema": "schemas/input.schema.json",
   "outputs_schema": "schemas/output.schema.json",

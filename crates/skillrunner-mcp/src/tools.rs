@@ -325,14 +325,23 @@ fn skill_to_tool(skill_id: &str, active_path: &str) -> Result<ToolDefinition> {
     // Append version to description so updates are visible in the tool listing.
     let versioned_desc = format!("{} (v{})", base_desc, pkg.manifest.version);
 
-    // Enrich description with trigger phrases if present
-    let description = if pkg.manifest.triggers.is_empty() {
+    // Enrich description with trigger phrases — auto-generate from description if empty
+    let triggers = if pkg.manifest.triggers.is_empty() {
+        skillrunner_core::import::generate_triggers_from_description(
+            pkg.manifest.description.as_deref().unwrap_or(""),
+            &pkg.manifest.name,
+        )
+    } else {
+        pkg.manifest.triggers.clone()
+    };
+
+    let description = if triggers.is_empty() {
         versioned_desc
     } else {
         format!(
             "{}\n\nUse this tool when the user asks to: {}",
             versioned_desc,
-            pkg.manifest.triggers.join(", ")
+            triggers.join(", ")
         )
     };
 
@@ -1348,7 +1357,17 @@ mod tests {
 
         assert!(skill_tool.is_some(), "installed skill should appear as tool");
         let tool = skill_tool.unwrap();
-        assert_eq!(tool.description, "A test skill for MCP testing (v0.1.0)");
+        // Description includes auto-generated triggers from the description
+        assert!(
+            tool.description.starts_with("A test skill for MCP testing (v0.1.0)"),
+            "description should start with versioned desc, got: {}",
+            tool.description
+        );
+        assert!(
+            tool.description.contains("Use this tool when the user asks to:"),
+            "description should contain auto-generated trigger phrases, got: {}",
+            tool.description
+        );
         // The input schema should match the skill's input.schema.json
         assert_eq!(tool.input_schema["type"], "object");
         assert!(tool.input_schema["properties"]["query"].is_object());
