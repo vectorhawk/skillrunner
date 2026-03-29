@@ -178,8 +178,20 @@ enum SkillCommands {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("info").init();
     let cli = Cli::parse();
+
+    // MCP serve mode: force logs to stderr with no ANSI colors to avoid
+    // contaminating the stdio JSON-RPC transport on stdout.
+    let is_mcp_serve = matches!(cli.command, Commands::Mcp { command: McpCommands::Serve { .. } });
+    if is_mcp_serve {
+        tracing_subscriber::fmt()
+            .with_env_filter("info")
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter("info").init();
+    }
     let app = SkillRunnerApp::bootstrap()?;
     let managed_registry_url: Option<String> = load_managed_config(&app.state)
         .and_then(|c| c.registry_url);

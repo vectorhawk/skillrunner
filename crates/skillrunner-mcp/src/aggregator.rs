@@ -400,7 +400,12 @@ impl BackendRegistry {
             let tools = self
                 .fetch_tools_from_backend(&conn)
                 .unwrap_or_else(|e| {
-                    warn!(server_id = %server_id, error = %e, "failed to fetch tools from backend");
+                    let err_str = e.to_string();
+                    if err_str.contains("401") || err_str.contains("Unauthorized") {
+                        debug!(server_id = %server_id, "backend requires credentials — skipping tool fetch (authorize via portal to connect)");
+                    } else {
+                        warn!(server_id = %server_id, error = %e, "failed to fetch tools from backend");
+                    }
                     vec![]
                 });
 

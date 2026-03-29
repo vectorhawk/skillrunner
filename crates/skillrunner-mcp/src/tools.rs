@@ -284,6 +284,25 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
                 "required": ["skill_id"]
             }),
         });
+
+        tools.push(ToolDefinition {
+            name: "skillclub_import".to_string(),
+            description: "Import an external skill or MCP server into SkillClub. Paste an npm package name (e.g. @modelcontextprotocol/server-github), npx command, or GitHub URL. The system detects whether it's a skill or MCP server and routes to the appropriate approval workflow.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "input": {
+                        "type": "string",
+                        "description": "The npm package name, npx command, or GitHub URL to import"
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "If true, submit the import after preview. If false (default), only preview."
+                    }
+                },
+                "required": ["input"]
+            }),
+        });
     }
 
     tools
@@ -383,6 +402,7 @@ pub fn handle_tool_call(
         "skillclub_mcp_catalog" => handle_mcp_catalog(state, registry_url),
         "skillclub_mcp_request" => handle_mcp_request(arguments, state, registry_url),
         "skillclub_mcp_status" => handle_mcp_status(state, registry_url),
+        "skillclub_import" => handle_import(arguments, state, registry_url),
         _ => handle_skill_run(name, arguments, state, policy_client, model_client, registry_client),
     };
 
@@ -1119,6 +1139,215 @@ fn handle_mcp_status(state: &AppState, registry_url: &Option<String>) -> ToolCal
             Ok(text) => ToolCallResult::success(text),
             Err(e) => ToolCallResult::error(format!("Failed to serialize: {e}")),
         }
+    }
+}
+
+fn handle_import(
+    arguments: &serde_json::Value,
+    state: &AppState,
+    registry_url: &Option<String>,
+) -> ToolCallResult {
+    let url = match registry_url {
+        Some(u) => u,
+        None => return ToolCallResult::error("No registry URL configured"),
+    };
+
+    let input = match arguments.get("input").and_then(|v| v.as_str()) {
+        Some(i) if !i.is_empty() => i,
+        _ => return ToolCallResult::error("Missing required parameter: input. Provide an npm package name, npx command, or GitHub URL."),
+    };
+
+    let confirm = arguments
+        .get("confirm")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Ensure auth with refresh fallback
+    let access_token = match ensure_auth(state, url) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+
+    let registry = RegistryClient::new(url);
+
+    // Always preview first
+    let preview = match registry.import_preview(input, &access_token) {
+        Ok(v) => v,
+        Err(e) => {
+            // On auth failure, try refresh
+            let err_str = e.to_string();
+            if err_str.contains("401") || err_str.contains("Unauthorized") {
+                let refresh_token = match auth::load_tokens(state, url) {
+                    Ok(Some(t)) => t.refresh_token,
+                    _ => return auth_elicitation_prompt(url),
+                };
+                let new_token = match try_refresh_auth(state, url, &refresh_token) {
+                    Ok(t) => t,
+                    Err(e) => return e,
+                };
+                match registry.import_preview(input, &new_token) {
+                    Ok(v) => v,
+                    Err(e) => return ToolCallResult::error(format!("Import preview failed: {e}")),
+                }
+            } else {
+                return ToolCallResult::error(format!("Import preview failed: {e}"));
+            }
+        }
+    };
+
+    let preview_text = format_import_preview(&preview);
+
+    if !confirm {
+        return ToolCallResult::success(format!(
+            "{}\n\nSet confirm=true to submit this import.",
+            preview_text
+        ));
+    }
+
+    // Submit
+    let submit_token = match ensure_auth(state, url) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+
+    match registry.import_submit(input, &submit_token) {
+        Ok(result) => {
+            let result_text = format_import_result(&result);
+            ToolCallResult::success(result_text)
+        }
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("401") || err_str.contains("Unauthorized") {
+                let refresh_token = match auth::load_tokens(state, url) {
+                    Ok(Some(t)) => t.refresh_token,
+                    _ => return auth_elicitation_prompt(url),
+                };
+                let new_token = match try_refresh_auth(state, url, &refresh_token) {
+                    Ok(t) => t,
+                    Err(e) => return e,
+                };
+                match registry.import_submit(input, &new_token) {
+                    Ok(result) => ToolCallResult::success(format_import_result(&result)),
+                    Err(e) => ToolCallResult::error(format!("Import submit failed: {e}")),
+                }
+            } else {
+                ToolCallResult::error(format!("Import submit failed: {e}"))
+            }
+        }
+    }
+}
+
+fn format_import_preview(preview: &serde_json::Value) -> String {
+    let import_type = preview
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    match import_type {
+        "skill" => {
+            let name = preview.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let skill_id = preview.get("skill_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let version = preview.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+            let publisher = preview.get("publisher").and_then(|v| v.as_str()).unwrap_or("?");
+            let desc = preview
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!(
+                "Skill Import Preview\n  Name: {}\n  ID: {}\n  Version: {}\n  Publisher: {}\n  Description: {}",
+                name, skill_id, version, publisher, desc
+            )
+        }
+        "mcp_server" => {
+            let pkg = preview
+                .get("package_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let desc = preview
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let ver = preview
+                .get("latest_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let license = preview
+                .get("license")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let in_catalog = preview
+                .get("already_in_catalog")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mode = preview
+                .get("approval_mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let mut text = format!(
+                "MCP Server Import Preview\n  Package: {}\n  Description: {}\n  Version: {}\n  License: {}\n  In catalog: {}\n  Approval mode: {}",
+                pkg, desc, ver, license, in_catalog, mode
+            );
+            if let Some(keywords) = preview.get("keywords").and_then(|v| v.as_array()) {
+                let kws: Vec<&str> = keywords.iter().filter_map(|k| k.as_str()).collect();
+                if !kws.is_empty() {
+                    text.push_str(&format!("\n  Keywords: {}", kws.join(", ")));
+                }
+            }
+            text
+        }
+        _ => format!("Unknown import type: {}", import_type),
+    }
+}
+
+fn format_import_result(result: &serde_json::Value) -> String {
+    let import_type = result
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    match import_type {
+        "skill" => {
+            let skill_id = result
+                .get("skill_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let version = result.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+            let status = result
+                .get("review_status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("submitted");
+            format!(
+                "Skill imported successfully!\n  ID: {}\n  Version: {}\n  Status: {}",
+                skill_id, version, status
+            )
+        }
+        "mcp_server" => {
+            let name = result
+                .get("server_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let pkg = result
+                .get("package_source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let status = result.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+            let mut text = format!(
+                "MCP Server import {}!\n  Server: {}\n  Package: {}\n  Status: {}",
+                if status == "approved" { "approved" } else { "submitted" },
+                name,
+                pkg,
+                status
+            );
+            if status == "approved" {
+                text.push_str(
+                    "\n\nThe server has been added to your catalog and will appear in your AI tools shortly.",
+                );
+            } else if status == "pending" {
+                text.push_str("\n\nYour request has been submitted for admin review.");
+            }
+            text
+        }
+        _ => format!("Import completed (type: {})", import_type),
     }
 }
 

@@ -142,6 +142,63 @@ impl RegistryClient {
 
         resp.json().context("failed to deserialize requests response")
     }
+
+    /// Preview an external import (skill or MCP server) before submitting.
+    ///
+    /// Calls `POST /portal/import/preview` with the provided `url` (npm package
+    /// name, npx command, or GitHub URL). Returns a JSON object describing the
+    /// detected type and key metadata. Requires a valid auth token.
+    pub fn import_preview(&self, input: &str, auth_token: &str) -> Result<serde_json::Value> {
+        let url = format!(
+            "{}/portal/import/preview",
+            self.base_url.trim_end_matches('/')
+        );
+        let body = serde_json::json!({ "url": input });
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(auth_token)
+            .json(&body)
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!("import preview failed (HTTP {status}): {body}");
+        }
+
+        resp.json().context("failed to deserialize import preview response")
+    }
+
+    /// Submit an external import (skill or MCP server) for approval.
+    ///
+    /// Calls `POST /portal/import/submit` with the provided `url`. Returns a
+    /// JSON object with the result status. Requires a valid auth token.
+    pub fn import_submit(&self, input: &str, auth_token: &str) -> Result<serde_json::Value> {
+        let url = format!(
+            "{}/portal/import/submit",
+            self.base_url.trim_end_matches('/')
+        );
+        let body = serde_json::json!({ "url": input });
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(auth_token)
+            .json(&body)
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!("import submit failed (HTTP {status}): {body}");
+        }
+
+        resp.json().context("failed to deserialize import submit response")
+    }
 }
 
 // ── Public fetch helper ───────────────────────────────────────────────────────
