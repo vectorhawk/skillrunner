@@ -7,6 +7,7 @@ pub mod managed;
 pub mod mcp_governance;
 pub mod model;
 pub mod ollama;
+pub mod plugin;
 pub mod policy;
 pub mod registry;
 pub mod resolver;

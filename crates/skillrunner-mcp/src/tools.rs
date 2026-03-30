@@ -303,7 +303,79 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
                 "required": ["input"]
             }),
         });
+
+        // Plugin tools (registry-dependent)
+        tools.push(ToolDefinition {
+            name: "skillclub_plugin_search".to_string(),
+            description: "Search the SkillClub registry for plugins. Plugins are composite bundles that include skills, MCP servers, and slash commands packaged together for a complete workflow.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query (empty to list all plugins)"
+                    }
+                },
+                "required": []
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "skillclub_plugin_info".to_string(),
+            description: "Get detailed information about a plugin including its skills, MCP servers, commands, and configuration requirements.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "plugin_id": {
+                        "type": "string",
+                        "description": "The ID of the plugin to get info about"
+                    }
+                },
+                "required": ["plugin_id"]
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "skillclub_plugin_install".to_string(),
+            description: "Install a plugin from a local directory or the SkillClub registry. Installs embedded skills, requests MCP server access through governance, and sets up slash commands.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path_or_id": {
+                        "type": "string",
+                        "description": "Local directory path to a plugin bundle, or a registry plugin ID"
+                    }
+                },
+                "required": ["path_or_id"]
+            }),
+        });
+
+        tools.push(ToolDefinition {
+            name: "skillclub_plugin_uninstall".to_string(),
+            description: "Uninstall a plugin. Removes all its skills, disconnects MCP servers, and deletes slash commands.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "plugin_id": {
+                        "type": "string",
+                        "description": "The ID of the installed plugin to uninstall"
+                    }
+                },
+                "required": ["plugin_id"]
+            }),
+        });
     }
+
+    // Plugin tools (always available)
+    tools.push(ToolDefinition {
+        name: "skillclub_plugin_list".to_string(),
+        description: "List all installed plugins with their status and component breakdown (skills, MCP servers, commands).".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        }),
+    });
 
     tools
 }
@@ -403,6 +475,11 @@ pub fn handle_tool_call(
         "skillclub_mcp_request" => handle_mcp_request(arguments, state, registry_url),
         "skillclub_mcp_status" => handle_mcp_status(state, registry_url),
         "skillclub_import" => handle_import(arguments, state, registry_url),
+        "skillclub_plugin_search" => handle_plugin_search(registry_url),
+        "skillclub_plugin_info" => handle_plugin_info(arguments, state),
+        "skillclub_plugin_install" => handle_plugin_install(arguments, state),
+        "skillclub_plugin_uninstall" => handle_plugin_uninstall(arguments, state),
+        "skillclub_plugin_list" => handle_plugin_list(state),
         _ => handle_skill_run(name, arguments, state, policy_client, model_client, registry_client),
     };
 
@@ -1433,6 +1510,127 @@ pub fn handle_mcp_uninstall(
             "No active MCP server found with name '{}'. Use skillclub_mcp_status to see your servers.",
             server_name
         ))
+    }
+}
+
+// ── Plugin handlers ─────────────────────────────────────────────────────────
+
+fn handle_plugin_search(registry_url: &Option<String>) -> ToolCallResult {
+    let url = match registry_url {
+        Some(u) => u,
+        None => return ToolCallResult::error("No registry URL configured."),
+    };
+    let registry = RegistryClient::new(url);
+    match registry.health_check() {
+        Ok(_) => ToolCallResult::success(serde_json::to_string_pretty(&serde_json::json!({
+            "message": "Plugin search is not yet available in this registry version. Use skillclub_search for skills and skillclub_mcp_catalog for MCP servers.",
+            "registry": url
+        })).unwrap_or_default()),
+        Err(e) => ToolCallResult::error(format!("Registry not reachable: {e}")),
+    }
+}
+
+fn handle_plugin_info(arguments: &serde_json::Value, state: &AppState) -> ToolCallResult {
+    let plugin_id = match arguments["plugin_id"].as_str() {
+        Some(id) => id,
+        None => return ToolCallResult::error("plugin_id is required"),
+    };
+
+    match skillrunner_core::plugin::get_installed_plugin(state, plugin_id) {
+        Ok(Some(plugin)) => ToolCallResult::success(serde_json::to_string_pretty(&serde_json::json!({
+            "id": plugin.id,
+            "name": plugin.manifest.name,
+            "version": plugin.version,
+            "description": plugin.manifest.description,
+            "status": plugin.status,
+            "components": {
+                "skills": plugin.components.skill_ids,
+                "mcp_servers": plugin.components.mcp_server_names,
+                "commands": plugin.components.command_names,
+            },
+            "installed_at": plugin.installed_at,
+        })).unwrap_or_default()),
+        Ok(None) => ToolCallResult::error(format!("Plugin '{plugin_id}' is not installed.")),
+        Err(e) => ToolCallResult::error(format!("Failed to get plugin info: {e}")),
+    }
+}
+
+fn handle_plugin_install(arguments: &serde_json::Value, state: &AppState) -> ToolCallResult {
+    let path_or_id = match arguments["path_or_id"].as_str() {
+        Some(id) => id,
+        None => return ToolCallResult::error("path_or_id is required"),
+    };
+
+    let plugin_path = camino::Utf8PathBuf::from(path_or_id);
+
+    if plugin_path.join("plugin.json").exists() {
+        match skillrunner_core::plugin::install_plugin_from_dir(state, &plugin_path) {
+            Ok(result) => {
+                let mut response = serde_json::json!({
+                    "status": "success",
+                    "plugin_id": result.id,
+                    "version": result.version,
+                    "install_status": result.status,
+                    "installed_skills": result.components.skill_ids,
+                    "installed_commands": result.components.command_names,
+                });
+                if !result.components.mcp_server_names.is_empty() {
+                    response["mcp_servers_pending"] = serde_json::json!(result.components.mcp_server_names);
+                    response["note"] = serde_json::json!(
+                        "MCP servers require approval. Use skillclub_mcp_request to request access, then skillclub_mcp_install to activate."
+                    );
+                }
+                ToolCallResult::success(serde_json::to_string_pretty(&response).unwrap_or_default())
+            }
+            Err(e) => ToolCallResult::error(format!("Failed to install plugin: {e}")),
+        }
+    } else {
+        ToolCallResult::error(format!(
+            "Registry plugin install is not yet available. To install from a local directory, provide the path to a directory containing plugin.json. Got: '{path_or_id}'"
+        ))
+    }
+}
+
+fn handle_plugin_uninstall(arguments: &serde_json::Value, state: &AppState) -> ToolCallResult {
+    let plugin_id = match arguments["plugin_id"].as_str() {
+        Some(id) => id,
+        None => return ToolCallResult::error("plugin_id is required"),
+    };
+
+    match skillrunner_core::plugin::uninstall_plugin(state, plugin_id) {
+        Ok(Some(version)) => ToolCallResult::success(serde_json::to_string_pretty(&serde_json::json!({
+            "status": "success",
+            "plugin_id": plugin_id,
+            "version_removed": version,
+        })).unwrap_or_default()),
+        Ok(None) => ToolCallResult::error(format!("Plugin '{plugin_id}' is not installed.")),
+        Err(e) => ToolCallResult::error(format!("Failed to uninstall plugin: {e}")),
+    }
+}
+
+fn handle_plugin_list(state: &AppState) -> ToolCallResult {
+    match skillrunner_core::plugin::list_installed_plugins(state) {
+        Ok(plugins) if plugins.is_empty() => {
+            ToolCallResult::success("No plugins installed.")
+        }
+        Ok(plugins) => {
+            let list: Vec<serde_json::Value> = plugins
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "id": p.id,
+                        "name": p.manifest.name,
+                        "version": p.version,
+                        "status": p.status,
+                        "skills": p.components.skill_ids,
+                        "mcp_servers": p.components.mcp_server_names,
+                        "commands": p.components.command_names,
+                    })
+                })
+                .collect();
+            ToolCallResult::success(serde_json::to_string_pretty(&serde_json::json!(list)).unwrap_or_default())
+        }
+        Err(e) => ToolCallResult::error(format!("Failed to list plugins: {e}")),
     }
 }
 

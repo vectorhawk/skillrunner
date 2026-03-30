@@ -54,6 +54,11 @@ enum Commands {
         #[command(subcommand)]
         command: McpCommands,
     },
+    /// Manage SkillClub plugins (composite bundles of skills + MCP servers + commands)
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -175,6 +180,32 @@ enum SkillCommands {
         registry_url: Option<String>,
     },
     Validate { path: Utf8PathBuf },
+}
+
+#[derive(Subcommand)]
+enum PluginCommands {
+    /// Install a plugin from a local directory
+    Install {
+        /// Path to a plugin directory containing plugin.json
+        path: Utf8PathBuf,
+    },
+    /// Uninstall an installed plugin (removes skills, commands, and MCP server records)
+    Uninstall {
+        /// Plugin ID
+        plugin_id: String,
+    },
+    /// List all installed plugins
+    List,
+    /// Validate a plugin bundle directory
+    Validate {
+        /// Path to the plugin directory to validate
+        path: Utf8PathBuf,
+    },
+    /// Show detailed info about an installed plugin
+    Info {
+        /// Plugin ID
+        plugin_id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -719,6 +750,92 @@ fn main() -> Result<()> {
                     println!("All checks passed.");
                 } else {
                     anyhow::bail!("one or more validation checks failed");
+                }
+            }
+        },
+        Commands::Plugin { command } => match command {
+            PluginCommands::Install { path } => {
+                let pkg = skillrunner_manifest::PluginPackage::load_from_dir(&path)?;
+                println!("Installing plugin '{}' v{}", pkg.manifest.name, pkg.manifest.version);
+
+                let result = skillrunner_core::plugin::install_plugin_from_dir(&app.state, &path)?;
+
+                if !result.components.skill_ids.is_empty() {
+                    println!("  Skills: {}", result.components.skill_ids.join(", "));
+                }
+                if !result.components.mcp_server_names.is_empty() {
+                    println!("  MCP servers (pending approval): {}", result.components.mcp_server_names.join(", "));
+                }
+                if !result.components.command_names.is_empty() {
+                    println!("  Commands: {}", result.components.command_names.iter().map(|c| format!("/{c}")).collect::<Vec<_>>().join(", "));
+                }
+                println!("  Status: {}", result.status);
+                println!("\nPlugin '{}' installed.", result.id);
+            }
+            PluginCommands::Uninstall { plugin_id } => {
+                match skillrunner_core::plugin::uninstall_plugin(&app.state, &plugin_id)? {
+                    Some(version) => println!("Uninstalled plugin '{plugin_id}' v{version}"),
+                    None => println!("Plugin '{plugin_id}' is not installed."),
+                }
+            }
+            PluginCommands::List => {
+                let plugins = skillrunner_core::plugin::list_installed_plugins(&app.state)?;
+                if plugins.is_empty() {
+                    println!("No plugins installed.");
+                } else {
+                    for p in &plugins {
+                        println!("  {} v{} [{}]", p.id, p.version, p.status);
+                        if !p.components.skill_ids.is_empty() {
+                            println!("    skills: {}", p.components.skill_ids.join(", "));
+                        }
+                        if !p.components.mcp_server_names.is_empty() {
+                            println!("    mcp servers: {}", p.components.mcp_server_names.join(", "));
+                        }
+                        if !p.components.command_names.is_empty() {
+                            println!("    commands: {}", p.components.command_names.iter().map(|c| format!("/{c}")).collect::<Vec<_>>().join(", "));
+                        }
+                    }
+                }
+            }
+            PluginCommands::Validate { path } => {
+                println!("Validating plugin at {path}");
+                match skillrunner_manifest::PluginPackage::load_from_dir(&path) {
+                    Ok(pkg) => {
+                        println!("  [OK] plugin.json valid");
+                        println!("  ID:        {}", pkg.manifest.id);
+                        println!("  Name:      {}", pkg.manifest.name);
+                        println!("  Version:   {}", pkg.manifest.version);
+                        println!("  Skills:    {}", pkg.manifest.skills.len());
+                        println!("  MCP Srvrs: {}", pkg.manifest.mcp_servers.len());
+                        println!("  Commands:  {}", pkg.manifest.commands.len());
+                        println!("All checks passed.");
+                    }
+                    Err(e) => {
+                        println!("  [FAIL] {e}");
+                        anyhow::bail!("plugin validation failed");
+                    }
+                }
+            }
+            PluginCommands::Info { plugin_id } => {
+                match skillrunner_core::plugin::get_installed_plugin(&app.state, &plugin_id)? {
+                    Some(p) => {
+                        println!("Plugin: {} v{}", p.id, p.version);
+                        println!("Name:   {}", p.manifest.name);
+                        if let Some(desc) = &p.manifest.description {
+                            println!("Desc:   {desc}");
+                        }
+                        println!("Status: {}", p.status);
+                        if !p.components.skill_ids.is_empty() {
+                            println!("Skills: {}", p.components.skill_ids.join(", "));
+                        }
+                        if !p.components.mcp_server_names.is_empty() {
+                            println!("MCP:    {}", p.components.mcp_server_names.join(", "));
+                        }
+                        if !p.components.command_names.is_empty() {
+                            println!("Cmds:   {}", p.components.command_names.iter().map(|c| format!("/{c}")).collect::<Vec<_>>().join(", "));
+                        }
+                    }
+                    None => println!("Plugin '{plugin_id}' is not installed."),
                 }
             }
         },

@@ -73,6 +73,16 @@ impl AppState {
                 latency_ms INTEGER,
                 executed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS installed_plugins (
+                id TEXT PRIMARY KEY,
+                version TEXT NOT NULL,
+                manifest TEXT NOT NULL,
+                components TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'installed',
+                installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             "#,
         )?;
 

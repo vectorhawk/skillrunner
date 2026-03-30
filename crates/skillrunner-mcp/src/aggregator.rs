@@ -279,7 +279,8 @@ impl BackendRegistry {
                 last_response: None,
             })),
             http: reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(30))
+                .connect_timeout(Duration::from_secs(3))
+                .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| reqwest::blocking::Client::new()),
         }
@@ -357,15 +358,30 @@ impl BackendRegistry {
                 // Skip backends that only have a package_source (npm name) but no
                 // actual reachable URL — they are catalog entries awaiting gateway
                 // configuration or local stdio setup.
-                let url = entry
-                    .gateway_url
-                    .clone()
-                    .or_else(|| {
-                        entry
-                            .server_config
-                            .as_ref()
-                            .and_then(|c| c.get("url").and_then(|u| u.as_str()).map(String::from))
-                    });
+                // For gateway-routed backends, rewrite the gateway_url to use
+                // the local registry base URL (the one the user configured via
+                // --registry-url / SKILLCLUB_REGISTRY_URL). The API may return a
+                // public URL that isn't reachable from this machine.
+                let url = if transport == "gateway" {
+                    entry.gateway_url.as_ref().and_then(|gw_url| {
+                        // Extract the path portion (e.g. /gateway/guinness-finder/mcp)
+                        gw_url.find("/gateway/").map(|idx| {
+                            let path = &gw_url[idx..];
+                            let base = registry_client.base_url.trim_end_matches('/');
+                            format!("{base}{path}")
+                        })
+                    })
+                } else {
+                    entry
+                        .gateway_url
+                        .clone()
+                        .or_else(|| {
+                            entry
+                                .server_config
+                                .as_ref()
+                                .and_then(|c| c.get("url").and_then(|u| u.as_str()).map(String::from))
+                        })
+                };
 
                 match url {
                     Some(url) => {

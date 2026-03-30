@@ -341,6 +341,9 @@ Show the user a SkillClub status overview:
    - /skill-list — List installed skills
    - /skill-create — Create a new skill
    - /skill-publish — Publish a skill to the registry
+   - /plugin-search — Search for plugins
+   - /plugin-install — Install a plugin
+   - /plugin-list — List installed plugins
 "#,
         ),
         (
@@ -470,6 +473,44 @@ $ARGUMENTS
 
 If not authenticated, suggest using /mcp-login first.
 Show the publish result and the skill's registry URL.
+"#,
+        ),
+        (
+            "plugin-search",
+            r#"---
+name: plugin-search
+description: Search for SkillClub plugins (composite bundles of skills + MCP servers + commands)
+---
+Search for plugins. Call the skillclub_plugin_search tool with the query from the arguments.
+
+$ARGUMENTS
+
+Show results with plugin name, description, and component summary (skills, MCP servers, commands).
+"#,
+        ),
+        (
+            "plugin-install",
+            r#"---
+name: plugin-install
+description: Install a SkillClub plugin from a local directory or registry
+---
+Install a plugin. Call the skillclub_plugin_install tool with the path or plugin ID from the arguments.
+
+$ARGUMENTS
+
+Show what was installed (skills, MCP servers, commands) and any pending approvals.
+If MCP servers need approval, suggest using /mcp-request and /mcp-status.
+"#,
+        ),
+        (
+            "plugin-list",
+            r#"---
+name: plugin-list
+description: List all installed SkillClub plugins with their components
+---
+List installed plugins. Call the skillclub_plugin_list tool.
+
+Show each plugin's name, version, status, and component breakdown (skills, MCP servers, commands).
 "#,
         ),
     ]
@@ -927,7 +968,7 @@ mod tests {
         let installed = install_claude_skills_in(tmp.as_ref()).unwrap();
 
         // Should install all 11 skills
-        assert_eq!(installed.len(), 11);
+        assert_eq!(installed.len(), 14);
         assert!(installed.contains(&"skillclub".to_string()));
         assert!(installed.contains(&"mcp-login".to_string()));
         assert!(installed.contains(&"mcp-search".to_string()));
@@ -959,7 +1000,7 @@ mod tests {
 
         // First install
         let first = install_claude_skills_in(tmp.as_ref()).unwrap();
-        assert_eq!(first.len(), 11);
+        assert_eq!(first.len(), 14);
 
         // Second install — should skip all (identical content)
         let second = install_claude_skills_in(tmp.as_ref()).unwrap();
