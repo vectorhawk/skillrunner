@@ -19,7 +19,7 @@ use skillrunner_core::{
 use skillrunner_manifest::SkillPackage;
 use skillrunner_mcp::{
     server::{McpServerConfig, run_server},
-    setup::{configure_client, detect_ai_clients, install_claude_skills, mark_first_run_offered},
+    setup::{configure_client, detect_ai_clients, install_claude_skills, install_npx_claude_hook, install_npx_shell_wrapper, mark_first_run_offered},
 };
 use rusqlite::Connection;
 
@@ -448,6 +448,37 @@ fn main() -> Result<()> {
                     Err(e) => {
                         if !auto {
                             println!("\n  Warning: could not install slash commands: {e}");
+                        }
+                    }
+                }
+
+                // Install Claude Code npx guard hook
+                match install_npx_claude_hook() {
+                    Ok(true) => {
+                        if !auto {
+                            println!("  NPX guard hook — installed ✓");
+                        }
+                    }
+                    Ok(false) => {} // already installed
+                    Err(e) => {
+                        if !auto {
+                            println!("  NPX guard hook — skipped: {e}");
+                        }
+                    }
+                }
+
+                // Install shell npx wrapper
+                match install_npx_shell_wrapper(&app.state) {
+                    Ok(Some(path)) => {
+                        if !auto {
+                            println!("  NPX shell wrapper — installed ✓");
+                            println!("    To activate: add {} to your PATH", path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(&path));
+                        }
+                    }
+                    Ok(None) => {} // already installed
+                    Err(e) => {
+                        if !auto {
+                            println!("  NPX shell wrapper — skipped: {e}");
                         }
                     }
                 }

@@ -573,6 +573,178 @@ fn install_claude_skills_in(home: &std::path::Path) -> Result<Vec<String>> {
     Ok(installed)
 }
 
+// ── NPX Guard Hook ──────────────────────────────────────────────────────────
+
+const NPX_GUARD_SCRIPT: &str = r#"#!/bin/bash
+# SkillClub NPX Guard — Claude Code PreToolUse hook
+# Intercepts npx commands that install MCP servers and redirects to governance.
+
+INPUT=$(cat)
+COMMAND=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tool_input',{}).get('command',''))" 2>/dev/null)
+
+if [ -z "$COMMAND" ]; then
+  exit 0
+fi
+
+# Check if the npx command targets an MCP-related package
+if echo "$COMMAND" | grep -qE '(npx\s+(-y\s+)?(@modelcontextprotocol/|@anthropic-ai/mcp|mcp-server-|@smithery/))'; then
+  PACKAGE=$(echo "$COMMAND" | grep -oE '(@modelcontextprotocol/[^ ]+|@anthropic-ai/mcp[^ ]*|mcp-server-[^ ]+|@smithery/[^ ]+)')
+  cat <<EOF
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "MCP servers must be installed through SkillClub governance, not directly via npx.\n\nTo install '${PACKAGE:-this server}':\n  1. Use /mcp-request to request access\n  2. Use /mcp-install to activate after approval\n\nOr use /mcp-search to browse the approved catalog."
+  }
+}
+EOF
+  exit 0
+fi
+"#;
+
+const NPX_SHELL_WRAPPER: &str = r#"#!/bin/bash
+# SkillClub NPX Wrapper — intercepts MCP server installs in the terminal.
+# Deployed by: skillrunner mcp setup
+
+for arg in "$@"; do
+  if echo "$arg" | grep -qE '(@modelcontextprotocol/|@anthropic-ai/mcp|mcp-server-|@smithery/)'; then
+    echo ""
+    echo "  SkillClub: MCP servers should be installed through governance."
+    echo ""
+    echo "  Instead, run one of:"
+    echo "    skillrunner mcp setup        # configure SkillRunner for your AI client"
+    echo "    /mcp-request <server>        # request access in Claude Code"
+    echo "    /mcp-search                  # browse approved servers"
+    echo ""
+    echo "  To bypass this check:"
+    REAL_NPX=$(which -a npx 2>/dev/null | grep -v skillclub | head -1)
+    if [ -n "$REAL_NPX" ]; then
+      echo "    $REAL_NPX $*"
+    else
+      echo "    command npx $*"
+    fi
+    echo ""
+    exit 1
+  fi
+done
+
+# Pass through to real npx
+REAL_NPX=$(which -a npx 2>/dev/null | grep -v skillclub | head -1)
+if [ -n "$REAL_NPX" ]; then
+  exec "$REAL_NPX" "$@"
+else
+  echo "Error: npx not found" >&2
+  exit 1
+fi
+"#;
+
+/// Install the Claude Code PreToolUse hook for npx interception.
+///
+/// Writes the guard script to `~/.claude/hooks/skillclub-npx-guard.sh`
+/// and adds the hook config to `~/.claude/settings.json`.
+/// Returns true if any changes were made.
+pub fn install_npx_claude_hook() -> Result<bool> {
+    let home = dirs_home().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    install_npx_claude_hook_in(&home)
+}
+
+fn install_npx_claude_hook_in(home: &std::path::Path) -> Result<bool> {
+    let mut changed = false;
+
+    // 1. Write the hook script
+    let hooks_dir = home.join(".claude").join("hooks");
+    let script_path = hooks_dir.join("skillclub-npx-guard.sh");
+
+    if !script_path.exists() || fs::read_to_string(&script_path).unwrap_or_default() != NPX_GUARD_SCRIPT {
+        fs::create_dir_all(&hooks_dir)?;
+        fs::write(&script_path, NPX_GUARD_SCRIPT)?;
+        #[cfg(target_family = "unix")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))?;
+        }
+        changed = true;
+    }
+
+    // 2. Add hook config to ~/.claude/settings.json
+    let settings_path = home.join(".claude").join("settings.json");
+    let mut settings: serde_json::Value = if settings_path.exists() {
+        let text = fs::read_to_string(&settings_path)?;
+        serde_json::from_str(&text).unwrap_or(json!({}))
+    } else {
+        json!({})
+    };
+
+    let hook_entry = json!({
+        "matcher": "Bash",
+        "hooks": [{
+            "type": "command",
+            "command": script_path.to_string_lossy()
+        }]
+    });
+
+    // Check if our hook is already present
+    let pre_tool_use = settings
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("settings is not a JSON object"))?
+        .entry("hooks")
+        .or_insert(json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("hooks is not a JSON object"))?
+        .entry("PreToolUse")
+        .or_insert(json!([]))
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("PreToolUse is not an array"))?;
+
+    let already_has_hook = pre_tool_use.iter().any(|h| {
+        h.get("hooks")
+            .and_then(|hooks| hooks.as_array())
+            .map(|hooks| {
+                hooks.iter().any(|hook| {
+                    hook.get("command")
+                        .and_then(|c| c.as_str())
+                        .map(|c| c.contains("skillclub-npx-guard"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    });
+
+    if !already_has_hook {
+        pre_tool_use.push(hook_entry);
+        fs::create_dir_all(settings_path.parent().unwrap())?;
+        let formatted = serde_json::to_string_pretty(&settings)?;
+        fs::write(&settings_path, formatted)?;
+        changed = true;
+    }
+
+    Ok(changed)
+}
+
+/// Install the shell npx wrapper to SkillRunner's bin directory.
+///
+/// Writes the wrapper to `~/Library/Application Support/SkillClub/SkillRunner/bin/npx`.
+/// The user or IT can add this directory to PATH to activate the wrapper.
+/// Returns the path to the wrapper if changes were made.
+pub fn install_npx_shell_wrapper(state: &skillrunner_core::state::AppState) -> Result<Option<String>> {
+    let bin_dir = state.root_dir.join("bin");
+    let wrapper_path = bin_dir.join("npx");
+
+    if wrapper_path.exists() && fs::read_to_string(&wrapper_path).unwrap_or_default() == NPX_SHELL_WRAPPER {
+        return Ok(None);
+    }
+
+    fs::create_dir_all(&bin_dir)?;
+    fs::write(&wrapper_path, NPX_SHELL_WRAPPER)?;
+    #[cfg(target_family = "unix")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))?;
+    }
+
+    Ok(Some(wrapper_path.to_string()))
+}
+
 /// Get the machine hostname for audit event identification.
 pub fn get_machine_id() -> String {
     // Try HOSTNAME env var first (common on Linux), then shell out
@@ -1065,5 +1237,76 @@ mod tests {
         assert!(is_skillrunner_configured(&config_path, "mcpServers"));
 
         let _ = fs::remove_dir_all(tmp.as_str());
+    }
+
+    #[test]
+    fn install_npx_claude_hook_creates_script_and_settings() {
+        let tmp = temp_root("npx-hook");
+        fs::create_dir_all(tmp.join(".claude")).unwrap();
+
+        let changed = install_npx_claude_hook_in(tmp.as_ref()).unwrap();
+        assert!(changed, "first install should report changes");
+
+        // Verify script exists and is executable
+        let script = tmp.join(".claude/hooks/skillclub-npx-guard.sh");
+        assert!(script.exists(), "hook script should exist");
+        let content = fs::read_to_string(&script).unwrap();
+        assert!(content.contains("SkillClub NPX Guard"));
+        assert!(content.contains("permissionDecision"));
+
+        // Verify settings.json has the hook
+        let settings_path = tmp.join(".claude/settings.json");
+        assert!(settings_path.exists(), "settings.json should exist");
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let hooks = &settings["hooks"]["PreToolUse"];
+        assert!(hooks.is_array());
+        assert!(!hooks.as_array().unwrap().is_empty());
+
+        // Second install should be idempotent
+        let changed2 = install_npx_claude_hook_in(tmp.as_ref()).unwrap();
+        assert!(!changed2, "second install should be no-op");
+
+        let _ = fs::remove_dir_all(tmp.as_str());
+    }
+
+    #[test]
+    fn install_npx_claude_hook_preserves_existing_settings() {
+        let tmp = temp_root("npx-hook-preserve");
+        fs::create_dir_all(tmp.join(".claude")).unwrap();
+
+        // Write existing settings
+        let settings_path = tmp.join(".claude/settings.json");
+        fs::write(&settings_path, r#"{"customKey": "value", "hooks": {}}"#).unwrap();
+
+        install_npx_claude_hook_in(tmp.as_ref()).unwrap();
+
+        let settings: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(settings["customKey"], "value", "existing keys preserved");
+        assert!(settings["hooks"]["PreToolUse"].is_array());
+
+        let _ = fs::remove_dir_all(tmp.as_str());
+    }
+
+    #[test]
+    fn install_npx_shell_wrapper_creates_executable() {
+        let state_root = temp_root("npx-wrapper");
+        let state = skillrunner_core::state::AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let result = install_npx_shell_wrapper(&state).unwrap();
+        assert!(result.is_some(), "first install should return path");
+
+        let wrapper_path = state.root_dir.join("bin/npx");
+        assert!(wrapper_path.exists(), "wrapper should exist");
+        let content = fs::read_to_string(&wrapper_path).unwrap();
+        assert!(content.contains("SkillClub NPX Wrapper"));
+        assert!(content.contains("@modelcontextprotocol"));
+
+        // Second install should be idempotent
+        let result2 = install_npx_shell_wrapper(&state).unwrap();
+        assert!(result2.is_none(), "second install should be no-op");
+
+        let _ = fs::remove_dir_all(state_root.as_str());
     }
 }
