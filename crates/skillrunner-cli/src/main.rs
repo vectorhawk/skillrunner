@@ -19,7 +19,7 @@ use skillrunner_core::{
 use skillrunner_manifest::SkillPackage;
 use skillrunner_mcp::{
     server::{McpServerConfig, run_server},
-    setup::{configure_client, detect_ai_clients, mark_first_run_offered},
+    setup::{configure_client, detect_ai_clients, install_claude_skills, mark_first_run_offered},
 };
 use rusqlite::Connection;
 
@@ -401,6 +401,22 @@ fn main() -> Result<()> {
                             if !auto {
                                 println!("  {} — failed: {e}", detected.name);
                             }
+                        }
+                    }
+                }
+
+                // Install slash command skills to ~/.claude/skills/
+                match install_claude_skills() {
+                    Ok(installed) => {
+                        if !auto && !installed.is_empty() {
+                            println!("\n  Installed {} slash command(s): {}",
+                                installed.len(),
+                                installed.iter().map(|s| format!("/{s}")).collect::<Vec<_>>().join(", "));
+                        }
+                    }
+                    Err(e) => {
+                        if !auto {
+                            println!("\n  Warning: could not install slash commands: {e}");
                         }
                     }
                 }

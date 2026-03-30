@@ -266,6 +266,223 @@ pub fn detect_unmanaged_servers() -> Vec<UnmanagedServer> {
     unmanaged
 }
 
+/// Skill definitions for auto-installed slash commands.
+/// Each tuple is (directory_name, SKILL.md content).
+fn skill_definitions() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "skillclub",
+            r#"---
+name: skillclub
+description: SkillClub hub — show auth status, installed skills, MCP servers, and available commands
+---
+Show the user a SkillClub status overview:
+
+1. Call skillclub_login to check authentication status (if registry is configured)
+2. Call skillclub_list to show installed skills count and names
+3. Call skillclub_mcp_status to show active MCP server count (if registry is configured)
+4. Then list all available SkillClub slash commands:
+   - /mcp-login — Authenticate with SkillClub
+   - /mcp-search — Browse approved MCP servers
+   - /mcp-install — Install an approved MCP server
+   - /mcp-request — Request access to a new MCP server
+   - /mcp-status — Check MCP server request status
+   - /skill-search — Search for skills in the registry
+   - /skill-install — Install a skill
+   - /skill-list — List installed skills
+   - /skill-create — Create a new skill
+   - /skill-publish — Publish a skill to the registry
+"#,
+        ),
+        (
+            "mcp-login",
+            r#"---
+name: mcp-login
+description: Authenticate with the SkillClub registry
+---
+Log the user into SkillClub. Call the skillclub_login tool.
+
+If it succeeds, confirm they are logged in and show their identity.
+If it fails, show the error and suggest checking their registry URL.
+"#,
+        ),
+        (
+            "mcp-search",
+            r#"---
+name: mcp-search
+description: Browse approved MCP servers in your organization's catalog
+---
+Browse available MCP servers. Call the skillclub_mcp_catalog tool.
+
+$ARGUMENTS
+
+Show results in a clean table with server name, status, and description.
+If no servers are found, suggest the user contact their IT admin.
+"#,
+        ),
+        (
+            "mcp-install",
+            r#"---
+name: mcp-install
+description: Install an approved MCP server through SkillClub governance
+---
+Install an MCP server through governance. Call the skillclub_mcp_install tool with the server ID from the arguments.
+
+$ARGUMENTS
+
+If the server is not yet approved, suggest using /mcp-request first.
+"#,
+        ),
+        (
+            "mcp-request",
+            r#"---
+name: mcp-request
+description: Request access to a new MCP server from your organization
+---
+Request access to an MCP server. Call the skillclub_mcp_request tool with the server ID from the arguments.
+
+$ARGUMENTS
+
+Explain the approval status to the user (auto-approved, pending review, etc.).
+Suggest using /mcp-status to check back on pending requests.
+"#,
+        ),
+        (
+            "mcp-status",
+            r#"---
+name: mcp-status
+description: Check the status of your MCP server access requests
+---
+Check MCP server request status. Call the skillclub_mcp_status tool.
+
+Show results clearly — which requests are approved, pending, or denied.
+For approved servers, suggest using /mcp-install to activate them.
+"#,
+        ),
+        (
+            "skill-search",
+            r#"---
+name: skill-search
+description: Search the SkillClub registry for available skills
+---
+Search for skills in the SkillClub registry. Call the skillclub_search tool with the query from the arguments. Use an empty query to list all available skills.
+
+$ARGUMENTS
+
+Show results with skill name, version, and description.
+"#,
+        ),
+        (
+            "skill-install",
+            r#"---
+name: skill-install
+description: Install a skill from the SkillClub registry
+---
+Install a skill. Call the skillclub_install tool with the skill ID from the arguments.
+
+$ARGUMENTS
+
+Confirm installation and show what the skill does.
+"#,
+        ),
+        (
+            "skill-list",
+            r#"---
+name: skill-list
+description: List all installed SkillClub skills
+---
+List installed skills. Call the skillclub_list tool.
+
+Show each skill's name, version, and a brief description.
+"#,
+        ),
+        (
+            "skill-create",
+            r#"---
+name: skill-create
+description: Create a new SkillClub skill from a name and system prompt
+---
+Create a new skill. Call the skillclub_author tool with the name and description from the arguments.
+
+$ARGUMENTS
+
+Walk the user through the result — show the generated bundle path and suggest next steps (validate, test, publish).
+"#,
+        ),
+        (
+            "skill-publish",
+            r#"---
+name: skill-publish
+description: Publish a skill bundle to the SkillClub registry
+---
+Publish a skill to the registry. Call the skillclub_publish tool with the skill path from the arguments.
+
+$ARGUMENTS
+
+If not authenticated, suggest using /mcp-login first.
+Show the publish result and the skill's registry URL.
+"#,
+        ),
+    ]
+}
+
+/// Install SkillClub slash command skills to `~/.claude/skills/`.
+///
+/// Each skill is a SKILL.md file that wraps a SkillRunner MCP tool,
+/// giving users clean top-level slash commands in Claude Code.
+/// Skips writing if the skill file already exists with identical content.
+pub fn install_claude_skills() -> Result<Vec<String>> {
+    let home = dirs_home().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let skills_dir = home.join(".claude").join("skills");
+    let mut installed = Vec::new();
+
+    for (dir_name, content) in skill_definitions() {
+        let skill_dir = skills_dir.join(dir_name);
+        let skill_file = skill_dir.join("SKILL.md");
+
+        // Skip if already exists with identical content
+        if skill_file.exists() {
+            if let Ok(existing) = fs::read_to_string(&skill_file) {
+                if existing == content {
+                    continue;
+                }
+            }
+        }
+
+        fs::create_dir_all(&skill_dir)?;
+        fs::write(&skill_file, content)?;
+        installed.push(dir_name.to_string());
+    }
+
+    Ok(installed)
+}
+
+/// Install skills to a custom root directory (for testing).
+#[cfg(test)]
+fn install_claude_skills_in(home: &std::path::Path) -> Result<Vec<String>> {
+    let skills_dir = home.join(".claude").join("skills");
+    let mut installed = Vec::new();
+
+    for (dir_name, content) in skill_definitions() {
+        let skill_dir = skills_dir.join(dir_name);
+        let skill_file = skill_dir.join("SKILL.md");
+
+        if skill_file.exists() {
+            if let Ok(existing) = fs::read_to_string(&skill_file) {
+                if existing == content {
+                    continue;
+                }
+            }
+        }
+
+        fs::create_dir_all(&skill_dir)?;
+        fs::write(&skill_file, content)?;
+        installed.push(dir_name.to_string());
+    }
+
+    Ok(installed)
+}
+
 /// Get the machine hostname for audit event identification.
 pub fn get_machine_id() -> String {
     // Try HOSTNAME env var first (common on Linux), then shell out
@@ -621,6 +838,89 @@ mod tests {
         let id = get_machine_id();
         assert!(!id.is_empty());
         assert_ne!(id, "unknown");
+    }
+
+    #[test]
+    fn install_claude_skills_creates_all_skill_files() {
+        let tmp = temp_root("skills-install");
+        fs::create_dir_all(tmp.join(".claude")).unwrap();
+
+        let installed = install_claude_skills_in(tmp.as_ref()).unwrap();
+
+        // Should install all 11 skills
+        assert_eq!(installed.len(), 11);
+        assert!(installed.contains(&"skillclub".to_string()));
+        assert!(installed.contains(&"mcp-login".to_string()));
+        assert!(installed.contains(&"mcp-search".to_string()));
+        assert!(installed.contains(&"mcp-install".to_string()));
+        assert!(installed.contains(&"mcp-request".to_string()));
+        assert!(installed.contains(&"mcp-status".to_string()));
+        assert!(installed.contains(&"skill-search".to_string()));
+        assert!(installed.contains(&"skill-install".to_string()));
+        assert!(installed.contains(&"skill-list".to_string()));
+        assert!(installed.contains(&"skill-create".to_string()));
+        assert!(installed.contains(&"skill-publish".to_string()));
+
+        // Verify SKILL.md files exist and have YAML frontmatter
+        for name in &installed {
+            let skill_file = tmp.join(".claude").join("skills").join(name).join("SKILL.md");
+            assert!(skill_file.exists(), "SKILL.md missing for {name}");
+            let content = fs::read_to_string(&skill_file).unwrap();
+            assert!(content.starts_with("---\n"), "SKILL.md for {name} must start with YAML frontmatter");
+            assert!(content.contains(&format!("name: {name}")), "SKILL.md for {name} must contain name field");
+        }
+
+        let _ = fs::remove_dir_all(tmp.as_str());
+    }
+
+    #[test]
+    fn install_claude_skills_skips_identical() {
+        let tmp = temp_root("skills-skip");
+        fs::create_dir_all(tmp.join(".claude")).unwrap();
+
+        // First install
+        let first = install_claude_skills_in(tmp.as_ref()).unwrap();
+        assert_eq!(first.len(), 11);
+
+        // Second install — should skip all (identical content)
+        let second = install_claude_skills_in(tmp.as_ref()).unwrap();
+        assert!(second.is_empty(), "should skip all skills on re-install, got: {:?}", second);
+
+        let _ = fs::remove_dir_all(tmp.as_str());
+    }
+
+    #[test]
+    fn install_claude_skills_updates_changed_content() {
+        let tmp = temp_root("skills-update");
+        fs::create_dir_all(tmp.join(".claude")).unwrap();
+
+        // First install
+        install_claude_skills_in(tmp.as_ref()).unwrap();
+
+        // Modify one skill file
+        let skill_file = tmp.join(".claude").join("skills").join("mcp-login").join("SKILL.md");
+        fs::write(&skill_file, "old content").unwrap();
+
+        // Re-install — should update the modified one
+        let updated = install_claude_skills_in(tmp.as_ref()).unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0], "mcp-login");
+
+        // Verify content was restored
+        let content = fs::read_to_string(&skill_file).unwrap();
+        assert!(content.contains("skillclub_login"));
+
+        let _ = fs::remove_dir_all(tmp.as_str());
+    }
+
+    #[test]
+    fn skill_definitions_have_valid_structure() {
+        for (name, content) in skill_definitions() {
+            assert!(!name.is_empty(), "skill dir name must not be empty");
+            assert!(content.starts_with("---\n"), "{name}: must start with YAML frontmatter");
+            assert!(content.contains("description:"), "{name}: must have description field");
+            assert!(content.contains(&format!("name: {name}")), "{name}: name field must match dir name");
+        }
     }
 
     #[test]
