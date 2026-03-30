@@ -42,6 +42,30 @@ pub fn detect_ai_clients(_skillrunner_path: &str) -> Vec<ClientConfig> {
         });
     }
 
+    // ── Claude Desktop ───────────────────────────────────────────────────────
+    // Config: ~/Library/Application Support/Claude/claude_desktop_config.json (macOS)
+    //         ~/.config/Claude/claude_desktop_config.json (Linux)
+    // Key: "mcpServers"
+    if let Some(claude_desktop_config) = claude_desktop_config_path(&home) {
+        let claude_desktop_dir = claude_desktop_config
+            .parent()
+            .map(|p| p.to_path_buf());
+        if claude_desktop_dir
+            .as_ref()
+            .map(|d| d.exists())
+            .unwrap_or(false)
+            || claude_desktop_config.exists()
+        {
+            let already = is_skillrunner_configured(&claude_desktop_config, "mcpServers");
+            clients.push(ClientConfig {
+                name: "Claude Desktop".to_string(),
+                config_path: claude_desktop_config,
+                mcp_key: "mcpServers".to_string(),
+                already_configured: already,
+            });
+        }
+    }
+
     // ── Cursor ───────────────────────────────────────────────────────────────
     // Config: ~/.cursor/mcp.json  (key: "mcpServers")
     let cursor_dir = home.join(".cursor");
@@ -207,6 +231,31 @@ fn vscode_settings_path(home: &std::path::Path) -> Option<PathBuf> {
                 .join("Code")
                 .join("User")
                 .join("settings.json"),
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// Return the Claude Desktop config path for the current OS.
+fn claude_desktop_config_path(home: &std::path::Path) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(
+            home.join("Library")
+                .join("Application Support")
+                .join("Claude")
+                .join("claude_desktop_config.json"),
+        )
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Some(
+            home.join(".config")
+                .join("Claude")
+                .join("claude_desktop_config.json"),
         )
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -648,6 +697,36 @@ mod tests {
         let windsurf = clients.iter().find(|c| c.name == "Windsurf");
         assert!(windsurf.is_some(), "Windsurf should be detected");
         assert_eq!(windsurf.unwrap().mcp_key, "mcpServers");
+
+        let _ = fs::remove_dir_all(tmp.as_str());
+    }
+
+    #[test]
+    fn detect_claude_desktop_when_dir_exists() {
+        let tmp = temp_root("claude-desktop");
+
+        #[cfg(target_os = "macos")]
+        let claude_desktop_dir = tmp
+            .join("Library")
+            .join("Application Support")
+            .join("Claude");
+        #[cfg(target_os = "linux")]
+        let claude_desktop_dir = tmp.join(".config").join("Claude");
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            // Claude Desktop detection not supported on this OS, skip
+            return;
+        }
+
+        fs::create_dir_all(&claude_desktop_dir).unwrap();
+
+        // Override HOME so detect_ai_clients looks in our temp dir
+        std::env::set_var("HOME", tmp.as_str());
+
+        let clients = detect_ai_clients("/usr/local/bin/skillrunner");
+        let claude_desktop = clients.iter().find(|c| c.name == "Claude Desktop");
+        assert!(claude_desktop.is_some(), "Claude Desktop should be detected");
+        assert_eq!(claude_desktop.unwrap().mcp_key, "mcpServers");
 
         let _ = fs::remove_dir_all(tmp.as_str());
     }
