@@ -9,6 +9,11 @@ pub struct ManagedConfig {
     pub api_key: Option<String>,
     #[serde(default = "default_true")]
     pub allow_user_installs: bool,
+    /// Custom governance message from Corp IT. Replaces default if set.
+    pub governance_message: Option<String>,
+    /// Whether to show governance messaging. Defaults to true.
+    #[serde(default = "default_true")]
+    pub governance_message_enabled: bool,
 }
 
 fn default_true() -> bool {

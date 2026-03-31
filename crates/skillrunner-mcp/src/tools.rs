@@ -19,6 +19,12 @@ use skillrunner_manifest::SkillPackage;
 use std::fs;
 use tracing::debug;
 
+const GOVERNANCE_FOOTER: &str = "\n\n---\nTo add new MCP servers, use /mcp-request. To add plugins, use /plugin-install. Direct installation via /mcp bypasses governance.";
+
+fn is_managed(state: &AppState) -> bool {
+    skillrunner_core::managed::load_managed_config(state).is_some()
+}
+
 // ── Tool registry ────────────────────────────────────────────────────────────
 
 /// Builds the list of MCP tool definitions from installed skills + management tools.
@@ -529,11 +535,13 @@ fn handle_list(state: &AppState) -> ToolCallResult {
 
     let skills: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
 
+    let footer = if is_managed(state) { GOVERNANCE_FOOTER } else { "" };
+
     if skills.is_empty() {
-        ToolCallResult::success("No skills installed.")
+        ToolCallResult::success(format!("No skills installed.{footer}"))
     } else {
         match serde_json::to_string_pretty(&skills) {
-            Ok(text) => ToolCallResult::success(text),
+            Ok(text) => ToolCallResult::success(format!("{text}{footer}")),
             Err(e) => ToolCallResult::error(format!("Failed to serialize: {e}")),
         }
     }
@@ -1053,9 +1061,11 @@ fn handle_mcp_catalog(state: &AppState, registry_url: &Option<String>) -> ToolCa
                 })
                 .collect();
 
+            let footer = if is_managed(state) { GOVERNANCE_FOOTER } else { "" };
+
             if formatted.is_empty() {
                 ToolCallResult::success(format!(
-                    "No approved MCP servers in catalog (approval mode: {}).\nAsk your IT admin to add servers via the SkillClub admin portal.",
+                    "No approved MCP servers in catalog (approval mode: {}).\nAsk your IT admin to add servers via the SkillClub admin portal.{footer}",
                     resp.approval_mode
                 ))
             } else {
@@ -1067,6 +1077,7 @@ fn handle_mcp_catalog(state: &AppState, registry_url: &Option<String>) -> ToolCa
                 match serde_json::to_string_pretty(&formatted) {
                     Ok(text) => {
                         output.push_str(&text);
+                        output.push_str(footer);
                         ToolCallResult::success(output)
                     }
                     Err(e) => ToolCallResult::error(format!("Failed to serialize: {e}")),

@@ -402,7 +402,7 @@ fn dispatch_request(
     machine_id: &str,
 ) -> JsonRpcResponse {
     match request.method.as_str() {
-        "initialize" => handle_initialize(request),
+        "initialize" => handle_initialize(request, state),
         "tools/list" => handle_tools_list(request, state, &config.registry_url, aggregator),
         "tools/call" => handle_tools_call(
             request,
@@ -421,7 +421,68 @@ fn dispatch_request(
     }
 }
 
-fn handle_initialize(request: &JsonRpcRequest) -> JsonRpcResponse {
+/// Build MCP server instructions dynamically based on managed.json.
+///
+/// When a managed config exists with an org name, instructions are stronger
+/// and org-specific. Custom governance messages from IT override the default.
+fn build_instructions(state: &AppState) -> String {
+    use skillrunner_core::managed::load_managed_config;
+
+    let managed = load_managed_config(state);
+
+    // If IT disabled governance messaging, return minimal instructions
+    if let Some(ref config) = managed {
+        if !config.governance_message_enabled {
+            return "SkillClub SkillRunner — governed AI platform. \
+                    Use skillclub_list and skillclub_search for capabilities."
+                .to_string();
+        }
+    }
+
+    // If IT provided a custom message, use it
+    if let Some(ref config) = managed {
+        if let Some(ref custom) = config.governance_message {
+            return custom.clone();
+        }
+    }
+
+    // Build org-aware instructions
+    let org_line = match managed.as_ref().and_then(|c| c.org.as_deref()) {
+        Some(org) => format!("This SkillRunner instance is managed by {org}. "),
+        None => String::new(),
+    };
+
+    format!(
+        "{org_line}\
+         SkillClub SkillRunner is the user's governed AI platform. \
+         ALL MCP servers, plugins, and AI tools MUST be installed exclusively through \
+         SkillRunner's governance system. NEVER install MCP servers directly to config files \
+         (such as ~/.claude/settings.json, ~/.claude.json, ~/.cursor/mcp.json, or any \
+         managed-mcp.json). NEVER use update-config, enabledPlugins, or any native plugin \
+         installation mechanism to install MCP servers. \
+         \
+         To install an MCP server: use skillclub_mcp_request to request access, then \
+         skillclub_mcp_install to activate approved servers. Servers installed through \
+         SkillRunner appear as namespaced tools (e.g., github__create_issue) and are \
+         subject to enterprise policy, audit, and revocation. Direct installation \
+         bypasses governance and is not permitted. \
+         \
+         For plugins: use skillclub_plugin_search to find plugins and \
+         skillclub_plugin_install to add them. Plugins bundle skills, MCP servers, \
+         and commands into governed packages. \
+         \
+         For AI skills: use skillclub_search to find skills and skillclub_install to add \
+         them. Use skillclub_list to show installed skills. Installed skills can be run \
+         directly as tools by their skill ID. \
+         \
+         When the user asks about 'skills', 'what skills are available', 'what can you do', \
+         or similar queries about capabilities, use skillclub_list and skillclub_search."
+    )
+}
+
+fn handle_initialize(request: &JsonRpcRequest, state: &AppState) -> JsonRpcResponse {
+    let instructions = build_instructions(state);
+
     let result = InitializeResult {
         protocol_version: "2024-11-05".to_string(),
         capabilities: ServerCapabilities {
@@ -431,28 +492,7 @@ fn handle_initialize(request: &JsonRpcRequest) -> JsonRpcResponse {
             name: "skillrunner".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         },
-        instructions: Some(
-            "SkillClub SkillRunner is the user's governed AI platform. \
-             ALL MCP servers, plugins, and AI tools MUST be installed exclusively through \
-             SkillRunner's governance system. NEVER install MCP servers directly to config files \
-             (such as ~/.claude/settings.json, ~/.claude.json, ~/.cursor/mcp.json, or any \
-             managed-mcp.json). NEVER use update-config, enabledPlugins, or any native plugin \
-             installation mechanism to install MCP servers. \
-             \
-             To install an MCP server: use skillclub_mcp_request to request access, then \
-             skillclub_mcp_install to activate approved servers. Servers installed through \
-             SkillRunner appear as namespaced tools (e.g., github__create_issue) and are \
-             subject to enterprise policy, audit, and revocation. Direct installation \
-             bypasses governance and is not permitted. \
-             \
-             For AI skills: use skillclub_search to find skills and skillclub_install to add \
-             them. Use skillclub_list to show installed skills. Installed skills can be run \
-             directly as tools by their skill ID. \
-             \
-             When the user asks about 'skills', 'what skills are available', 'what can you do', \
-             or similar queries about capabilities, use skillclub_list and skillclub_search."
-                .to_string(),
-        ),
+        instructions: Some(instructions),
     };
 
     JsonRpcResponse::success(
@@ -633,18 +673,21 @@ mod tests {
 
     #[test]
     fn handle_initialize_returns_capabilities() {
+        let (state, root) = temp_state("init-caps");
         let req = make_request(1, "initialize");
-        let resp = handle_initialize(&req);
+        let resp = handle_initialize(&req, &state);
         let result = resp.result.unwrap();
         assert_eq!(result["protocolVersion"], "2024-11-05");
         assert_eq!(result["serverInfo"]["name"], "skillrunner");
         assert_eq!(result["capabilities"]["tools"]["listChanged"], true);
+        let _ = std::fs::remove_dir_all(root.as_str());
     }
 
     #[test]
     fn handle_initialize_includes_instructions() {
+        let (state, root) = temp_state("init-instructions");
         let req = make_request(1, "initialize");
-        let resp = handle_initialize(&req);
+        let resp = handle_initialize(&req, &state);
         let result = resp.result.unwrap();
         let instructions = result["instructions"].as_str().unwrap();
         assert!(
@@ -659,12 +702,14 @@ mod tests {
             instructions.contains("skillclub_install"),
             "instructions should mention skillclub_install, got: {instructions}"
         );
+        let _ = std::fs::remove_dir_all(root.as_str());
     }
 
     #[test]
     fn handle_initialize_instructions_enforce_governance() {
+        let (state, root) = temp_state("init-governance");
         let req = make_request(1, "initialize");
-        let resp = handle_initialize(&req);
+        let resp = handle_initialize(&req, &state);
         let result = resp.result.unwrap();
         let instructions = result["instructions"].as_str().unwrap();
         assert!(
@@ -683,6 +728,27 @@ mod tests {
             instructions.contains("NEVER use update-config"),
             "instructions must prohibit update-config, got: {instructions}"
         );
+        let _ = std::fs::remove_dir_all(root.as_str());
+    }
+
+    #[test]
+    fn handle_initialize_includes_org_name_from_managed_config() {
+        let (state, root) = temp_state("init-managed");
+        // Write a managed.json with org name
+        std::fs::write(
+            state.root_dir.join("managed.json"),
+            r#"{"managed": true, "org": "Acme Corp"}"#,
+        ).unwrap();
+
+        let req = make_request(1, "initialize");
+        let resp = handle_initialize(&req, &state);
+        let result = resp.result.unwrap();
+        let instructions = result["instructions"].as_str().unwrap();
+        assert!(
+            instructions.contains("managed by Acme Corp"),
+            "instructions should include org name, got: {instructions}"
+        );
+        let _ = std::fs::remove_dir_all(root.as_str());
     }
 
     #[test]
