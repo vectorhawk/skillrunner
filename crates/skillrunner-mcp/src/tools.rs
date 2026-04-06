@@ -12,7 +12,7 @@ use skillrunner_core::{
     policy::PolicyClient,
     registry::RegistryClient,
     state::AppState,
-    updater::{install_from_registry, package_skill},
+    updater::{install_from_registry, install_plugin_from_registry, package_plugin, package_skill},
     validator::validate_bundle,
 };
 use skillrunner_manifest::SkillPackage;
@@ -383,6 +383,46 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
         }),
     });
 
+    tools.push(ToolDefinition {
+        name: "skillclub_plugin_author".to_string(),
+        description: "Create a new SkillClub plugin scaffold with plugin.json and directory structure.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Human-readable name for the plugin (e.g., 'My Workflow Plugin')"
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Brief description of what the plugin does"
+                },
+                "output_dir": {
+                    "type": "string",
+                    "description": "Directory to create the plugin bundle in (default: current directory)"
+                }
+            },
+            "required": ["name"]
+        }),
+    });
+
+    if registry_url.is_some() {
+        tools.push(ToolDefinition {
+            name: "skillclub_plugin_publish".to_string(),
+            description: "Package and publish a plugin bundle to the SkillClub registry. Requires authentication.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the plugin bundle directory to publish"
+                    }
+                },
+                "required": ["path"]
+            }),
+        });
+    }
+
     tools
 }
 
@@ -481,11 +521,13 @@ pub fn handle_tool_call(
         "skillclub_mcp_request" => handle_mcp_request(arguments, state, registry_url),
         "skillclub_mcp_status" => handle_mcp_status(state, registry_url),
         "skillclub_import" => handle_import(arguments, state, registry_url),
-        "skillclub_plugin_search" => handle_plugin_search(registry_url),
+        "skillclub_plugin_search" => handle_plugin_search(arguments, registry_url),
         "skillclub_plugin_info" => handle_plugin_info(arguments, state),
-        "skillclub_plugin_install" => handle_plugin_install(arguments, state),
+        "skillclub_plugin_install" => handle_plugin_install(arguments, state, registry_url),
         "skillclub_plugin_uninstall" => handle_plugin_uninstall(arguments, state),
         "skillclub_plugin_list" => handle_plugin_list(state),
+        "skillclub_plugin_author" => handle_plugin_author(arguments),
+        "skillclub_plugin_publish" => handle_plugin_publish(arguments, state, registry_url),
         _ => handle_skill_run(name, arguments, state, policy_client, model_client, registry_client),
     };
 
@@ -1526,18 +1568,43 @@ pub fn handle_mcp_uninstall(
 
 // ── Plugin handlers ─────────────────────────────────────────────────────────
 
-fn handle_plugin_search(registry_url: &Option<String>) -> ToolCallResult {
+fn handle_plugin_search(
+    arguments: &serde_json::Value,
+    registry_url: &Option<String>,
+) -> ToolCallResult {
     let url = match registry_url {
         Some(u) => u,
         None => return ToolCallResult::error("No registry URL configured."),
     };
+
+    let query = arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
+
     let registry = RegistryClient::new(url);
-    match registry.health_check() {
-        Ok(_) => ToolCallResult::success(serde_json::to_string_pretty(&serde_json::json!({
-            "message": "Plugin search is not yet available in this registry version. Use skillclub_search for skills and skillclub_mcp_catalog for MCP servers.",
-            "registry": url
-        })).unwrap_or_default()),
-        Err(e) => ToolCallResult::error(format!("Registry not reachable: {e}")),
+    match registry.search_plugins(query) {
+        Ok(results) => {
+            if results.is_empty() {
+                ToolCallResult::success(format!("No plugins found matching '{query}'."))
+            } else {
+                let formatted: Vec<serde_json::Value> = results
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "slug": r.slug,
+                            "name": r.name,
+                            "description": r.description,
+                            "latest_version": r.latest_version,
+                            "publisher": r.publisher_name,
+                            "install_count": r.install_count,
+                        })
+                    })
+                    .collect();
+                match serde_json::to_string_pretty(&formatted) {
+                    Ok(text) => ToolCallResult::success(text),
+                    Err(e) => ToolCallResult::error(format!("Failed to serialize: {e}")),
+                }
+            }
+        }
+        Err(e) => ToolCallResult::error(format!("Plugin search failed: {e}")),
     }
 }
 
@@ -1566,7 +1633,11 @@ fn handle_plugin_info(arguments: &serde_json::Value, state: &AppState) -> ToolCa
     }
 }
 
-fn handle_plugin_install(arguments: &serde_json::Value, state: &AppState) -> ToolCallResult {
+fn handle_plugin_install(
+    arguments: &serde_json::Value,
+    state: &AppState,
+    registry_url: &Option<String>,
+) -> ToolCallResult {
     let path_or_id = match arguments["path_or_id"].as_str() {
         Some(id) => id,
         None => return ToolCallResult::error("path_or_id is required"),
@@ -1575,30 +1646,70 @@ fn handle_plugin_install(arguments: &serde_json::Value, state: &AppState) -> Too
     let plugin_path = camino::Utf8PathBuf::from(path_or_id);
 
     if plugin_path.join("plugin.json").exists() {
-        match skillrunner_core::plugin::install_plugin_from_dir(state, &plugin_path) {
-            Ok(result) => {
-                let mut response = serde_json::json!({
-                    "status": "success",
-                    "plugin_id": result.id,
-                    "version": result.version,
-                    "install_status": result.status,
-                    "installed_skills": result.components.skill_ids,
-                    "installed_commands": result.components.command_names,
-                });
-                if !result.components.mcp_server_names.is_empty() {
-                    response["mcp_servers_pending"] = serde_json::json!(result.components.mcp_server_names);
-                    response["note"] = serde_json::json!(
-                        "MCP servers require approval. Use skillclub_mcp_request to request access, then skillclub_mcp_install to activate."
-                    );
-                }
-                ToolCallResult::success(serde_json::to_string_pretty(&response).unwrap_or_default())
-            }
-            Err(e) => ToolCallResult::error(format!("Failed to install plugin: {e}")),
-        }
+        install_plugin_from_local(state, &plugin_path)
     } else {
-        ToolCallResult::error(format!(
-            "Registry plugin install is not yet available. To install from a local directory, provide the path to a directory containing plugin.json. Got: '{path_or_id}'"
-        ))
+        install_plugin_from_registry_slug(path_or_id, state, registry_url)
+    }
+}
+
+fn install_plugin_from_local(state: &AppState, plugin_path: &camino::Utf8Path) -> ToolCallResult {
+    match skillrunner_core::plugin::install_plugin_from_dir(state, plugin_path) {
+        Ok(result) => {
+            let mut response = serde_json::json!({
+                "status": "success",
+                "plugin_id": result.id,
+                "version": result.version,
+                "install_status": result.status,
+                "installed_skills": result.components.skill_ids,
+                "installed_commands": result.components.command_names,
+            });
+            if !result.components.mcp_server_names.is_empty() {
+                response["mcp_servers_pending"] = serde_json::json!(result.components.mcp_server_names);
+                response["note"] = serde_json::json!(
+                    "MCP servers require approval. Use skillclub_mcp_request to request access, then skillclub_mcp_install to activate."
+                );
+            }
+            ToolCallResult::success(serde_json::to_string_pretty(&response).unwrap_or_default())
+        }
+        Err(e) => ToolCallResult::error(format!("Failed to install plugin: {e}")),
+    }
+}
+
+fn install_plugin_from_registry_slug(
+    slug: &str,
+    state: &AppState,
+    registry_url: &Option<String>,
+) -> ToolCallResult {
+    let url = match registry_url {
+        Some(u) => u,
+        None => {
+            return ToolCallResult::error(
+                "No registry URL configured. To install from a local directory, \
+                 provide the path to a directory containing plugin.json.",
+            )
+        }
+    };
+
+    let registry = RegistryClient::new(url);
+    match install_plugin_from_registry(state, &registry, slug) {
+        Ok(result) => {
+            let mut response = serde_json::json!({
+                "status": "success",
+                "plugin_id": result.id,
+                "version": result.version,
+                "install_status": result.status,
+                "installed_skills": result.components.skill_ids,
+                "installed_commands": result.components.command_names,
+            });
+            if !result.components.mcp_server_names.is_empty() {
+                response["mcp_servers_pending"] = serde_json::json!(result.components.mcp_server_names);
+                response["note"] = serde_json::json!(
+                    "MCP servers require approval. Use skillclub_mcp_request to request access, then skillclub_mcp_install to activate."
+                );
+            }
+            ToolCallResult::success(serde_json::to_string_pretty(&response).unwrap_or_default())
+        }
+        Err(e) => ToolCallResult::error(format!("Failed to install plugin '{slug}' from registry: {e}")),
     }
 }
 
@@ -1643,6 +1754,132 @@ fn handle_plugin_list(state: &AppState) -> ToolCallResult {
         }
         Err(e) => ToolCallResult::error(format!("Failed to list plugins: {e}")),
     }
+}
+
+fn handle_plugin_author(arguments: &serde_json::Value) -> ToolCallResult {
+    let name = match arguments.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return ToolCallResult::error("Missing required parameter: name"),
+    };
+    let description = arguments.get("description").and_then(|v| v.as_str());
+    let output_dir = arguments
+        .get("output_dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or(".");
+
+    // Derive plugin ID: lowercase, spaces and special chars become hyphens
+    let plugin_id: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+
+    let plugin_dir = Utf8PathBuf::from(output_dir).join(&plugin_id);
+
+    if let Err(e) = std::fs::create_dir_all(plugin_dir.join("skills")) {
+        return ToolCallResult::error(format!("Failed to create plugin directory: {e}"));
+    }
+    if let Err(e) = std::fs::create_dir_all(plugin_dir.join("commands")) {
+        return ToolCallResult::error(format!("Failed to create commands directory: {e}"));
+    }
+
+    let desc_value = description
+        .map(|d| serde_json::Value::String(d.to_string()))
+        .unwrap_or(serde_json::Value::Null);
+
+    let manifest = serde_json::json!({
+        "schema_version": "1.0",
+        "id": plugin_id,
+        "name": name,
+        "version": "0.1.0",
+        "publisher": "my-org",
+        "description": desc_value,
+        "skills": [],
+        "mcp_servers": [],
+        "commands": []
+    });
+
+    let manifest_str = match serde_json::to_string_pretty(&manifest) {
+        Ok(s) => s,
+        Err(e) => return ToolCallResult::error(format!("Failed to serialize manifest: {e}")),
+    };
+
+    if let Err(e) = std::fs::write(plugin_dir.join("plugin.json"), &manifest_str) {
+        return ToolCallResult::error(format!("Failed to write plugin.json: {e}"));
+    }
+
+    let readme = format!(
+        "# {name}\n\n{}\n",
+        description.unwrap_or("A SkillClub plugin.")
+    );
+    if let Err(e) = std::fs::write(plugin_dir.join("README.md"), readme) {
+        return ToolCallResult::error(format!("Failed to write README.md: {e}"));
+    }
+
+    ToolCallResult::success(serde_json::to_string_pretty(&serde_json::json!({
+        "status": "created",
+        "plugin_id": plugin_id,
+        "path": plugin_dir.as_str(),
+    })).unwrap_or_default())
+}
+
+fn handle_plugin_publish(
+    arguments: &serde_json::Value,
+    state: &AppState,
+    registry_url: &Option<String>,
+) -> ToolCallResult {
+    let url = match registry_url {
+        Some(u) => u,
+        None => return ToolCallResult::error("No registry URL configured"),
+    };
+
+    let path = match arguments.get("path").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return ToolCallResult::error("Missing required parameter: path"),
+    };
+
+    // Check auth
+    let tokens = match auth::load_tokens(state, url) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return ToolCallResult::error("Not logged in. Run `skillrunner auth login` first.")
+        }
+        Err(e) => return ToolCallResult::error(format!("Failed to load auth tokens: {e}")),
+    };
+
+    // Package the plugin
+    let utf8_path = camino::Utf8Path::new(path);
+    let (archive_path, _sha) = match package_plugin(utf8_path) {
+        Ok(r) => r,
+        Err(e) => return ToolCallResult::error(format!("Failed to package plugin: {e}")),
+    };
+
+    // Publish to registry
+    let registry = RegistryClient::new(url).with_auth(&tokens.access_token);
+    let result = match registry.publish_plugin(&archive_path) {
+        Ok(resp) => {
+            let _ = fs::remove_file(&archive_path);
+            let slug = resp.get("slug").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let version = resp.get("version").and_then(|v| v.as_str()).unwrap_or("unknown");
+            format!("Published plugin {slug}@{version} to registry successfully.")
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&archive_path);
+            let err_msg = e.to_string();
+            if err_msg.contains("already exists") && err_msg.contains("ersion") {
+                return ToolCallResult::error(format!(
+                    "{err_msg}\n\nTo publish a new version, bump the version in plugin.json \
+                     (e.g., 0.1.0 → 0.2.0) and run skillclub_plugin_publish again."
+                ));
+            }
+            return ToolCallResult::error(format!("Failed to publish plugin: {e}"));
+        }
+    };
+
+    ToolCallResult::success(result)
 }
 
 // ── Skill execution handler ──────────────────────────────────────────────────

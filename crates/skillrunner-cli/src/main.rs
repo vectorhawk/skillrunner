@@ -13,7 +13,7 @@ use skillrunner_core::{
     policy::MockPolicyClient,
     registry::{HttpPolicyClient, RegistryClient},
     resolver::{resolve_skill, ResolveOutcome},
-    updater::{check_skill_updates, install_from_registry, package_skill},
+    updater::{check_skill_updates, install_from_registry, package_plugin, package_skill},
     validator::validate_bundle,
 };
 use skillrunner_manifest::SkillPackage;
@@ -205,6 +205,30 @@ enum PluginCommands {
     Info {
         /// Plugin ID
         plugin_id: String,
+    },
+    /// Search the registry for plugins
+    Search {
+        /// Search query
+        query: Option<String>,
+        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        #[arg(long)]
+        registry_url: Option<String>,
+    },
+    /// Publish a plugin to the registry
+    Publish {
+        /// Path to the plugin directory
+        path: Utf8PathBuf,
+        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        #[arg(long)]
+        registry_url: Option<String>,
+    },
+    /// Scaffold a new plugin directory
+    Author {
+        /// Plugin name
+        name: String,
+        /// Output directory (default: current directory)
+        #[arg(long)]
+        output_dir: Option<Utf8PathBuf>,
     },
 }
 
@@ -868,6 +892,90 @@ fn main() -> Result<()> {
                     }
                     None => println!("Plugin '{plugin_id}' is not installed."),
                 }
+            }
+            PluginCommands::Search { query, registry_url } => {
+                let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
+                let query_str = query.as_deref().unwrap_or("");
+                let registry = RegistryClient::new(&url);
+                let results = registry
+                    .search_plugins(query_str)
+                    .with_context(|| format!("failed to search plugins matching '{query_str}'"))?;
+                if results.is_empty() {
+                    println!("No plugins found matching '{query_str}'.");
+                } else {
+                    println!("{:<30} {:<12} NAME", "SLUG", "VERSION");
+                    for r in &results {
+                        println!(
+                            "{:<30} {:<12} {}",
+                            r.slug,
+                            r.latest_version.as_deref().unwrap_or("-"),
+                            r.name
+                        );
+                    }
+                }
+            }
+            PluginCommands::Publish { path, registry_url } => {
+                let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
+                let (archive_path, _sha) = package_plugin(&path)
+                    .with_context(|| format!("failed to package plugin at {path}"))?;
+                println!("Packaged plugin: {archive_path}");
+
+                let token = auth::load_tokens(&app.state, &url)?
+                    .ok_or_else(|| anyhow::anyhow!("not logged in; run `skillrunner auth login` first"))?;
+
+                let registry = RegistryClient::new(&url).with_auth(&token.access_token);
+                let resp = registry
+                    .publish_plugin(&archive_path)
+                    .with_context(|| "failed to publish plugin to registry")?;
+
+                let _ = std::fs::remove_file(&archive_path);
+
+                let slug = resp.get("slug").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let version = resp.get("version").and_then(|v| v.as_str()).unwrap_or("unknown");
+                println!("Published plugin {slug}@{version} to registry.");
+            }
+            PluginCommands::Author { name, output_dir } => {
+                let out = output_dir
+                    .as_deref()
+                    .unwrap_or_else(|| camino::Utf8Path::new("."));
+
+                // Derive plugin ID: lowercase, non-alphanumeric chars become hyphens
+                let plugin_id: String = name
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+                    .collect::<String>()
+                    .split('-')
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("-");
+
+                let plugin_dir = out.join(&plugin_id);
+                std::fs::create_dir_all(plugin_dir.join("skills"))
+                    .with_context(|| format!("failed to create {}", plugin_dir.join("skills")))?;
+                std::fs::create_dir_all(plugin_dir.join("commands"))
+                    .with_context(|| format!("failed to create {}", plugin_dir.join("commands")))?;
+
+                let manifest = serde_json::json!({
+                    "schema_version": "1.0",
+                    "id": plugin_id,
+                    "name": name,
+                    "version": "0.1.0",
+                    "publisher": "my-org",
+                    "description": null,
+                    "skills": [],
+                    "mcp_servers": [],
+                    "commands": []
+                });
+                let manifest_str = serde_json::to_string_pretty(&manifest)
+                    .context("failed to serialize plugin.json")?;
+                std::fs::write(plugin_dir.join("plugin.json"), &manifest_str)
+                    .with_context(|| format!("failed to write {}", plugin_dir.join("plugin.json")))?;
+
+                std::fs::write(plugin_dir.join("README.md"), format!("# {name}\n"))
+                    .with_context(|| format!("failed to write {}", plugin_dir.join("README.md")))?;
+
+                println!("Created plugin scaffold at {plugin_dir}");
+                println!("  Edit {}/plugin.json to add skills, MCP servers, and commands.", plugin_dir);
             }
         },
     }

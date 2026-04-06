@@ -79,6 +79,44 @@ pub struct SkillDetail {
     pub description: Option<String>,
 }
 
+/// A single plugin result from `GET /api/plugins/search?query=<query>`.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PluginSearchResult {
+    pub slug: String,
+    pub name: String,
+    pub latest_version: Option<String>,
+    pub publisher_name: Option<String>,
+    pub description: Option<String>,
+    pub install_count: Option<i64>,
+}
+
+/// Wire format returned by the plugin search endpoint.
+#[derive(Debug, Deserialize)]
+struct PluginSearchApiResponse {
+    items: Vec<PluginSearchResult>,
+}
+
+/// Plugin detail returned by `GET /portal/plugins/{slug}`.
+#[derive(Debug, Deserialize)]
+pub struct PluginDetail {
+    pub slug: String,
+    pub name: String,
+    pub latest_version: Option<String>,
+    pub publisher_name: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Download info returned by `GET /api/runner/plugins/{slug}/latest`.
+#[derive(Debug, Deserialize)]
+pub struct PluginDownloadInfo {
+    pub slug: String,
+    pub version: String,
+    pub download_url: String,
+    pub sha256: String,
+    pub components: serde_json::Value,
+    pub manifest_json: serde_json::Value,
+}
+
 // ── RegistryClient ────────────────────────────────────────────────────────────
 
 /// Pure HTTP client for the SkillClub registry.
@@ -411,6 +449,161 @@ impl RegistryClient {
         // We already have last_dash pointing at "-0.2.0", which is correct
         // But we need to handle "my-skill-1.0.0" vs "my-1-skill-1.0.0"
         // Simple approach: check if after_dash contains dots (version-like)
+        if after.contains('.') {
+            Some(stem[..last_dash].to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Search the registry for plugins matching `query`.
+    pub fn search_plugins(&self, query: &str) -> Result<Vec<PluginSearchResult>> {
+        let url = format!(
+            "{}/api/plugins/search?query={}",
+            self.base_url.trim_end_matches('/'),
+            urlencoding::encode(query)
+        );
+        debug!(url, "searching plugins");
+
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!("registry returned HTTP {status} for plugin search: {body}");
+        }
+
+        let wire: PluginSearchApiResponse = resp
+            .json()
+            .context("failed to deserialize plugin search response")?;
+        Ok(wire.items)
+    }
+
+    /// Fetch plugin detail including latest version info.
+    pub fn fetch_plugin_detail(&self, slug: &str) -> Result<PluginDetail> {
+        let url = format!(
+            "{}/portal/plugins/{}",
+            self.base_url.trim_end_matches('/'),
+            slug
+        );
+        debug!(url, "fetching plugin detail");
+
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!("registry returned HTTP {status} for plugin {slug}: {body}");
+        }
+
+        resp.json()
+            .context("failed to deserialize plugin detail response")
+    }
+
+    /// Fetch download info for the latest version of a plugin.
+    pub fn download_plugin_info(&self, slug: &str) -> Result<PluginDownloadInfo> {
+        let url = format!(
+            "{}/api/runner/plugins/{}/latest",
+            self.base_url.trim_end_matches('/'),
+            slug
+        );
+        debug!(url, "fetching plugin download info");
+
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!("registry returned HTTP {status} for plugin download info {slug}: {body}");
+        }
+
+        resp.json()
+            .context("failed to deserialize plugin download info response")
+    }
+
+    /// Upload a `.plugin` archive to the registry.
+    ///
+    /// Requires auth token to be set via [`with_auth`].
+    /// On 409 CONFLICT (plugin exists), retries as a new version upload.
+    pub fn publish_plugin(&self, archive_path: &Utf8Path) -> Result<serde_json::Value> {
+        let token = self
+            .auth_token
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("not authenticated; run `skillrunner auth login` first"))?;
+
+        let base = self.base_url.trim_end_matches('/');
+        let url = format!("{base}/portal/plugins");
+        debug!(url, archive = %archive_path, "uploading plugin");
+
+        let file_bytes = std::fs::read(archive_path)
+            .with_context(|| format!("failed to read archive {archive_path}"))?;
+
+        let file_name = archive_path
+            .file_name()
+            .unwrap_or("bundle.plugin")
+            .to_string();
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .multipart(Self::make_upload_form(file_bytes.clone(), file_name.clone())?)
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        // If plugin already exists (409), retry as a new version upload
+        if resp.status() == reqwest::StatusCode::CONFLICT {
+            let slug = Self::extract_plugin_slug_from_filename(&file_name)
+                .ok_or_else(|| anyhow::anyhow!("plugin already exists but could not extract slug from archive filename"))?;
+            debug!(slug, "plugin exists, uploading as new version");
+
+            let version_url = format!("{base}/portal/plugins/{slug}/versions");
+            let resp2 = self
+                .http
+                .post(&version_url)
+                .bearer_auth(token)
+                .multipart(Self::make_upload_form(file_bytes, file_name)?)
+                .send()
+                .with_context(|| format!("failed to reach registry at {version_url}"))?;
+
+            if !resp2.status().is_success() {
+                let status = resp2.status();
+                let body = resp2.text().unwrap_or_default();
+                anyhow::bail!("publish plugin version failed (HTTP {status}): {body}");
+            }
+
+            return resp2.json().context("failed to deserialize publish plugin response");
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!("publish plugin failed (HTTP {status}): {body}");
+        }
+
+        resp.json().context("failed to deserialize publish plugin response")
+    }
+
+    /// Extract plugin slug from archive filename like "my-plugin-0.1.0.plugin"
+    fn extract_plugin_slug_from_filename(filename: &str) -> Option<String> {
+        let stem = filename.strip_suffix(".plugin")?;
+        let last_dash = stem.rfind('-')?;
+        let after = &stem[last_dash + 1..];
+        if after.chars().next().is_none_or(|c| !c.is_ascii_digit()) {
+            return None;
+        }
         if after.contains('.') {
             Some(stem[..last_dash].to_string())
         } else {

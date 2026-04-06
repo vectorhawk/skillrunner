@@ -1,5 +1,6 @@
 use crate::{
     install::{deactivate_skill, install_unpacked_skill, reactivate_skill, uninstall_skill},
+    plugin::{install_plugin_from_dir, InstalledPlugin},
     policy::Policy,
     registry::RegistryClient,
     state::AppState,
@@ -10,7 +11,7 @@ use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use rusqlite::{Connection, OptionalExtension};
 use semver::Version;
 use sha2::{Digest, Sha256};
-use skillrunner_manifest::SkillPackage;
+use skillrunner_manifest::{PluginPackage, SkillPackage};
 use tar::Archive;
 use tracing::info;
 
@@ -121,6 +122,44 @@ pub fn package_skill(skill_dir: &Utf8Path) -> Result<(Utf8PathBuf, String)> {
     Ok((archive_path, sha))
 }
 
+/// Package a plugin directory into a `.plugin` tar.gz archive.
+///
+/// Validates the bundle first, then creates the archive in a temp directory.
+/// Returns `(archive_path, sha256_hex)`.
+pub fn package_plugin(plugin_dir: &Utf8Path) -> Result<(Utf8PathBuf, String)> {
+    let pkg = PluginPackage::load_from_dir(plugin_dir)
+        .with_context(|| format!("plugin at {plugin_dir} failed validation"))?;
+
+    let filename = format!("{}-{}.plugin", pkg.manifest.id, pkg.manifest.version);
+    let archive_path = Utf8PathBuf::from_path_buf(
+        std::env::temp_dir().join(&filename),
+    )
+    .map_err(|_| anyhow::anyhow!("temp dir path is not valid UTF-8"))?;
+
+    let file = std::fs::File::create(&archive_path)
+        .with_context(|| format!("failed to create {archive_path}"))?;
+    let enc = GzEncoder::new(file, Compression::default());
+    let mut tar = tar::Builder::new(enc);
+    tar.append_dir_all(".", plugin_dir.as_std_path())
+        .with_context(|| format!("failed to build archive from {plugin_dir}"))?;
+    tar.finish().context("failed to finalize archive")?;
+    drop(tar);
+
+    let archive_bytes = std::fs::read(&archive_path)
+        .with_context(|| format!("failed to read archive {archive_path}"))?;
+    let sha = hex::encode(Sha256::digest(&archive_bytes));
+
+    info!(
+        plugin_id = %pkg.manifest.id,
+        version = %pkg.manifest.version,
+        path = %archive_path,
+        sha256 = %sha,
+        "packaged plugin"
+    );
+
+    Ok((archive_path, sha))
+}
+
 // ── Download + install flow ───────────────────────────────────────────────────
 
 fn download_and_install(
@@ -160,6 +199,58 @@ fn download_and_install(
     install_unpacked_skill(state, &pkg)
         .with_context(|| format!("failed to install updated {skill_id}@{version}"))?;
 
+    Ok(())
+}
+
+/// Install a plugin from the registry by slug.
+///
+/// Downloads the latest version, extracts the archive, and installs.
+/// Returns the [`InstalledPlugin`] summary on success.
+pub fn install_plugin_from_registry(
+    state: &AppState,
+    registry: &RegistryClient,
+    slug: &str,
+) -> Result<InstalledPlugin> {
+    info!(slug, "installing plugin from registry");
+
+    // 1. Fetch download info (URL + sha256).
+    let download_info = registry
+        .download_plugin_info(slug)
+        .with_context(|| format!("failed to fetch download info for plugin '{slug}'"))?;
+
+    // 2. Download the .plugin archive to a temp file.
+    let tmp_dir = tempfile::TempDir::new().context("failed to create temp dir for download")?;
+    let archive_path = Utf8PathBuf::from_path_buf(tmp_dir.path().join("bundle.plugin"))
+        .map_err(|_| anyhow::anyhow!("temp dir path is not valid UTF-8"))?;
+
+    registry
+        .download_artifact(&download_info.download_url, &download_info.sha256, &archive_path)
+        .with_context(|| format!("failed to download plugin '{slug}'"))?;
+
+    // 3. Extract the tar.gz archive to a staging directory.
+    let staging_path = Utf8PathBuf::from_path_buf(tmp_dir.path().join("staging"))
+        .map_err(|_| anyhow::anyhow!("staging path is not valid UTF-8"))?;
+    std::fs::create_dir_all(&staging_path).context("failed to create staging dir")?;
+
+    extract_archive(&archive_path, &staging_path)
+        .with_context(|| format!("failed to extract plugin '{slug}'"))?;
+
+    // 4. Install from the extracted directory.
+    let result = install_plugin_from_dir(state, &staging_path)
+        .with_context(|| format!("failed to install plugin '{slug}' from extracted archive"))?;
+
+    info!(slug, version = %result.version, "plugin installed from registry");
+    Ok(result)
+}
+
+/// Extract a tar.gz archive into `dest`.
+fn extract_archive(archive_path: &Utf8PathBuf, dest: &Utf8PathBuf) -> Result<()> {
+    let file = std::fs::File::open(archive_path)
+        .with_context(|| format!("failed to open archive {archive_path}"))?;
+    let gz = GzDecoder::new(file);
+    let mut tar = Archive::new(gz);
+    tar.unpack(dest.as_std_path())
+        .with_context(|| format!("failed to unpack archive to {dest}"))?;
     Ok(())
 }
 
