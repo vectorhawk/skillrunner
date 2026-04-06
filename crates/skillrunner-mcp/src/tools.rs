@@ -1823,6 +1823,7 @@ fn handle_plugin_author(arguments: &serde_json::Value) -> ToolCallResult {
         "status": "created",
         "plugin_id": plugin_id,
         "path": plugin_dir.as_str(),
+        "next_steps": "Add skills to skills/, MCP servers, or commands to commands/ before running plugin validate. A plugin must contain at least one component."
     })).unwrap_or_default())
 }
 

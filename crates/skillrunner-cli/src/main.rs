@@ -975,7 +975,9 @@ fn main() -> Result<()> {
                     .with_context(|| format!("failed to write {}", plugin_dir.join("README.md")))?;
 
                 println!("Created plugin scaffold at {plugin_dir}");
-                println!("  Edit {}/plugin.json to add skills, MCP servers, and commands.", plugin_dir);
+                println!("Next: add skills to {plugin_dir}/skills/, MCP servers, or commands to {plugin_dir}/commands/");
+                println!("      A plugin must contain at least one component to pass validation.");
+                println!("      Then run: skillrunner plugin validate {plugin_dir}");
             }
         },
     }
