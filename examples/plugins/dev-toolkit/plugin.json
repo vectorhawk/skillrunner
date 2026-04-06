@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0",
+  "id": "dev-toolkit",
+  "name": "Developer Toolkit",
+  "version": "0.1.0",
+  "publisher": "skillclub",
+  "description": "A sample plugin bundling code review and security scan skills.",
+  "category": "development",
+  "tags": ["code", "security", "review"],
+  "skills": [
+    { "path": "skills/code-review" },
+    { "path": "skills/security-scan" }
+  ],
+  "mcp_servers": [],
+  "commands": []
+}
