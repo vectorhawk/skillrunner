@@ -8,6 +8,8 @@ pub mod mcp_governance;
 pub mod model;
 pub mod ollama;
 pub mod plugin;
+pub mod plugin_export;
+pub mod plugin_import;
 pub mod policy;
 pub mod registry;
 pub mod resolver;

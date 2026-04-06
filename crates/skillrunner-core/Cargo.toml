@@ -25,6 +25,7 @@ tempfile.workspace = true
 sha2.workspace = true
 hex.workspace = true
 urlencoding.workspace = true
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 mockito = "1"

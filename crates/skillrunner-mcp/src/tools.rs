@@ -374,12 +374,57 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
 
     // Plugin tools (always available)
     tools.push(ToolDefinition {
+        name: "skillclub_plugin_import".to_string(),
+        description: "Import a Claude Code plugin or .mcpb Desktop Extension into SkillClub plugin format. Auto-detects the external format and converts it.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the Claude Code plugin directory or .mcpb file"
+                },
+                "output_dir": {
+                    "type": "string",
+                    "description": "Output directory for the converted plugin (default: current directory)"
+                }
+            },
+            "required": ["path"]
+        }),
+    });
+
+    tools.push(ToolDefinition {
         name: "skillclub_plugin_list".to_string(),
         description: "List all installed plugins with their status and component breakdown (skills, MCP servers, commands).".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {},
             "required": []
+        }),
+    });
+
+    tools.push(ToolDefinition {
+        name: "skillclub_plugin_export".to_string(),
+        description: "Export a SkillClub plugin to Claude Code plugin or .mcpb Desktop Extension \
+            format for distribution to non-SkillClub channels."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the SkillClub plugin directory"
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["claude-code", "mcpb"],
+                    "description": "Export format: 'claude-code' for a Claude Code plugin directory, 'mcpb' for a Desktop Extension archive"
+                },
+                "output_dir": {
+                    "type": "string",
+                    "description": "Output directory where the exported artifact will be written (default: current directory)"
+                }
+            },
+            "required": ["path", "format"]
         }),
     });
 
@@ -528,6 +573,8 @@ pub fn handle_tool_call(
         "skillclub_plugin_list" => handle_plugin_list(state),
         "skillclub_plugin_author" => handle_plugin_author(arguments),
         "skillclub_plugin_publish" => handle_plugin_publish(arguments, state, registry_url),
+        "skillclub_plugin_export" => handle_plugin_export(arguments),
+        "skillclub_plugin_import" => handle_plugin_import(arguments),
         _ => handle_skill_run(name, arguments, state, policy_client, model_client, registry_client),
     };
 
@@ -1881,6 +1928,103 @@ fn handle_plugin_publish(
     };
 
     ToolCallResult::success(result)
+}
+
+// ── Plugin export handler ────────────────────────────────────────────────────
+
+fn handle_plugin_export(arguments: &serde_json::Value) -> ToolCallResult {
+    let path = match arguments.get("path").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return ToolCallResult::error("Missing required parameter: path"),
+    };
+
+    let format = match arguments.get("format").and_then(|v| v.as_str()) {
+        Some(f) => f,
+        None => return ToolCallResult::error("Missing required parameter: format"),
+    };
+
+    let output_dir = arguments
+        .get("output_dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or(".");
+
+    let plugin_path = camino::Utf8Path::new(path);
+    let out_path = camino::Utf8Path::new(output_dir);
+
+    let result = match format {
+        "claude-code" => {
+            skillrunner_core::plugin_export::export_claude_code(plugin_path, out_path)
+        }
+        "mcpb" => skillrunner_core::plugin_export::export_mcpb(plugin_path, out_path),
+        other => {
+            return ToolCallResult::error(format!(
+                "Unsupported format '{other}'. Use 'claude-code' or 'mcpb'."
+            ))
+        }
+    };
+
+    match result {
+        Ok(exported_path) => ToolCallResult::success(format!(
+            "Plugin exported successfully to: {exported_path}"
+        )),
+        Err(e) => ToolCallResult::error(format!("Export failed: {e}")),
+    }
+}
+
+// ── Plugin import handler ─────────────────────────────────────────────────────
+
+fn handle_plugin_import(arguments: &serde_json::Value) -> ToolCallResult {
+    use skillrunner_core::plugin_import;
+
+    let path = match arguments.get("path").and_then(|v| v.as_str()) {
+        Some(p) => camino::Utf8PathBuf::from(p),
+        None => return ToolCallResult::error("Missing required parameter: path"),
+    };
+
+    let output_dir = arguments
+        .get("output_dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or(".");
+    let out = camino::Utf8PathBuf::from(output_dir);
+
+    let format = match plugin_import::detect_plugin_format(&path) {
+        Some(f) => f,
+        None => return ToolCallResult::error(format!(
+            "Could not detect plugin format at '{}'. \
+             Expected a Claude Code plugin directory (with .claude-plugin/) or a .mcpb file.",
+            path
+        )),
+    };
+
+    let format_label = format!("{:?}", format);
+
+    let result = match format {
+        plugin_import::ExternalPluginFormat::ClaudeCode => {
+            plugin_import::import_claude_code_plugin(&path, &out)
+        }
+        plugin_import::ExternalPluginFormat::Mcpb => {
+            plugin_import::import_mcpb(&path, &out)
+        }
+    };
+
+    match result {
+        Ok(p) => {
+            let payload = serde_json::json!({
+                "status": "imported",
+                "format": format_label,
+                "output_path": p.as_str(),
+                "next_steps": format!(
+                    "Run 'skillrunner plugin validate {}' then 'skillrunner plugin install {}'",
+                    p, p
+                )
+            });
+            match serde_json::to_string_pretty(&payload) {
+                Ok(text) => ToolCallResult::success(text),
+                Err(e) => ToolCallResult::error(format!("Failed to serialize result: {e}")),
+            }
+        }
+        Err(e) => ToolCallResult::error(format!("Import failed: {e}")),
+    }
 }
 
 // ── Skill execution handler ──────────────────────────────────────────────────

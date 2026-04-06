@@ -230,6 +230,25 @@ enum PluginCommands {
         #[arg(long)]
         output_dir: Option<Utf8PathBuf>,
     },
+    /// Export a plugin to an external format for distribution
+    Export {
+        /// Path to the plugin directory
+        path: Utf8PathBuf,
+        /// Output format: "claude-code" or "mcpb"
+        #[arg(long)]
+        format: String,
+        /// Output directory (default: current directory)
+        #[arg(long)]
+        output_dir: Option<Utf8PathBuf>,
+    },
+    /// Import an external plugin (Claude Code plugin or .mcpb) into SkillClub format
+    Import {
+        /// Path to the external plugin directory or .mcpb file
+        path: Utf8PathBuf,
+        /// Output directory for the converted plugin (default: current directory)
+        #[arg(long)]
+        output_dir: Option<Utf8PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -933,6 +952,48 @@ fn main() -> Result<()> {
                 let slug = resp.get("slug").and_then(|v| v.as_str()).unwrap_or("unknown");
                 let version = resp.get("version").and_then(|v| v.as_str()).unwrap_or("unknown");
                 println!("Published plugin {slug}@{version} to registry.");
+            }
+            PluginCommands::Export { path, format, output_dir } => {
+                let out = output_dir
+                    .as_deref()
+                    .unwrap_or_else(|| camino::Utf8Path::new("."));
+                let result = match format.as_str() {
+                    "claude-code" => {
+                        skillrunner_core::plugin_export::export_claude_code(&path, out)
+                            .with_context(|| format!("failed to export plugin at {path} as claude-code"))?
+                    }
+                    "mcpb" => {
+                        skillrunner_core::plugin_export::export_mcpb(&path, out)
+                            .with_context(|| format!("failed to export plugin at {path} as mcpb"))?
+                    }
+                    other => {
+                        anyhow::bail!("unsupported format '{}'. Use 'claude-code' or 'mcpb'", other)
+                    }
+                };
+                println!("Exported to {result}");
+            }
+            PluginCommands::Import { path, output_dir } => {
+                let out = output_dir
+                    .as_deref()
+                    .unwrap_or_else(|| camino::Utf8Path::new("."));
+                let format = skillrunner_core::plugin_import::detect_plugin_format(&path)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "Could not detect plugin format at '{}'. \
+                         Expected a Claude Code plugin directory (with .claude-plugin/) or a .mcpb file.",
+                        path
+                    ))?;
+                let result = match format {
+                    skillrunner_core::plugin_import::ExternalPluginFormat::ClaudeCode => {
+                        skillrunner_core::plugin_import::import_claude_code_plugin(&path, out)
+                            .with_context(|| format!("failed to import Claude Code plugin at {path}"))?
+                    }
+                    skillrunner_core::plugin_import::ExternalPluginFormat::Mcpb => {
+                        skillrunner_core::plugin_import::import_mcpb(&path, out)
+                            .with_context(|| format!("failed to import .mcpb at {path}"))?
+                    }
+                };
+                println!("Imported to {result}");
+                println!("Next: skillrunner plugin validate {result}");
             }
             PluginCommands::Author { name, output_dir } => {
                 let out = output_dir
