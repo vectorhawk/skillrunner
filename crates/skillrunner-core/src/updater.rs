@@ -312,16 +312,36 @@ pub fn check_skill_updates(
     let all_skill_ids: Vec<String> = all_installed.iter().map(|(id, _)| id.clone()).collect();
     let mut changes = 0usize;
 
+    // Collect skill IDs owned by plugins — these are local-only and must
+    // not be uninstalled when the registry reports them as "unknown".
+    let plugin_owned_skills: std::collections::HashSet<String> = {
+        let mut set = std::collections::HashSet::new();
+        if let Ok(plugins) = crate::plugin::list_installed_plugins(state) {
+            for p in &plugins {
+                for sid in &p.components.skill_ids {
+                    set.insert(sid.clone());
+                }
+            }
+        }
+        set
+    };
+
     // ── Phase 2: lifecycle check ──────────────────────────────────────────────
     // `published_ids` is Some(set) when the endpoint succeeded — only skills in
     // the set are eligible for version updates.  None means "skip lifecycle, update all active".
+    // Only check registry status for non-plugin-owned skills
+    let registry_skill_ids: Vec<String> = all_skill_ids.iter()
+        .filter(|id| !plugin_owned_skills.contains(id.as_str()))
+        .cloned()
+        .collect();
     let published_ids: Option<std::collections::HashSet<String>> =
-        match registry.check_skill_status(&all_skill_ids) {
+        match registry.check_skill_status(&registry_skill_ids) {
             Ok(status_resp) => {
                 let mut published = std::collections::HashSet::new();
                 for (skill_id, local_status) in &all_installed {
-                    if status_resp.unknown.contains(skill_id) {
+                    if status_resp.unknown.contains(skill_id) && !plugin_owned_skills.contains(skill_id) {
                         // Skill was deleted from registry — full cleanup.
+                        // Skip plugin-owned skills (local-only, not in registry).
                         match uninstall_skill(state, skill_id) {
                             Ok(Some(_)) => {
                                 info!(skill_id, "sync: skill removed from registry, uninstalled");
