@@ -1,4 +1,5 @@
 pub mod aggregator;
+pub mod backends_config;
 pub mod protocol;
 pub mod sampling;
 pub mod server;

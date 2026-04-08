@@ -463,6 +463,75 @@ impl BackendRegistry {
         Ok(count)
     }
 
+    /// Sync backends from the local `backends.yaml` config file.
+    ///
+    /// This is the standalone (no-registry) path. Local backends are loaded
+    /// and merged into the registry. When called alongside `sync()`, local
+    /// backends are additive — they do not remove registry-sourced backends.
+    ///
+    /// Returns the number of local backends loaded.
+    pub fn sync_local(&self, state: &AppState) -> Result<usize> {
+        let local_backends = crate::backends_config::load_local_backends(state)?;
+
+        if local_backends.is_empty() {
+            debug!("no local backends to sync");
+            return Ok(0);
+        }
+
+        let mut inner = self.inner.lock().unwrap();
+
+        let mut loaded = 0;
+        for conn in local_backends {
+            let server_id = conn.server_id().to_string();
+
+            // Fetch tools from the backend (best-effort).
+            let tools = self
+                .fetch_tools_from_backend(&conn)
+                .unwrap_or_else(|e| {
+                    warn!(
+                        server_id = %server_id,
+                        error = %e,
+                        "failed to fetch tools from local backend"
+                    );
+                    vec![]
+                });
+
+            // Apply budget.
+            let budget_slots = if inner.budget.has_room_for(tools.len()) {
+                inner.budget.consume(tools.len());
+                tools.len()
+            } else {
+                let remaining = inner.budget.remaining();
+                inner.budget.record_truncation(&server_id);
+                inner.budget.consume(remaining);
+                remaining
+            };
+
+            let final_tools = tools.into_iter().take(budget_slots).collect();
+            let conn_with_tools = rebuild_with_tools(conn, final_tools);
+
+            if !inner.backends.contains_key(&server_id) {
+                info!(
+                    server_id = %server_id,
+                    tools = budget_slots,
+                    "registered local backend"
+                );
+            } else {
+                debug!(
+                    server_id = %server_id,
+                    tools = budget_slots,
+                    "refreshed local backend"
+                );
+            }
+            inner.backends.insert(server_id, conn_with_tools);
+            loaded += 1;
+        }
+
+        inner.last_synced = Some(Instant::now());
+        info!(backends = loaded, "local backend sync complete");
+        Ok(loaded)
+    }
+
     /// Returns all namespaced tool definitions from all active backends,
     /// respecting tool budget limits.
     pub fn all_tools(&self) -> Vec<Value> {

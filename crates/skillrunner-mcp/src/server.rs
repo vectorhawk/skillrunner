@@ -187,11 +187,34 @@ impl ServerState {
         }
 
         let Some(registry) = &self.registry_client else {
-            return false;
+            // No registry configured — sync from local backends.yaml only
+            match self.aggregator.sync_local(app_state) {
+                Ok(_count) => {
+                    self.last_aggregator_sync = Some(Instant::now());
+                    let new_count = self.aggregator.all_tools().len();
+                    let changed = new_count != self.last_aggregated_tool_count;
+                    self.last_aggregated_tool_count = new_count;
+                    if changed {
+                        info!(
+                            tools = new_count,
+                            "local backend tool count changed — will fire list_changed"
+                        );
+                    }
+                    return changed;
+                }
+                Err(e) => {
+                    warn!(error = %e, "local backend sync failed");
+                    return false;
+                }
+            }
         };
 
         match self.aggregator.sync(app_state, registry) {
             Ok(_count) => {
+                // Also merge local backends alongside registry ones
+                if let Err(e) = self.aggregator.sync_local(app_state) {
+                    warn!(error = %e, "local backend merge after registry sync failed");
+                }
                 self.last_aggregator_sync = Some(Instant::now());
                 let new_count = self.aggregator.all_tools().len();
                 let changed = new_count != self.last_aggregated_tool_count;
