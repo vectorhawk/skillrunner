@@ -2,6 +2,16 @@ pub mod aggregator;
 pub mod backends_config;
 pub mod protocol;
 pub mod sampling;
-pub mod server;
 pub mod setup;
+
+#[cfg(feature = "registry")]
+pub mod server;
+#[cfg(feature = "registry")]
+pub mod tools;
+
+#[cfg(not(feature = "registry"))]
+#[path = "server_local.rs"]
+pub mod server;
+#[cfg(not(feature = "registry"))]
+#[path = "tools_local.rs"]
 pub mod tools;

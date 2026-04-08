@@ -1,9 +1,11 @@
 pub mod app;
+#[cfg(feature = "registry")]
 pub mod auth;
 pub mod executor;
 pub mod import;
 pub mod install;
 pub mod managed;
+#[cfg(feature = "registry")]
 pub mod mcp_governance;
 pub mod model;
 pub mod ollama;
@@ -11,8 +13,10 @@ pub mod plugin;
 pub mod plugin_export;
 pub mod plugin_import;
 pub mod policy;
+#[cfg(feature = "registry")]
 pub mod registry;
 pub mod resolver;
 pub mod state;
+#[cfg(feature = "registry")]
 pub mod updater;
 pub mod validator;

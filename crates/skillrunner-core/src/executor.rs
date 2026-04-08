@@ -1,11 +1,16 @@
 use crate::{
     model::{ModelClient, ModelRequest},
     policy::PolicyClient,
-    registry::RegistryClient,
     resolver::{resolve_skill, ResolveOutcome},
     state::AppState,
-    updater::auto_update_if_needed,
 };
+#[cfg(feature = "registry")]
+use crate::{registry::RegistryClient, updater::auto_update_if_needed};
+
+/// Stub type used when the `registry` feature is disabled.
+/// Allows `run_skill` to keep its signature without depending on `RegistryClient`.
+#[cfg(not(feature = "registry"))]
+pub struct RegistryClient;
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use rusqlite::Connection;
@@ -60,10 +65,13 @@ pub fn run_skill(
     let wall_start = std::time::Instant::now();
 
     // 0. Silent auto-update if registry is available and version is stale.
+    #[cfg(feature = "registry")]
     if let Some(registry) = registry_client {
         let policy = policy_client.fetch_policy(skill_id)?;
         auto_update_if_needed(state, registry, skill_id, &policy)?;
     }
+    #[cfg(not(feature = "registry"))]
+    let _ = registry_client;
 
     // 1. Resolve → get version and install path.
     let outcome = resolve_skill(state, policy_client, skill_id)?;

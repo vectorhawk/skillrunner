@@ -5,13 +5,17 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = ["registry"]
+registry = ["skillrunner-core/registry"]
+
 [dependencies]
 anyhow.workspace = true
 camino.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
-skillrunner-core = { path = "../skillrunner-core" }
+skillrunner-core = { path = "../skillrunner-core", default-features = false }
 skillrunner-manifest = { path = "../skillrunner-manifest" }
 rusqlite.workspace = true
 reqwest.workspace = true

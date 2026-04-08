@@ -38,19 +38,24 @@
 //! 3. Backend proxied tools, ordered by `McpServerEntry::priority` descending
 //!    (default 50 when unset)
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+#[cfg(feature = "registry")]
+use anyhow::Context;
 use serde_json::Value;
+#[cfg(feature = "registry")]
 use skillrunner_core::{
     mcp_governance::{fetch_approved_servers, McpServerEntry, McpServersResponse},
     registry::RegistryClient,
-    state::AppState,
 };
+use skillrunner_core::state::AppState;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
+#[cfg(feature = "registry")]
+use tracing::warn;
 
 // ── Tool budget ───────────────────────────────────────────────────────────────
 
@@ -186,6 +191,7 @@ pub enum ToolVisibility {
 }
 
 impl ToolVisibility {
+    #[cfg(feature = "registry")]
     fn from_entry(entry: &McpServerEntry) -> Self {
         match entry.tool_visibility.as_deref() {
             Some("curated") => {
@@ -257,6 +263,7 @@ pub(crate) struct RegistryInner {
     /// Time of the last successful sync.
     pub(crate) last_synced: Option<Instant>,
     /// Cached approved server list from the most recent successful registry fetch.
+    #[cfg(feature = "registry")]
     pub(crate) last_response: Option<McpServersResponse>,
 }
 
@@ -265,19 +272,22 @@ pub(crate) struct RegistryInner {
 #[derive(Clone)]
 pub struct BackendRegistry {
     pub(crate) inner: Arc<Mutex<RegistryInner>>,
+    #[cfg(feature = "registry")]
     http: reqwest::blocking::Client,
 }
 
 impl BackendRegistry {
-    /// Create a new, empty registry. Call `sync()` to populate it.
+    /// Create a new, empty registry. Call `sync()` or `sync_local()` to populate it.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(RegistryInner {
                 backends: HashMap::new(),
                 budget: ToolBudget::new(),
                 last_synced: None,
+                #[cfg(feature = "registry")]
                 last_response: None,
             })),
+            #[cfg(feature = "registry")]
             http: reqwest::blocking::Client::builder()
                 .connect_timeout(Duration::from_secs(3))
                 .timeout(Duration::from_secs(10))
@@ -294,6 +304,7 @@ impl BackendRegistry {
     /// - Existing servers are refreshed if their config changed.
     ///
     /// Returns the number of backends now active.
+    #[cfg(feature = "registry")]
     pub fn sync(&self, state: &AppState, registry_client: &RegistryClient) -> Result<usize> {
         let response = fetch_approved_servers(state, registry_client)?;
 
@@ -485,6 +496,10 @@ impl BackendRegistry {
             let server_id = conn.server_id().to_string();
 
             // Fetch tools from the backend (best-effort).
+            // When the registry feature is disabled, we skip HTTP tool fetching
+            // and register backends with empty tool lists (they'll be populated
+            // when the client sends tools/list to a running stdio process).
+            #[cfg(feature = "registry")]
             let tools = self
                 .fetch_tools_from_backend(&conn)
                 .unwrap_or_else(|e| {
@@ -495,6 +510,8 @@ impl BackendRegistry {
                     );
                     vec![]
                 });
+            #[cfg(not(feature = "registry"))]
+            let tools: Vec<ToolDefinition> = vec![];
 
             // Apply budget.
             let budget_slots = if inner.budget.has_room_for(tools.len()) {
@@ -566,6 +583,7 @@ impl BackendRegistry {
     ///
     /// Returns `None` if the tool name does not match any registered backend
     /// (i.e. it should be handled by the skill/governance layer instead).
+    #[allow(unused_variables)] // args used only with registry feature
     pub fn dispatch(&self, namespaced_tool: &str, args: &Value) -> Option<Result<Value>> {
         let (server_id, original_tool) = parse_tool_name(namespaced_tool)?;
 
@@ -583,8 +601,16 @@ impl BackendRegistry {
         }
 
         let result = match backend {
+            #[cfg(feature = "registry")]
             BackendConnection::Http(http) => {
                 self.call_http_tool(&http.url, original_tool, args, http.auth_token.as_deref())
+            }
+            #[cfg(not(feature = "registry"))]
+            BackendConnection::Http(_) => {
+                Err(anyhow::anyhow!(
+                    "HTTP backend dispatch requires the 'registry' feature for '{}'",
+                    server_id
+                ))
             }
             BackendConnection::Stdio(_stdio) => {
                 // Stdio dispatch is stubbed — full child-process management
@@ -664,6 +690,7 @@ impl BackendRegistry {
 
     /// Attempt to fetch the tool list from a backend's MCP endpoint.
     /// Returns an empty vec on any transport error (graceful degradation).
+    #[cfg(feature = "registry")]
     fn fetch_tools_from_backend(&self, conn: &BackendConnection) -> Result<Vec<ToolDefinition>> {
         match conn {
             BackendConnection::Http(http) => {
@@ -721,6 +748,7 @@ impl BackendRegistry {
     }
 
     /// Call a tool on an HTTP backend and return the result.
+    #[cfg(feature = "registry")]
     fn call_http_tool(&self, base_url: &str, tool_name: &str, args: &Value, auth_token: Option<&str>) -> Result<Value> {
         // MCP Streamable HTTP: POST JSON-RPC to the endpoint URL directly.
         let call_url = base_url.trim_end_matches('/').to_string();
@@ -802,6 +830,7 @@ pub fn parse_tool_name(namespaced: &str) -> Option<(&str, &str)> {
 
 /// Derive the effective server_id for an entry: use `server_id` field if
 /// present, otherwise fall back to a sanitised version of `name`.
+#[cfg(feature = "registry")]
 fn effective_server_id(entry: &McpServerEntry) -> String {
     entry
         .server_id
@@ -820,6 +849,7 @@ pub fn sanitize_id(name: &str) -> String {
 }
 
 /// Extract command and args from a stdio McpServerEntry's server_config.
+#[cfg(feature = "registry")]
 fn extract_stdio_command(entry: &McpServerEntry) -> (String, Vec<String>) {
     if let Some(config) = &entry.server_config {
         let command = config

@@ -1731,6 +1731,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "serde_yaml",
  "skillrunner-core",
  "skillrunner-manifest",
  "tempfile",
