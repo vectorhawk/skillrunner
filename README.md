@@ -1,129 +1,199 @@
 # SkillRunner
 
-The local runtime for [SkillClub](https://skillclub.ai) skills. Installs, validates, resolves, and executes portable AI skills on macOS — locally, privately, and under your organization's policy.
+A local runtime for portable AI skills and an MCP aggregator that connects your AI coding tools to every backend they need.
 
-## Installation
+SkillRunner sits between your AI client (Claude Code, Cursor, Windsurf, VS Code, Gemini CLI) and the MCP servers you depend on. It manages tool namespacing, enforces a tool budget so clients don't choke, and lets you define your entire backend stack in a single `backends.yaml` file.
 
-### Homebrew (recommended)
+It also has its own skill format -- portable, versioned bundles of prompts and workflows that execute locally via Ollama or delegate to MCP sampling.
+
+## Install
+
+### Homebrew
 
 ```bash
 brew install skillclub/tap/skillrunner
 ```
 
-> The Homebrew tap is coming soon. Star this repo to be notified.
+### Pre-built binaries
 
-### Download a pre-built binary
-
-Signed binaries for macOS `arm64` and `x86_64` are published with each release.
+Binaries for macOS (arm64, x86_64) and Linux (x86_64, arm64) are attached to each [GitHub release](https://github.com/skillclub/skillrunner/releases).
 
 ```bash
-# Apple Silicon
-curl -L https://releases.skillclub.ai/skillrunner/latest/skillrunner-aarch64-apple-darwin \
-  -o /usr/local/bin/skillrunner && chmod +x /usr/local/bin/skillrunner
-
-# Intel
-curl -L https://releases.skillclub.ai/skillrunner/latest/skillrunner-x86_64-apple-darwin \
-  -o /usr/local/bin/skillrunner && chmod +x /usr/local/bin/skillrunner
+# macOS Apple Silicon
+curl -L https://github.com/skillclub/skillrunner/releases/latest/download/skillrunner-aarch64-apple-darwin.tar.gz | tar xz
+sudo mv skillrunner /usr/local/bin/
 ```
-
-Verify your download:
-```bash
-skillrunner doctor
-```
-
-### Enterprise / MDM deployment
-
-For IT teams deploying to a fleet:
-
-- A signed `.pkg` installer is available per release — suitable for deployment via Jamf, Mosyle, or Kandji.
-- The binary installs to `/usr/local/bin/skillrunner` and stores state under `~/Library/Application Support/SkillClub/SkillRunner/`.
-- Set `SKILLCLUB_REGISTRY_URL` in your managed environment profile to point all users at your organization's private registry.
 
 ### Build from source
 
-Requires [Rust](https://rustup.rs) 1.75+.
+Requires Rust 1.75+.
 
 ```bash
-git clone https://github.com/skillclub/skillrunner
+git clone https://github.com/skillclub/skillrunner.git
 cd skillrunner
 cargo build --release
 cp target/release/skillrunner /usr/local/bin/
 ```
 
-Or via `cargo install`:
-```bash
-cargo install --git https://github.com/skillclub/skillrunner skillrunner-cli
-```
-
----
-
-## Requirements
-
-- macOS 13+ (`arm64` or `x86_64`)
-- [Ollama](https://ollama.ai) running locally (for `llm` step execution)
-
-```bash
-# Pull a model before running skills
-ollama pull llama3.2
-```
-
----
-
 ## Quick start
 
 ```bash
-# Verify installation
+# Check your setup
 skillrunner doctor
 
-# Install a skill
-skillrunner skill install ./examples/skills/contract-compare
+# Set up SkillRunner as an MCP server for your AI clients
+skillrunner mcp setup
 
-# Run it
-echo '{"doc_a": "Payment due Jan 1.", "doc_b": "Payment due Mar 1."}' > /tmp/input.json
-skillrunner skill run contract-compare --input /tmp/input.json
-
-# Run without a model (stub mode, for testing)
-skillrunner skill run contract-compare --input /tmp/input.json --stub
+# Start the MCP server (usually managed by your AI client after setup)
+skillrunner mcp serve
 ```
 
+## MCP aggregator
+
+The aggregator is the main reason to use SkillRunner. It proxies multiple MCP backend servers through a single stdio connection, with automatic tool namespacing to prevent collisions:
+
+```
+github__create_issue     <- GitHub MCP server
+sentry__search_issues    <- Sentry MCP server
+playwright__screenshot   <- Playwright MCP server
+```
+
+### Configure backends
+
+Create `~/Library/Application Support/SkillClub/SkillRunner/backends.yaml`:
+
+```yaml
+backends:
+  - name: GitHub
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_TOKEN: "ghp_xxxx"
+
+  - name: Sentry
+    server_id: sentry
+    transport: http
+    url: http://localhost:3001/mcp
+    priority: 60
+
+  - name: Playwright
+    transport: stdio
+    command: npx
+    args: ["-y", "@anthropic-ai/mcp-server-playwright"]
+```
+
+Each backend entry supports:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | yes | Display name |
+| `transport` | yes | `stdio` or `http` |
+| `command` | stdio | Command to run |
+| `args` | stdio | Command arguments |
+| `env` | stdio | Environment variables |
+| `url` | http | Server URL |
+| `server_id` | no | Override the auto-generated ID used for namespacing |
+| `priority` | no | Higher = more important when the tool budget is tight (default: 50) |
+
+### Tool budget
+
+AI clients like Cursor and Windsurf cap tools at 100. SkillRunner enforces this limit, allocating slots by priority and truncating lower-priority backends when the budget runs out.
+
+### AI client setup
+
+```bash
+# Auto-detect and configure all supported clients
+skillrunner mcp setup
+
+# Configure a specific client
+skillrunner mcp setup --client claude
+skillrunner mcp setup --client cursor
+```
+
+Supported clients: Claude Code, Cursor, Windsurf, VS Code (Copilot), Gemini CLI.
+
+## Skills
+
+Skills are portable AI tool bundles -- a directory containing a manifest, workflow, prompts, and schemas.
+
+### Author a skill from a prompt
+
+The fastest way to create a skill:
+
+```bash
+skillrunner skill import ./my-skill.md
+```
+
+Where `my-skill.md` is a Markdown file with YAML frontmatter:
+
+```markdown
+---
+id: code-reviewer
+version: 0.1.0
+publisher: yourname
+model: llama3.2
 ---
 
-## Commands
+You are a senior code reviewer. Analyze the provided code diff and return
+structured feedback covering correctness, performance, and style issues.
+```
 
-| Command | Description |
-|---|---|
-| `skillrunner doctor` | Verify runtime state and paths |
-| `skillrunner skill install <path>` | Install a skill bundle from a local directory |
-| `skillrunner skill import <SKILL.md>` | Scaffold a skill bundle from a Markdown file |
-| `skillrunner skill list` | List all installed skills |
-| `skillrunner skill info <path>` | Show metadata for a skill bundle |
-| `skillrunner skill validate <path>` | Validate a skill bundle without installing |
-| `skillrunner skill resolve <skill-id>` | Check install status and policy for a skill |
-| `skillrunner skill run <skill-id> --input <file>` | Execute a skill with a JSON input file |
+This scaffolds a complete skill bundle with manifest, workflow, prompt, and schemas.
 
-**`skill run` flags:**
+### Run a skill
 
-| Flag | Default | Description |
-|---|---|---|
-| `--input <file>` | _(required)_ | JSON input file |
-| `--stub` | off | Skip model calls; trace execution without LLM |
-| `--model <name>` | `llama3.2` | Ollama model to use |
-| `--ollama-url <url>` | `http://localhost:11434` | Ollama base URL |
-| `--registry-url <url>` | _(env var)_ | Override registry for policy and auto-update |
+```bash
+# With a local model (requires Ollama)
+echo '{"diff": "..."}' > input.json
+skillrunner skill run code-reviewer --input input.json
 
-Set `SKILLCLUB_REGISTRY_URL` in your environment to connect to your organization's registry without passing `--registry-url` on every command.
+# Without a model (stub mode, for testing the workflow)
+skillrunner skill run code-reviewer --input input.json --stub
+```
 
----
+### Skill bundle structure
 
-## Workspace
+```
+my-skill/
+  manifest.json     # id, version, publisher, permissions, model requirements
+  workflow.yaml     # ordered steps: llm, tool, transform, validate
+  schemas/
+    inputs.json     # JSON Schema for input validation
+    outputs.json    # JSON Schema for output validation
+  prompts/
+    system.txt      # prompt templates referenced by workflow steps
+```
+
+### Manage skills
+
+```bash
+skillrunner skill list                    # list installed skills
+skillrunner skill install ./path/to/skill # install from local directory
+skillrunner skill validate ./path/to/skill # validate without installing
+skillrunner skill resolve my-skill        # check install status and policy
+```
+
+## Architecture
+
+Four-crate Rust workspace:
 
 | Crate | Role |
-|---|---|
-| `skillrunner-cli` | User-facing CLI binary |
-| `skillrunner-core` | App state, executor, policy, resolver, installer |
-| `skillrunner-manifest` | Skill manifest, workflow, and schema parsing |
+|-------|------|
+| `skillrunner-cli` | User-facing CLI (clap) |
+| `skillrunner-core` | State management, installer, resolver, executor, policy, Ollama client |
+| `skillrunner-manifest` | Skill bundle parsing and validation (pure data, no I/O) |
+| `skillrunner-mcp` | MCP server, aggregator, AI client setup, tool dispatch |
 
----
+### Feature flags
+
+The `registry` feature (default: on) enables SkillClub registry integration -- auth, remote policy, auto-updates, governance tools. Disable it to build a fully standalone binary:
+
+```bash
+# Library crates compile without registry support
+cargo build -p skillrunner-core --no-default-features
+cargo build -p skillrunner-mcp --no-default-features
+```
 
 ## Development
 
@@ -133,3 +203,12 @@ cargo test
 cargo clippy
 cargo run -p skillrunner-cli -- doctor
 ```
+
+## Requirements
+
+- macOS 13+ or Linux (x86_64, arm64)
+- [Ollama](https://ollama.ai) for local LLM execution (optional -- skills can also delegate via MCP sampling)
+
+## License
+
+Apache 2.0. See [LICENSE](LICENSE).
