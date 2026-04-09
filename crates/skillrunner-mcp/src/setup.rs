@@ -154,7 +154,7 @@ pub fn configure_client(
 
     let mut env = json!({});
     if let Some(url) = registry_url {
-        env["SKILLCLUB_REGISTRY_URL"] = json!(url);
+        env["VECTORHAWK_REGISTRY_URL"] = json!(url);
     }
 
     mcp_servers["skillrunner"] = json!({
@@ -817,7 +817,7 @@ mod tests {
         configure_client(
             &client,
             "/usr/local/bin/skillrunner",
-            &Some("https://registry.skillclub.ai".to_string()),
+            &Some("https://vectorhawk.ai/registry".to_string()),
         )
         .unwrap();
 
@@ -831,8 +831,8 @@ mod tests {
         assert_eq!(content["mcpServers"]["skillrunner"]["args"][0], "mcp");
         assert_eq!(content["mcpServers"]["skillrunner"]["args"][1], "serve");
         assert_eq!(
-            content["mcpServers"]["skillrunner"]["env"]["SKILLCLUB_REGISTRY_URL"],
-            "https://registry.skillclub.ai"
+            content["mcpServers"]["skillrunner"]["env"]["VECTORHAWK_REGISTRY_URL"],
+            "https://vectorhawk.ai/registry"
         );
 
         let _ = fs::remove_dir_all(tmp.as_str());
@@ -1056,7 +1056,7 @@ mod tests {
             "/usr/local/bin/skillrunner"
         );
         assert_eq!(
-            content["mcpServers"]["skillrunner"]["env"]["SKILLCLUB_REGISTRY_URL"],
+            content["mcpServers"]["skillrunner"]["env"]["VECTORHAWK_REGISTRY_URL"],
             "https://registry.test.com"
         );
 

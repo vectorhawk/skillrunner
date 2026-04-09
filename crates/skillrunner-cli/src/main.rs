@@ -40,7 +40,7 @@ enum Commands {
         /// Ollama base URL (default: http://localhost:11434)
         #[arg(long, default_value = "http://localhost:11434")]
         ollama_url: String,
-        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        /// VectorHawk registry URL (overrides VECTORHAWK_REGISTRY_URL)
         #[arg(long)]
         registry_url: Option<String>,
     },
@@ -68,7 +68,7 @@ enum Commands {
 enum McpCommands {
     /// Start the MCP server (stdio transport)
     Serve {
-        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        /// VectorHawk registry URL (overrides VECTORHAWK_REGISTRY_URL)
         #[arg(long)]
         registry_url: Option<String>,
         /// Ollama base URL (default: http://localhost:11434)
@@ -80,7 +80,7 @@ enum McpCommands {
     },
     /// Configure SkillRunner as an MCP server for detected AI clients
     Setup {
-        /// SkillClub registry URL to configure
+        /// VectorHawk registry URL to configure
         #[arg(long)]
         registry_url: Option<String>,
         /// Which client to configure (claude, cursor, all)
@@ -92,13 +92,13 @@ enum McpCommands {
     },
     /// Show aggregator backend status (approved servers from registry)
     Backends {
-        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        /// VectorHawk registry URL (overrides VECTORHAWK_REGISTRY_URL)
         #[arg(long)]
         registry_url: Option<String>,
     },
     /// Manually trigger a skill sync (check for updates, lifecycle changes)
     Sync {
-        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        /// VectorHawk registry URL (overrides VECTORHAWK_REGISTRY_URL)
         #[arg(long)]
         registry_url: Option<String>,
     },
@@ -108,7 +108,7 @@ enum McpCommands {
 enum AuthCommands {
     /// Log in to the SkillClub registry
     Login {
-        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        /// VectorHawk registry URL (overrides VECTORHAWK_REGISTRY_URL)
         #[arg(long)]
         registry_url: Option<String>,
         /// Email address
@@ -120,13 +120,13 @@ enum AuthCommands {
     },
     /// Log out from the SkillClub registry
     Logout {
-        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        /// VectorHawk registry URL (overrides VECTORHAWK_REGISTRY_URL)
         #[arg(long)]
         registry_url: Option<String>,
     },
     /// Show current authentication status
     Status {
-        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        /// VectorHawk registry URL (overrides VECTORHAWK_REGISTRY_URL)
         #[arg(long)]
         registry_url: Option<String>,
     },
@@ -139,7 +139,7 @@ enum SkillCommands {
     },
     Search {
         query: String,
-        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        /// VectorHawk registry URL (overrides VECTORHAWK_REGISTRY_URL)
         #[arg(long)]
         registry_url: Option<String>,
     },
@@ -153,7 +153,7 @@ enum SkillCommands {
         /// Specific version to install from registry (default: latest)
         #[arg(long)]
         version: Option<String>,
-        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        /// VectorHawk registry URL (overrides VECTORHAWK_REGISTRY_URL)
         #[arg(long)]
         registry_url: Option<String>,
     },
@@ -161,7 +161,7 @@ enum SkillCommands {
     Publish {
         /// Path to the skill directory to publish
         path: Utf8PathBuf,
-        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        /// VectorHawk registry URL (overrides VECTORHAWK_REGISTRY_URL)
         #[arg(long)]
         registry_url: Option<String>,
     },
@@ -186,7 +186,7 @@ enum SkillCommands {
         /// Skip model invocation and use stub execution
         #[arg(long)]
         stub: bool,
-        /// SkillClub registry URL for policy fetch and auto-update (overrides SKILLCLUB_REGISTRY_URL)
+        /// VectorHawk registry URL for policy fetch and auto-update (overrides VECTORHAWK_REGISTRY_URL)
         #[arg(long)]
         registry_url: Option<String>,
     },
@@ -223,7 +223,7 @@ enum PluginCommands {
     Search {
         /// Search query
         query: Option<String>,
-        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        /// VectorHawk registry URL (overrides VECTORHAWK_REGISTRY_URL)
         #[arg(long)]
         registry_url: Option<String>,
     },
@@ -231,7 +231,7 @@ enum PluginCommands {
     Publish {
         /// Path to the plugin directory
         path: Utf8PathBuf,
-        /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
+        /// VectorHawk registry URL (overrides VECTORHAWK_REGISTRY_URL)
         #[arg(long)]
         registry_url: Option<String>,
     },
@@ -601,7 +601,7 @@ fn main() -> Result<()> {
                 let url = resolve_registry_url(registry_url, managed_registry_url.as_deref());
                 match url {
                     None => {
-                        println!("No registry URL configured. Pass --registry-url or set SKILLCLUB_REGISTRY_URL.");
+                        println!("No registry URL configured. Pass --registry-url or set VECTORHAWK_REGISTRY_URL.");
                     }
                     Some(url) => {
                         let registry = RegistryClient::new(&url);
@@ -1235,8 +1235,11 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Default registry URL for release builds.
+const DEFAULT_REGISTRY_URL: &str = "https://vectorhawk.ai/registry";
+
 fn registry_url_from_env() -> Option<String> {
-    std::env::var("SKILLCLUB_REGISTRY_URL")
+    std::env::var("VECTORHAWK_REGISTRY_URL")
         .ok()
         .filter(|s| !s.is_empty())
 }
@@ -1244,18 +1247,20 @@ fn registry_url_from_env() -> Option<String> {
 /// Resolve the effective registry URL using priority order:
 /// 1. managed.json registry_url (IT override, already resolved before call)
 /// 2. --registry-url CLI flag
-/// 3. SKILLCLUB_REGISTRY_URL env var
+/// 3. VECTORHAWK_REGISTRY_URL env var
+/// 4. Built-in default (https://vectorhawk.ai/registry)
 fn resolve_registry_url(flag: Option<String>, managed_url: Option<&str>) -> Option<String> {
     managed_url
         .map(|s| s.to_string())
         .or(flag)
         .or_else(registry_url_from_env)
+        .or_else(|| Some(DEFAULT_REGISTRY_URL.to_string()))
 }
 
 fn require_registry_url(flag: Option<String>, managed_url: Option<&str>) -> Result<String> {
     resolve_registry_url(flag, managed_url).ok_or_else(|| {
         anyhow::anyhow!(
-            "no registry URL configured; set SKILLCLUB_REGISTRY_URL or use --registry-url"
+            "no registry URL configured; set VECTORHAWK_REGISTRY_URL or use --registry-url"
         )
     })
 }

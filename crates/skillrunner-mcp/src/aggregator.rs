@@ -386,7 +386,7 @@ impl BackendRegistry {
                 // configuration or local stdio setup.
                 // For gateway-routed backends, rewrite the gateway_url to use
                 // the local registry base URL (the one the user configured via
-                // --registry-url / SKILLCLUB_REGISTRY_URL). The API may return a
+                // --registry-url / VECTORHAWK_REGISTRY_URL). The API may return a
                 // public URL that isn't reachable from this machine.
                 let url = if transport == "gateway" {
                     entry.gateway_url.as_ref().and_then(|gw_url| {
