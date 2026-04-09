@@ -892,18 +892,32 @@ fn main() -> Result<()> {
 
                 let effective_url =
                     resolve_registry_url(registry_url, managed_registry_url.as_deref());
-                let result = if let Some(url) = effective_url {
-                    let registry = RegistryClient::new(&url);
-                    let http_policy = HttpPolicyClient::new(RegistryClient::new(&url), &app.state);
-                    run_skill(
-                        &app.state,
-                        &http_policy,
-                        &skill_id,
-                        &input_json,
-                        model_client,
-                        Some(&registry),
-                    )?
+                let result = if !stub {
+                    if let Some(url) = effective_url {
+                        let registry = RegistryClient::new(&url);
+                        let http_policy =
+                            HttpPolicyClient::new(RegistryClient::new(&url), &app.state);
+                        run_skill(
+                            &app.state,
+                            &http_policy,
+                            &skill_id,
+                            &input_json,
+                            model_client,
+                            Some(&registry),
+                        )?
+                    } else {
+                        let policy_client = MockPolicyClient::new();
+                        run_skill(
+                            &app.state,
+                            &policy_client,
+                            &skill_id,
+                            &input_json,
+                            model_client,
+                            None,
+                        )?
+                    }
                 } else {
+                    // Stub mode: skip registry policy, use allow-all mock
                     let policy_client = MockPolicyClient::new();
                     run_skill(
                         &app.state,

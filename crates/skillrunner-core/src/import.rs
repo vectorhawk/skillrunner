@@ -14,7 +14,10 @@ pub struct ScaffoldedBundle {
 /// YAML frontmatter block parsed from the top of a SKILL.md file.
 #[derive(Debug, Deserialize)]
 struct SkillMdFrontmatter {
-    name: String,
+    /// Display name. If omitted, derived from `id`.
+    name: Option<String>,
+    /// Optional skill ID. If omitted, derived from `name`.
+    id: Option<String>,
     description: Option<String>,
     license: Option<String>,
     #[serde(default)]
@@ -38,8 +41,22 @@ pub fn import_skill_md(skill_md_path: &Utf8Path) -> Result<ScaffoldedBundle> {
         .ok_or_else(|| anyhow::anyhow!("SKILL.md has no parent directory"))?
         .to_path_buf();
 
-    let id = to_skill_id(&frontmatter.name);
-    let files = scaffold_bundle(&output_dir, &id, &frontmatter, body.trim())?;
+    // Derive id and name from each other if one is missing.
+    let (id, display_name) = match (&frontmatter.id, &frontmatter.name) {
+        (Some(id), Some(name)) => (id.clone(), name.clone()),
+        (Some(id), None) => {
+            let name = id.replace('-', " ");
+            (id.clone(), name)
+        }
+        (None, Some(name)) => {
+            let id = to_skill_id(name);
+            (id, name.clone())
+        }
+        (None, None) => {
+            anyhow::bail!("SKILL.md frontmatter must include at least `name` or `id`");
+        }
+    };
+    let files = scaffold_bundle(&output_dir, &id, &display_name, &frontmatter, body.trim())?;
 
     Ok(ScaffoldedBundle {
         id,
@@ -98,6 +115,7 @@ fn to_skill_id(name: &str) -> String {
 fn scaffold_bundle(
     dir: &Utf8Path,
     id: &str,
+    display_name: &str,
     frontmatter: &SkillMdFrontmatter,
     system_prompt: &str,
 ) -> Result<Vec<String>> {
@@ -109,10 +127,10 @@ fn scaffold_bundle(
     // System prompt body
     write_file(dir, "prompts/system.txt", system_prompt, &mut written)?;
 
-    // Input schema: a single required `requirements` string
+    // Input schema: a single required `input` string
     write_file(dir, "schemas/input.schema.json", INPUT_SCHEMA, &mut written)?;
 
-    // Output schema: required `code` string, optional `notes`
+    // Output schema: required `result` string, optional `notes`
     write_file(
         dir,
         "schemas/output.schema.json",
@@ -128,13 +146,13 @@ fn scaffold_bundle(
          \x20   type: llm\n\
          \x20   prompt: prompts/system.txt\n\
          \x20   inputs:\n\
-         \x20     requirements: input.requirements\n\
+         \x20     input: input.input\n\
          \x20   output_schema: schemas/output.schema.json\n"
     );
     write_file(dir, "workflow.yaml", &workflow, &mut written)?;
 
     // Manifest
-    let manifest = build_manifest_json(id, frontmatter);
+    let manifest = build_manifest_json(id, display_name, frontmatter);
     write_file(dir, "manifest.json", &manifest, &mut written)?;
 
     Ok(written)
@@ -147,10 +165,10 @@ fn write_file(dir: &Utf8Path, rel: &str, content: &str, log: &mut Vec<String>) -
     Ok(())
 }
 
-fn build_manifest_json(id: &str, fm: &SkillMdFrontmatter) -> String {
+fn build_manifest_json(id: &str, display_name: &str, fm: &SkillMdFrontmatter) -> String {
     let description = fm.description.as_deref().unwrap_or("");
     let description = if description.is_empty() {
-        format!("A skill that helps with {}", fm.name.to_lowercase())
+        format!("A skill that helps with {}", display_name.to_lowercase())
     } else {
         description.to_string()
     };
@@ -167,7 +185,7 @@ fn build_manifest_json(id: &str, fm: &SkillMdFrontmatter) -> String {
 
     // Auto-generate triggers from description when none are provided
     let triggers = if fm.triggers.is_empty() {
-        generate_triggers_from_description(fm.description.as_deref().unwrap_or(""), &fm.name)
+        generate_triggers_from_description(fm.description.as_deref().unwrap_or(""), display_name)
     } else {
         fm.triggers.clone()
     };
@@ -210,7 +228,7 @@ fn build_manifest_json(id: &str, fm: &SkillMdFrontmatter) -> String {
     "auto_update": true
   }}
 }}"#,
-        name = serde_json::to_string(&fm.name).expect("name is valid JSON string"),
+        name = serde_json::to_string(display_name).expect("name is valid JSON string"),
         description =
             serde_json::to_string(&description).expect("description is valid JSON string"),
     )
@@ -280,11 +298,11 @@ pub fn generate_triggers_from_description(description: &str, name: &str) -> Vec<
 const INPUT_SCHEMA: &str = r#"{
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
-  "required": ["requirements"],
+  "required": ["input"],
   "properties": {
-    "requirements": {
+    "input": {
       "type": "string",
-      "description": "Description of the frontend component, page, or application to build."
+      "description": "The input to pass to the skill."
     }
   },
   "additionalProperties": false
@@ -293,15 +311,15 @@ const INPUT_SCHEMA: &str = r#"{
 const OUTPUT_SCHEMA: &str = r#"{
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
-  "required": ["code"],
+  "required": ["result"],
   "properties": {
-    "code": {
+    "result": {
       "type": "string",
-      "description": "Generated frontend code."
+      "description": "The skill's output."
     },
     "notes": {
       "type": "string",
-      "description": "Optional design rationale or implementation notes."
+      "description": "Optional notes or additional context."
     }
   },
   "additionalProperties": false

@@ -22,6 +22,12 @@ Binaries for macOS (arm64, x86_64) and Linux (x86_64, arm64) are attached to eac
 # macOS Apple Silicon
 curl -L https://github.com/vectorhawk/skillrunner/releases/latest/download/skillrunner-aarch64-apple-darwin.tar.gz | tar xz
 sudo mv skillrunner /usr/local/bin/
+
+# Linux x86_64
+curl -L https://github.com/vectorhawk/skillrunner/releases/latest/download/skillrunner-x86_64-unknown-linux-gnu.tar.gz | tar xz
+mkdir -p ~/.local/bin && mv skillrunner ~/.local/bin/
+# Ensure ~/.local/bin is on your PATH:
+# echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
 ```
 
 ### Build from source
