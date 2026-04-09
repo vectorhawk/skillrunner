@@ -38,7 +38,6 @@
 //! 3. Backend proxied tools, ordered by `McpServerEntry::priority` descending
 //!    (default 50 when unset)
 
-#[cfg(feature = "registry")]
 use anyhow::Context;
 use anyhow::Result;
 use serde_json::Value;
