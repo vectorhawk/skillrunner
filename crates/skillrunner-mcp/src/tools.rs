@@ -867,31 +867,15 @@ fn handle_author(arguments: &serde_json::Value) -> ToolCallResult {
 
     let skill_md = format!("{frontmatter}\n{system_prompt}\n");
 
-    // Derive skill ID for the subdirectory name
-    let skill_id: String = name
-        .to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .split('-')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("-");
+    let out = Utf8PathBuf::from(output_dir);
 
-    let skill_dir = Utf8PathBuf::from(output_dir).join(&skill_id);
-
-    // Create directory and write SKILL.md
-    if let Err(e) = fs::create_dir_all(&skill_dir) {
-        return ToolCallResult::error(format!("Failed to create directory {skill_dir}: {e}"));
+    // Create output directory and write SKILL.md there.
+    // import_skill_md will create the skill-id subdirectory.
+    if let Err(e) = fs::create_dir_all(&out) {
+        return ToolCallResult::error(format!("Failed to create directory {out}: {e}"));
     }
 
-    let skill_md_path = skill_dir.join("SKILL.md");
+    let skill_md_path = out.join("SKILL.md");
     if let Err(e) = fs::write(&skill_md_path, &skill_md) {
         return ToolCallResult::error(format!("Failed to write SKILL.md: {e}"));
     }

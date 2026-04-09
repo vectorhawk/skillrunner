@@ -19,6 +19,7 @@ struct SkillMdFrontmatter {
     /// Optional skill ID. If omitted, derived from `name`.
     id: Option<String>,
     description: Option<String>,
+    publisher: Option<String>,
     license: Option<String>,
     #[serde(default)]
     triggers: Vec<String>,
@@ -36,12 +37,8 @@ pub fn import_skill_md(skill_md_path: &Utf8Path) -> Result<ScaffoldedBundle> {
     let (frontmatter, body) = parse_frontmatter(&content)
         .with_context(|| format!("failed to parse frontmatter in {skill_md_path}"))?;
 
-    let output_dir = skill_md_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("SKILL.md has no parent directory"))?
-        .to_path_buf();
-
-    // Derive id and name from each other if one is missing.
+    // Derive id and name first so we can use id for the output directory.
+    //
     let (id, display_name) = match (&frontmatter.id, &frontmatter.name) {
         (Some(id), Some(name)) => (id.clone(), name.clone()),
         (Some(id), None) => {
@@ -56,6 +53,12 @@ pub fn import_skill_md(skill_md_path: &Utf8Path) -> Result<ScaffoldedBundle> {
             anyhow::bail!("SKILL.md frontmatter must include at least `name` or `id`");
         }
     };
+
+    // Create a subdirectory named after the skill ID next to the source file.
+    let parent = skill_md_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("SKILL.md has no parent directory"))?;
+    let output_dir = parent.join(&id);
     let files = scaffold_bundle(&output_dir, &id, &display_name, &frontmatter, body.trim())?;
 
     Ok(ScaffoldedBundle {
@@ -208,7 +211,7 @@ fn build_manifest_json(id: &str, display_name: &str, fm: &SkillMdFrontmatter) ->
   "id": "{id}",
   "name": {name},
   "version": "0.1.0",
-  "publisher": "skillclub",
+  "publisher": {publisher},
   "description": {description},{license_line}{triggers_line}{offload_line}
   "entrypoint": "workflow.yaml",
   "inputs_schema": "schemas/input.schema.json",
@@ -229,6 +232,8 @@ fn build_manifest_json(id: &str, display_name: &str, fm: &SkillMdFrontmatter) ->
   }}
 }}"#,
         name = serde_json::to_string(display_name).expect("name is valid JSON string"),
+        publisher = serde_json::to_string(fm.publisher.as_deref().unwrap_or("local"))
+            .expect("publisher is valid JSON string"),
         description =
             serde_json::to_string(&description).expect("description is valid JSON string"),
     )
@@ -371,11 +376,12 @@ It can span multiple lines.
         let result = import_skill_md(&path).expect("import should succeed");
 
         assert_eq!(result.id, "my-skill");
-        assert!(dir.join("manifest.json").exists());
-        assert!(dir.join("workflow.yaml").exists());
-        assert!(dir.join("prompts/system.txt").exists());
-        assert!(dir.join("schemas/input.schema.json").exists());
-        assert!(dir.join("schemas/output.schema.json").exists());
+        let out = &result.output_dir;
+        assert!(out.join("manifest.json").exists());
+        assert!(out.join("workflow.yaml").exists());
+        assert!(out.join("prompts/system.txt").exists());
+        assert!(out.join("schemas/input.schema.json").exists());
+        assert!(out.join("schemas/output.schema.json").exists());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -385,9 +391,9 @@ It can span multiple lines.
         let dir = temp_dir("prompt");
         let path = write_skill_md(&dir, SAMPLE_SKILL_MD);
 
-        import_skill_md(&path).unwrap();
+        let result = import_skill_md(&path).unwrap();
 
-        let body = fs::read_to_string(dir.join("prompts/system.txt")).unwrap();
+        let body = fs::read_to_string(result.output_dir.join("prompts/system.txt")).unwrap();
         assert!(body.contains("This is the system prompt body."));
 
         let _ = fs::remove_dir_all(&dir);
@@ -398,9 +404,9 @@ It can span multiple lines.
         let dir = temp_dir("manifest");
         let path = write_skill_md(&dir, SAMPLE_SKILL_MD);
 
-        import_skill_md(&path).unwrap();
+        let result = import_skill_md(&path).unwrap();
 
-        let manifest_text = fs::read_to_string(dir.join("manifest.json")).unwrap();
+        let manifest_text = fs::read_to_string(result.output_dir.join("manifest.json")).unwrap();
         assert!(manifest_text.contains("\"id\": \"my-skill\""));
         assert!(manifest_text.contains("\"description\": \"Does something cool.\""));
         assert!(manifest_text.contains("\"license\": \"MIT\""));
@@ -415,9 +421,9 @@ It can span multiple lines.
         let dir = temp_dir("roundtrip");
         let path = write_skill_md(&dir, SAMPLE_SKILL_MD);
 
-        import_skill_md(&path).unwrap();
+        let result = import_skill_md(&path).unwrap();
 
-        let pkg = SkillPackage::load_from_dir(&dir)
+        let pkg = SkillPackage::load_from_dir(&result.output_dir)
             .expect("generated bundle should pass SkillPackage validation");
         assert_eq!(pkg.manifest.id, "my-skill");
         assert_eq!(pkg.workflow.steps.len(), 1);
@@ -491,9 +497,9 @@ description: Compare two contracts and summarize changes.
 You are a contract analysis expert.
 ";
         let path = write_skill_md(&dir, skill_md);
-        import_skill_md(&path).unwrap();
+        let result = import_skill_md(&path).unwrap();
 
-        let manifest_text = fs::read_to_string(dir.join("manifest.json")).unwrap();
+        let manifest_text = fs::read_to_string(result.output_dir.join("manifest.json")).unwrap();
         assert!(
             manifest_text.contains("\"triggers\""),
             "manifest should contain auto-generated triggers, got:\n{manifest_text}"
@@ -517,9 +523,9 @@ triggers:
 System prompt here.
 ";
         let path = write_skill_md(&dir, skill_md);
-        import_skill_md(&path).unwrap();
+        let result = import_skill_md(&path).unwrap();
 
-        let manifest_text = fs::read_to_string(dir.join("manifest.json")).unwrap();
+        let manifest_text = fs::read_to_string(result.output_dir.join("manifest.json")).unwrap();
         assert!(manifest_text.contains("do the thing"));
         assert!(manifest_text.contains("make it happen"));
 

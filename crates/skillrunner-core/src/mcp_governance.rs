@@ -78,7 +78,12 @@ impl RegistryClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().unwrap_or_default();
-            anyhow::bail!("registry returned HTTP {status} for MCP servers: {body}");
+            let body_preview = if body.len() > 200 {
+                format!("{}...", &body[..200])
+            } else {
+                body
+            };
+            anyhow::bail!("registry returned HTTP {status} for MCP servers: {body_preview}");
         }
 
         resp.json()
