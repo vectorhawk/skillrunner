@@ -1,0 +1,90 @@
+# backends.yaml — Local MCP backend server declarations for SkillRunner
+#
+# Place this file at:
+#   macOS:  ~/Library/Application Support/SkillClub/SkillRunner/backends.yaml
+#   Linux:  ~/.local/share/SkillClub/SkillRunner/backends.yaml
+#
+# When the MCP server starts (`skillrunner mcp serve`), it reads this file and
+# merges these backends alongside any registry-provisioned backends. Backends
+# declared here are loaded every time the server starts — no registry connection
+# required.
+#
+# Supported fields per entry:
+#   name        (required) Human-readable display name.
+#   transport   (required) "stdio" or "http".
+#   command     (stdio only, required) Executable to launch.
+#   args        (stdio only) Arguments passed to the command. Default: [].
+#   env         (stdio only) Environment variables for the child process. Default: {}.
+#   url         (http only, required) Full URL of the running MCP server endpoint.
+#   server_id   (optional) Stable ID used for tool namespacing, e.g. "github" produces
+#               tools like "github__create_issue". Defaults to a sanitized form of name.
+#   priority    (optional) Integer 0–255 for tool budget allocation when the 100-tool
+#               limit is reached. Higher value = higher importance. Default: 50.
+#
+# All entries below are commented out. Uncomment and fill in credentials to enable.
+
+backends:
+
+  # ---------------------------------------------------------------------------
+  # GitHub MCP Server
+  # Provides tools for repositories, issues, pull requests, code search, and
+  # more via the GitHub REST and GraphQL APIs.
+  # Requires a GitHub personal access token (classic or fine-grained).
+  # Docs: https://github.com/modelcontextprotocol/servers/tree/main/src/github
+  # ---------------------------------------------------------------------------
+  # - name: GitHub
+  #   server_id: github
+  #   transport: stdio
+  #   command: npx
+  #   args:
+  #     - "-y"
+  #     - "@modelcontextprotocol/server-github"
+  #   env:
+  #     GITHUB_PERSONAL_ACCESS_TOKEN: "ghp_your_token_here"
+  #   priority: 70
+
+  # ---------------------------------------------------------------------------
+  # Playwright MCP Server
+  # Provides browser automation tools: navigate, click, fill forms, screenshot,
+  # and extract content from web pages. Useful for web scraping and testing.
+  # No credentials required; runs a headless Chromium instance locally.
+  # Docs: https://github.com/microsoft/playwright-mcp
+  # ---------------------------------------------------------------------------
+  # - name: Playwright
+  #   server_id: playwright
+  #   transport: stdio
+  #   command: npx
+  #   args:
+  #     - "-y"
+  #     - "@playwright/mcp@latest"
+  #   priority: 50
+
+  # ---------------------------------------------------------------------------
+  # Filesystem MCP Server
+  # Provides read/write access to files and directories on the local machine.
+  # Limit scope by passing only the directories you want exposed as arguments.
+  # Docs: https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem
+  # ---------------------------------------------------------------------------
+  # - name: Filesystem
+  #   server_id: filesystem
+  #   transport: stdio
+  #   command: npx
+  #   args:
+  #     - "-y"
+  #     - "@modelcontextprotocol/server-filesystem"
+  #     - "/Users/you/projects"   # add as many root paths as needed
+  #     - "/Users/you/documents"
+  #   priority: 60
+
+  # ---------------------------------------------------------------------------
+  # Generic HTTP MCP Server
+  # Use this pattern for any MCP server that is already running and exposes an
+  # HTTP endpoint (e.g. a self-hosted Sentry, Linear, or custom tool server).
+  # The server_id controls how tools are namespaced in the aggregator, so keep
+  # it short and stable across restarts.
+  # ---------------------------------------------------------------------------
+  # - name: My Internal Tool Server
+  #   server_id: internal-tools
+  #   transport: http
+  #   url: http://localhost:3001/mcp
+  #   priority: 80

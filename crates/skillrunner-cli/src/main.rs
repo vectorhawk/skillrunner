@@ -24,8 +24,8 @@ use skillrunner_mcp::{
 use rusqlite::Connection;
 
 #[derive(Parser)]
-#[command(name = "skillrunner")]
-#[command(about = "SkillRunner — the local runtime for SkillClub skills", long_about = None)]
+#[command(name = "skillrunner", version)]
+#[command(about = "SkillRunner — local AI skill runtime and MCP aggregator", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
