@@ -64,8 +64,8 @@ fn parse_frontmatter(content: &str) -> Result<(SkillMdFrontmatter, &str)> {
     let yaml_str = &after_open[..close];
     let body = &after_open[close + 5..]; // skip "\n---\n"
 
-    let frontmatter: SkillMdFrontmatter = serde_yaml::from_str(yaml_str)
-        .context("SKILL.md frontmatter is not valid YAML")?;
+    let frontmatter: SkillMdFrontmatter =
+        serde_yaml::from_str(yaml_str).context("SKILL.md frontmatter is not valid YAML")?;
 
     Ok((frontmatter, body))
 }
@@ -77,7 +77,13 @@ fn parse_frontmatter(content: &str) -> Result<(SkillMdFrontmatter, &str)> {
 fn to_skill_id(name: &str) -> String {
     name.to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .split('-')
         .filter(|s| !s.is_empty())
@@ -142,10 +148,7 @@ fn write_file(dir: &Utf8Path, rel: &str, content: &str, log: &mut Vec<String>) -
 }
 
 fn build_manifest_json(id: &str, fm: &SkillMdFrontmatter) -> String {
-    let description = fm
-        .description
-        .as_deref()
-        .unwrap_or("");
+    let description = fm.description.as_deref().unwrap_or("");
     let description = if description.is_empty() {
         format!("A skill that helps with {}", fm.name.to_lowercase())
     } else {
@@ -164,10 +167,7 @@ fn build_manifest_json(id: &str, fm: &SkillMdFrontmatter) -> String {
 
     // Auto-generate triggers from description when none are provided
     let triggers = if fm.triggers.is_empty() {
-        generate_triggers_from_description(
-            fm.description.as_deref().unwrap_or(""),
-            &fm.name,
-        )
+        generate_triggers_from_description(fm.description.as_deref().unwrap_or(""), &fm.name)
     } else {
         fm.triggers.clone()
     };
@@ -211,7 +211,8 @@ fn build_manifest_json(id: &str, fm: &SkillMdFrontmatter) -> String {
   }}
 }}"#,
         name = serde_json::to_string(&fm.name).expect("name is valid JSON string"),
-        description = serde_json::to_string(&description).expect("description is valid JSON string"),
+        description =
+            serde_json::to_string(&description).expect("description is valid JSON string"),
     )
 }
 
@@ -420,7 +421,10 @@ It can span multiple lines.
             "contract-compare",
         );
         assert!(triggers.contains(&"contract compare".to_string()));
-        assert!(triggers.len() >= 2, "should have at least name + one clause, got: {triggers:?}");
+        assert!(
+            triggers.len() >= 2,
+            "should have at least name + one clause, got: {triggers:?}"
+        );
     }
 
     #[test]
@@ -438,7 +442,10 @@ It can span multiple lines.
         assert!(triggers.contains(&"code review".to_string()));
         // "This skill will help with code review" should be cleaned
         let has_help = triggers.iter().any(|t| t.contains("help with"));
-        assert!(has_help, "should extract 'help with code review', got: {triggers:?}");
+        assert!(
+            has_help,
+            "should extract 'help with code review', got: {triggers:?}"
+        );
     }
 
     #[test]
@@ -447,7 +454,11 @@ It can span multiple lines.
             "one thing, two thing, three thing, four thing, five thing, six thing, seven thing",
             "many-triggers",
         );
-        assert!(triggers.len() <= 5, "should cap at 5, got: {}", triggers.len());
+        assert!(
+            triggers.len() <= 5,
+            "should cap at 5, got: {}",
+            triggers.len()
+        );
     }
 
     #[test]
@@ -465,7 +476,10 @@ You are a contract analysis expert.
         import_skill_md(&path).unwrap();
 
         let manifest_text = fs::read_to_string(dir.join("manifest.json")).unwrap();
-        assert!(manifest_text.contains("\"triggers\""), "manifest should contain auto-generated triggers, got:\n{manifest_text}");
+        assert!(
+            manifest_text.contains("\"triggers\""),
+            "manifest should contain auto-generated triggers, got:\n{manifest_text}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

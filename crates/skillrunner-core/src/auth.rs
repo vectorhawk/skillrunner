@@ -63,10 +63,7 @@ impl AuthClient {
     }
 
     pub fn login(&self, email: &str, password: &str) -> Result<TokenResponse> {
-        let url = format!(
-            "{}/portal/auth/login",
-            self.base_url.trim_end_matches('/')
-        );
+        let url = format!("{}/portal/auth/login", self.base_url.trim_end_matches('/'));
         debug!(url, "logging in");
 
         let resp = self
@@ -115,10 +112,7 @@ impl AuthClient {
     }
 
     pub fn me(&self, access_token: &str) -> Result<UserInfo> {
-        let url = format!(
-            "{}/portal/auth/me",
-            self.base_url.trim_end_matches('/')
-        );
+        let url = format!("{}/portal/auth/me", self.base_url.trim_end_matches('/'));
 
         let resp = self
             .http
@@ -264,7 +258,9 @@ mod tests {
         let state = AppState::bootstrap_in(root.clone()).unwrap();
 
         save_tokens(&state, "http://localhost:8000", "acc", "ref").unwrap();
-        let loaded = load_tokens(&state, "http://localhost:8000").unwrap().unwrap();
+        let loaded = load_tokens(&state, "http://localhost:8000")
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.access_token, "acc");
         assert_eq!(loaded.refresh_token, "ref");
 

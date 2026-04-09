@@ -32,7 +32,10 @@ pub struct PluginComponents {
 /// 3. Records MCP server names (actual server request happens at the MCP tool layer)
 /// 4. Writes slash command files to ~/.claude/skills/
 /// 5. Records plugin state in SQLite
-pub fn install_plugin_from_dir(state: &AppState, plugin_dir: &camino::Utf8Path) -> Result<InstalledPlugin> {
+pub fn install_plugin_from_dir(
+    state: &AppState,
+    plugin_dir: &camino::Utf8Path,
+) -> Result<InstalledPlugin> {
     let pkg = PluginPackage::load_from_dir(plugin_dir)
         .with_context(|| format!("failed to load plugin from {plugin_dir}"))?;
 
@@ -130,27 +133,29 @@ pub fn list_installed_plugins(state: &AppState) -> Result<Vec<InstalledPlugin>> 
         "SELECT id, version, manifest, components, status, installed_at FROM installed_plugins ORDER BY id",
     )?;
 
-    let plugins = stmt.query_map([], |row| {
-        let manifest_str: String = row.get(2)?;
-        let components_str: String = row.get(3)?;
-        Ok(InstalledPlugin {
-            id: row.get(0)?,
-            version: row.get(1)?,
-            manifest: serde_json::from_str(&manifest_str).unwrap_or_else(|_| {
-                // Fallback for corrupt manifest — shouldn't happen
-                serde_json::from_str("{}").unwrap()
-            }),
-            components: serde_json::from_str(&components_str).unwrap_or_else(|_| {
-                PluginComponents {
-                    skill_ids: vec![],
-                    mcp_server_names: vec![],
-                    command_names: vec![],
-                }
-            }),
-            status: row.get(4)?,
-            installed_at: row.get(5)?,
-        })
-    })?.collect::<Result<Vec<_>, _>>()?;
+    let plugins = stmt
+        .query_map([], |row| {
+            let manifest_str: String = row.get(2)?;
+            let components_str: String = row.get(3)?;
+            Ok(InstalledPlugin {
+                id: row.get(0)?,
+                version: row.get(1)?,
+                manifest: serde_json::from_str(&manifest_str).unwrap_or_else(|_| {
+                    // Fallback for corrupt manifest — shouldn't happen
+                    serde_json::from_str("{}").unwrap()
+                }),
+                components: serde_json::from_str(&components_str).unwrap_or_else(|_| {
+                    PluginComponents {
+                        skill_ids: vec![],
+                        mcp_server_names: vec![],
+                        command_names: vec![],
+                    }
+                }),
+                status: row.get(4)?,
+                installed_at: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(plugins)
 }
@@ -218,7 +223,10 @@ pub fn uninstall_plugin(state: &AppState, plugin_id: &str) -> Result<Option<Stri
 
     // 3. Delete plugin record
     let conn = Connection::open(&state.db_path)?;
-    conn.execute("DELETE FROM installed_plugins WHERE id = ?", params![plugin_id])?;
+    conn.execute(
+        "DELETE FROM installed_plugins WHERE id = ?",
+        params![plugin_id],
+    )?;
 
     info!(plugin_id, version = %plugin.version, "plugin uninstalled");
     Ok(Some(plugin.version))
@@ -264,7 +272,9 @@ mod tests {
         let skill_dir = root.join("skills").join("test-skill");
         fs::create_dir_all(skill_dir.join("schemas")).unwrap();
         fs::create_dir_all(skill_dir.join("prompts")).unwrap();
-        fs::write(skill_dir.join("manifest.json"), r#"{
+        fs::write(
+            skill_dir.join("manifest.json"),
+            r#"{
             "schema_version": "1.0", "id": "test-skill", "name": "Test Skill",
             "version": "0.1.0", "publisher": "test",
             "entrypoint": "workflow.yaml",
@@ -272,7 +282,9 @@ mod tests {
             "outputs_schema": "schemas/output.schema.json",
             "permissions": {"filesystem": "none", "network": "none", "clipboard": false},
             "execution": {"sandbox_profile": "strict", "timeout_seconds": 30, "memory_mb": 512}
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         fs::write(skill_dir.join("workflow.yaml"), "name: test\nsteps: []").unwrap();
         fs::write(skill_dir.join("schemas/input.schema.json"), "{}").unwrap();
         fs::write(skill_dir.join("schemas/output.schema.json"), "{}").unwrap();
@@ -281,10 +293,16 @@ mod tests {
         // Command
         let cmd_dir = root.join("commands");
         fs::create_dir_all(&cmd_dir).unwrap();
-        fs::write(cmd_dir.join("test-cmd.md"), "---\nname: test-cmd\ndescription: test\n---\nDo it.").unwrap();
+        fs::write(
+            cmd_dir.join("test-cmd.md"),
+            "---\nname: test-cmd\ndescription: test\n---\nDo it.",
+        )
+        .unwrap();
 
         // plugin.json
-        fs::write(root.join("plugin.json"), r#"{
+        fs::write(
+            root.join("plugin.json"),
+            r#"{
             "schema_version": "1.0",
             "id": "test-plugin",
             "name": "Test Plugin",
@@ -293,7 +311,9 @@ mod tests {
             "skills": [{ "path": "./skills/test-skill" }],
             "mcp_servers": [{ "name": "Test Server", "package_source": "npx test" }],
             "commands": [{ "path": "./commands/test-cmd.md" }]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -379,7 +399,9 @@ mod tests {
         // Update status
         update_plugin_status(&state, "test-plugin", "installed").unwrap();
 
-        let plugin = get_installed_plugin(&state, "test-plugin").unwrap().unwrap();
+        let plugin = get_installed_plugin(&state, "test-plugin")
+            .unwrap()
+            .unwrap();
         assert_eq!(plugin.status, "installed");
 
         let _ = fs::remove_dir_all(state_root.as_str());

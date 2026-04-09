@@ -74,9 +74,7 @@ fn derive_plugin_id(name: &str) -> String {
 /// ```json
 /// { "mcpServers": { "server-name": { "command": "...", "args": [...] } } }
 /// ```
-fn read_mcp_servers_from_file(
-    mcp_file: &Utf8Path,
-) -> Result<Vec<PluginMcpServer>> {
+fn read_mcp_servers_from_file(mcp_file: &Utf8Path) -> Result<Vec<PluginMcpServer>> {
     let text = fs::read_to_string(mcp_file)
         .with_context(|| format!("failed to read MCP config at {mcp_file}"))?;
     let value: serde_json::Value = serde_json::from_str(&text)
@@ -176,8 +174,7 @@ pub fn import_claude_code_plugin(
     let mcp_servers = if let Some(mcp_ref) = manifest.get("mcpServers").and_then(|v| v.as_str()) {
         let mcp_path = plugin_dir.join(mcp_ref.trim_start_matches("./"));
         if mcp_path.exists() {
-            read_mcp_servers_from_file(&mcp_path)
-                .unwrap_or_default()
+            read_mcp_servers_from_file(&mcp_path).unwrap_or_default()
         } else {
             Vec::new()
         }
@@ -272,8 +269,8 @@ pub fn import_claude_code_plugin(
         "user_config": user_config,
     });
 
-    let plugin_json_text = serde_json::to_string_pretty(&plugin_json)
-        .context("failed to serialize plugin.json")?;
+    let plugin_json_text =
+        serde_json::to_string_pretty(&plugin_json).context("failed to serialize plugin.json")?;
 
     let plugin_json_path = out_dir.join("plugin.json");
     fs::write(&plugin_json_path, plugin_json_text)
@@ -289,8 +286,7 @@ pub fn import_claude_code_plugin(
 /// manifest, and writes a SkillClub `plugin.json` to
 /// `{output_dir}/{plugin_id}/`.
 pub fn import_mcpb(mcpb_path: &Utf8Path, output_dir: &Utf8Path) -> Result<Utf8PathBuf> {
-    let file = fs::File::open(mcpb_path)
-        .with_context(|| format!("failed to open {mcpb_path}"))?;
+    let file = fs::File::open(mcpb_path).with_context(|| format!("failed to open {mcpb_path}"))?;
 
     let mut archive = zip::ZipArchive::new(file)
         .with_context(|| format!("failed to read ZIP archive at {mcpb_path}"))?;
@@ -324,8 +320,7 @@ pub fn import_mcpb(mcpb_path: &Utf8Path, output_dir: &Utf8Path) -> Result<Utf8Pa
             entry
                 .read_to_end(&mut content)
                 .with_context(|| format!("failed to read archive entry {entry_name}"))?;
-            fs::write(&dest, &content)
-                .with_context(|| format!("failed to write {dest}"))?;
+            fs::write(&dest, &content).with_context(|| format!("failed to write {dest}"))?;
         }
     }
 
@@ -358,26 +353,23 @@ pub fn import_mcpb(mcpb_path: &Utf8Path, output_dir: &Utf8Path) -> Result<Utf8Pa
         .with_context(|| format!("failed to create output directory {out_dir}"))?;
 
     // Build a single MCP server entry from the manifest server config
-    let package_source = manifest
-        .get("command")
-        .and_then(|v| v.as_str())
-        .map(|cmd| {
-            let args: Vec<String> = manifest
-                .get("args")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|a| a.as_str())
-                        .map(|s| s.to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
-            if args.is_empty() {
-                cmd.to_string()
-            } else {
-                format!("{} {}", cmd, args.join(" "))
-            }
-        });
+    let package_source = manifest.get("command").and_then(|v| v.as_str()).map(|cmd| {
+        let args: Vec<String> = manifest
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|a| a.as_str())
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if args.is_empty() {
+            cmd.to_string()
+        } else {
+            format!("{} {}", cmd, args.join(" "))
+        }
+    });
 
     let mcp_server = PluginMcpServer {
         name: name.clone(),
@@ -400,8 +392,8 @@ pub fn import_mcpb(mcpb_path: &Utf8Path, output_dir: &Utf8Path) -> Result<Utf8Pa
         "user_config": {},
     });
 
-    let plugin_json_text = serde_json::to_string_pretty(&plugin_json)
-        .context("failed to serialize plugin.json")?;
+    let plugin_json_text =
+        serde_json::to_string_pretty(&plugin_json).context("failed to serialize plugin.json")?;
 
     let plugin_json_path = out_dir.join("plugin.json");
     fs::write(&plugin_json_path, plugin_json_text)
@@ -420,9 +412,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock before unix epoch")
             .as_nanos();
-        Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
-            "plugin-import-test-{label}-{nanos}"
-        )))
+        Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("plugin-import-test-{label}-{nanos}")),
+        )
         .expect("temp dir path should be UTF-8")
     }
 
@@ -445,8 +437,7 @@ mod tests {
         let plugin_dir = root.join("my-plugin");
         let claude_dir = plugin_dir.join(".claude-plugin");
         fs::create_dir_all(&claude_dir).expect("create .claude-plugin dir");
-        fs::write(claude_dir.join("plugin.json"), r#"{"name":"test"}"#)
-            .expect("write plugin.json");
+        fs::write(claude_dir.join("plugin.json"), r#"{"name":"test"}"#).expect("write plugin.json");
 
         let result = detect_plugin_format(&plugin_dir);
         assert_eq!(result, Some(ExternalPluginFormat::ClaudeCode));
@@ -559,7 +550,9 @@ mod tests {
         assert_eq!(generated["description"], "A test plugin for import");
 
         // MCP server should be converted
-        let servers = generated["mcp_servers"].as_array().expect("mcp_servers array");
+        let servers = generated["mcp_servers"]
+            .as_array()
+            .expect("mcp_servers array");
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0]["name"], "acme-server");
         assert_eq!(servers[0]["package_source"], "npx -y @acme/mcp-server");
@@ -594,7 +587,11 @@ mod tests {
         .expect("write minimal plugin.json");
 
         let result = import_claude_code_plugin(&src, &out);
-        assert!(result.is_ok(), "minimal import should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "minimal import should succeed: {:?}",
+            result.err()
+        );
 
         let out_path = result.unwrap();
         let generated_text = fs::read_to_string(out_path.join("plugin.json")).unwrap();

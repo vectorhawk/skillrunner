@@ -1,10 +1,7 @@
 use anyhow::{bail, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use skillrunner_manifest::PluginPackage;
-use std::{
-    fs,
-    io::Write as IoWrite,
-};
+use std::{fs, io::Write as IoWrite};
 use zip::{write::SimpleFileOptions, ZipWriter};
 
 /// Export a SkillClub plugin to the Claude Code plugin format.
@@ -255,7 +252,11 @@ mod tests {
         fs::write(skill_dir.join("workflow.yaml"), "name: test\nsteps: []").unwrap();
         fs::write(skill_dir.join("schemas/input.schema.json"), "{}").unwrap();
         fs::write(skill_dir.join("schemas/output.schema.json"), "{}").unwrap();
-        fs::write(skill_dir.join("prompts/system.txt"), "You are a helpful assistant.").unwrap();
+        fs::write(
+            skill_dir.join("prompts/system.txt"),
+            "You are a helpful assistant.",
+        )
+        .unwrap();
 
         // Slash command
         let cmd_dir = root.join("commands");

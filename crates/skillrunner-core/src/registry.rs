@@ -185,7 +185,11 @@ impl RegistryClient {
     }
 
     /// Fetch artifact metadata for a specific skill version.
-    pub fn fetch_artifact_metadata(&self, skill_id: &str, version: &str) -> Result<ArtifactMetadata> {
+    pub fn fetch_artifact_metadata(
+        &self,
+        skill_id: &str,
+        version: &str,
+    ) -> Result<ArtifactMetadata> {
         let url = format!(
             "{}/skills/{}/versions/{}",
             self.base_url.trim_end_matches('/'),
@@ -203,10 +207,13 @@ impl RegistryClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().unwrap_or_default();
-            anyhow::bail!("registry returned HTTP {status} for artifact {skill_id}@{version}: {body}");
+            anyhow::bail!(
+                "registry returned HTTP {status} for artifact {skill_id}@{version}: {body}"
+            );
         }
 
-        resp.json().context("failed to deserialize artifact metadata")
+        resp.json()
+            .context("failed to deserialize artifact metadata")
     }
 
     /// Download an artifact to `dest`, verifying its SHA-256 hash.
@@ -233,26 +240,27 @@ impl RegistryClient {
         }
 
         let mut hasher = Sha256::new();
-        let mut out = std::fs::File::create(dest)
-            .with_context(|| format!("failed to create {dest}"))?;
+        let mut out =
+            std::fs::File::create(dest).with_context(|| format!("failed to create {dest}"))?;
 
         let mut buf = [0u8; 65536];
         loop {
-            let n = resp.read(&mut buf).context("error reading download stream")?;
+            let n = resp
+                .read(&mut buf)
+                .context("error reading download stream")?;
             if n == 0 {
                 break;
             }
             hasher.update(&buf[..n]);
-            out.write_all(&buf[..n]).context("error writing download to disk")?;
+            out.write_all(&buf[..n])
+                .context("error writing download to disk")?;
         }
         drop(out);
 
         let actual = hex::encode(hasher.finalize());
         if actual != expected_sha256 {
             let _ = std::fs::remove_file(dest);
-            anyhow::bail!(
-                "artifact hash mismatch: expected {expected_sha256}, got {actual}"
-            );
+            anyhow::bail!("artifact hash mismatch: expected {expected_sha256}, got {actual}");
         }
 
         debug!("artifact hash verified");
@@ -356,17 +364,17 @@ impl RegistryClient {
             anyhow::bail!("registry returned HTTP {status} for skill status check: {body}");
         }
 
-        resp.json().context("failed to deserialize skill status response")
+        resp.json()
+            .context("failed to deserialize skill status response")
     }
 
     /// Upload a `.cskill` archive to the registry.
     ///
     /// Requires auth token to be set via [`with_auth`].
     pub fn publish_skill(&self, archive_path: &Utf8Path) -> Result<serde_json::Value> {
-        let token = self
-            .auth_token
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("not authenticated; run `skillrunner auth login` first"))?;
+        let token = self.auth_token.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("not authenticated; run `skillrunner auth login` first")
+        })?;
 
         let base = self.base_url.trim_end_matches('/');
         let url = format!("{base}/portal/skills");
@@ -384,14 +392,20 @@ impl RegistryClient {
             .http
             .post(&url)
             .bearer_auth(token)
-            .multipart(Self::make_upload_form(file_bytes.clone(), file_name.clone())?)
+            .multipart(Self::make_upload_form(
+                file_bytes.clone(),
+                file_name.clone(),
+            )?)
             .send()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         // If skill already exists (409), retry as a new version upload
         if resp.status() == reqwest::StatusCode::CONFLICT {
-            let skill_id = Self::extract_skill_id_from_filename(&file_name)
-                .ok_or_else(|| anyhow::anyhow!("skill already exists but could not extract skill_id from archive filename"))?;
+            let skill_id = Self::extract_skill_id_from_filename(&file_name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "skill already exists but could not extract skill_id from archive filename"
+                )
+            })?;
             debug!(skill_id, "skill exists, uploading as new version");
 
             let version_url = format!("{base}/portal/skills/{skill_id}/versions");
@@ -409,7 +423,9 @@ impl RegistryClient {
                 anyhow::bail!("publish version failed (HTTP {status}): {body}");
             }
 
-            return resp2.json().context("failed to deserialize publish response");
+            return resp2
+                .json()
+                .context("failed to deserialize publish response");
         }
 
         if !resp.status().is_success() {
@@ -418,10 +434,14 @@ impl RegistryClient {
             anyhow::bail!("publish failed (HTTP {status}): {body}");
         }
 
-        resp.json().context("failed to deserialize publish response")
+        resp.json()
+            .context("failed to deserialize publish response")
     }
 
-    fn make_upload_form(file_bytes: Vec<u8>, file_name: String) -> Result<reqwest::blocking::multipart::Form> {
+    fn make_upload_form(
+        file_bytes: Vec<u8>,
+        file_name: String,
+    ) -> Result<reqwest::blocking::multipart::Form> {
         Ok(reqwest::blocking::multipart::Form::new().part(
             "file",
             reqwest::blocking::multipart::Part::bytes(file_bytes)
@@ -526,7 +546,9 @@ impl RegistryClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().unwrap_or_default();
-            anyhow::bail!("registry returned HTTP {status} for plugin download info {slug}: {body}");
+            anyhow::bail!(
+                "registry returned HTTP {status} for plugin download info {slug}: {body}"
+            );
         }
 
         resp.json()
@@ -538,10 +560,9 @@ impl RegistryClient {
     /// Requires auth token to be set via [`with_auth`].
     /// On 409 CONFLICT (plugin exists), retries as a new version upload.
     pub fn publish_plugin(&self, archive_path: &Utf8Path) -> Result<serde_json::Value> {
-        let token = self
-            .auth_token
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("not authenticated; run `skillrunner auth login` first"))?;
+        let token = self.auth_token.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("not authenticated; run `skillrunner auth login` first")
+        })?;
 
         let base = self.base_url.trim_end_matches('/');
         let url = format!("{base}/portal/plugins");
@@ -559,14 +580,20 @@ impl RegistryClient {
             .http
             .post(&url)
             .bearer_auth(token)
-            .multipart(Self::make_upload_form(file_bytes.clone(), file_name.clone())?)
+            .multipart(Self::make_upload_form(
+                file_bytes.clone(),
+                file_name.clone(),
+            )?)
             .send()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
         // If plugin already exists (409), retry as a new version upload
         if resp.status() == reqwest::StatusCode::CONFLICT {
-            let slug = Self::extract_plugin_slug_from_filename(&file_name)
-                .ok_or_else(|| anyhow::anyhow!("plugin already exists but could not extract slug from archive filename"))?;
+            let slug = Self::extract_plugin_slug_from_filename(&file_name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "plugin already exists but could not extract slug from archive filename"
+                )
+            })?;
             debug!(slug, "plugin exists, uploading as new version");
 
             let version_url = format!("{base}/portal/plugins/{slug}/versions");
@@ -584,7 +611,9 @@ impl RegistryClient {
                 anyhow::bail!("publish plugin version failed (HTTP {status}): {body}");
             }
 
-            return resp2.json().context("failed to deserialize publish plugin response");
+            return resp2
+                .json()
+                .context("failed to deserialize publish plugin response");
         }
 
         if !resp.status().is_success() {
@@ -593,7 +622,8 @@ impl RegistryClient {
             anyhow::bail!("publish plugin failed (HTTP {status}): {body}");
         }
 
-        resp.json().context("failed to deserialize publish plugin response")
+        resp.json()
+            .context("failed to deserialize publish plugin response")
     }
 
     /// Extract plugin slug from archive filename like "my-plugin-0.1.0.plugin"
@@ -712,7 +742,12 @@ fn policy_from_wire(wire: PolicyApiResponse) -> Result<Policy> {
         .as_deref()
         .map(Version::parse)
         .transpose()
-        .with_context(|| format!("invalid minimum_allowed_version in policy for '{}'", wire.skill_id))?;
+        .with_context(|| {
+            format!(
+                "invalid minimum_allowed_version in policy for '{}'",
+                wire.skill_id
+            )
+        })?;
 
     Ok(Policy {
         skill_id: wire.skill_id,
@@ -732,7 +767,10 @@ fn policy_to_wire(policy: &Policy, ttl: u64) -> PolicyApiResponse {
         },
         channel: None,
         target_version: policy.target_version.as_ref().map(|v| v.to_string()),
-        minimum_allowed_version: policy.minimum_allowed_version.as_ref().map(|v| v.to_string()),
+        minimum_allowed_version: policy
+            .minimum_allowed_version
+            .as_ref()
+            .map(|v| v.to_string()),
         blocked_message: policy.blocked_message.clone(),
         policy_ttl_seconds: Some(ttl),
     }
@@ -978,10 +1016,7 @@ mod tests {
     #[test]
     fn health_check_returns_false_on_server_error() {
         let mut server = Server::new();
-        let mock = server
-            .mock("GET", "/health")
-            .with_status(503)
-            .create();
+        let mock = server.mock("GET", "/health").with_status(503).create();
 
         let client = RegistryClient::new(server.url());
         assert!(!client.health_check().unwrap());
@@ -1103,7 +1138,10 @@ mod tests {
         let client = HttpPolicyClient::new(registry, &state);
 
         let policy = client.fetch_policy("new-skill").unwrap();
-        assert_eq!(policy.target_version, Some(Version::parse("2.0.0").unwrap()));
+        assert_eq!(
+            policy.target_version,
+            Some(Version::parse("2.0.0").unwrap())
+        );
 
         // Verify cache row was written
         let conn = Connection::open(&state.db_path).unwrap();

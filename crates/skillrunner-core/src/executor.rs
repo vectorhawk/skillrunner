@@ -147,24 +147,25 @@ fn execute_step(
     model_client: Option<&dyn ModelClient>,
 ) -> Result<StepResult> {
     match step {
-        WorkflowStep::Tool { id, tool, input } => {
-            execute_tool_step(id, tool, input, run_input)
-        }
+        WorkflowStep::Tool { id, tool, input } => execute_tool_step(id, tool, input, run_input),
         WorkflowStep::Llm {
             id,
             prompt,
             inputs,
             output_schema,
         } => match model_client {
-            Some(client) => execute_llm_step(pkg, LlmStepParams {
-                id,
-                prompt_rel: prompt,
-                step_inputs: inputs,
-                output_schema_rel: output_schema.as_deref(),
-                run_input,
-                step_outputs,
-                client,
-            }),
+            Some(client) => execute_llm_step(
+                pkg,
+                LlmStepParams {
+                    id,
+                    prompt_rel: prompt,
+                    step_inputs: inputs,
+                    output_schema_rel: output_schema.as_deref(),
+                    run_input,
+                    step_outputs,
+                    client,
+                },
+            ),
             None => Ok(stub_step(step)),
         },
         WorkflowStep::Transform { id, op, input } => {
@@ -197,7 +198,10 @@ fn execute_tool_step(
             Ok(StepResult {
                 id: id.to_string(),
                 step_type: "tool".to_string(),
-                note: format!("extract_text: extracted field '{field}' ({} chars)", text.len()),
+                note: format!(
+                    "extract_text: extracted field '{field}' ({} chars)",
+                    text.len()
+                ),
                 output: Some(serde_json::Value::String(text)),
                 prompt_tokens: None,
                 completion_tokens: None,
@@ -253,9 +257,9 @@ fn execute_validate_step(
     run_input: &serde_json::Value,
     step_outputs: &HashMap<String, serde_json::Value>,
 ) -> Result<StepResult> {
-    let ref_str = input.as_str().ok_or_else(|| {
-        anyhow::anyhow!("validate step '{id}': input must be a reference string")
-    })?;
+    let ref_str = input
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("validate step '{id}': input must be a reference string"))?;
     let resolved_str = resolve_ref(ref_str, run_input, step_outputs);
 
     // Try to parse the resolved string as JSON; if it's already a step output
@@ -290,7 +294,15 @@ struct LlmStepParams<'a> {
 }
 
 fn execute_llm_step(pkg: &SkillPackage, p: LlmStepParams<'_>) -> Result<StepResult> {
-    let LlmStepParams { id, prompt_rel, step_inputs, output_schema_rel, run_input, step_outputs, client } = p;
+    let LlmStepParams {
+        id,
+        prompt_rel,
+        step_inputs,
+        output_schema_rel,
+        run_input,
+        step_outputs,
+        client,
+    } = p;
     // Read system prompt from file.
     let prompt_path = pkg.root.join(prompt_rel);
     let system_prompt = fs::read_to_string(&prompt_path)
@@ -404,11 +416,9 @@ fn stub_step(step: &WorkflowStep) -> StepResult {
             "llm",
             format!("LLM call with prompt '{prompt}' — stub, no model invoked"),
         ),
-        WorkflowStep::Tool { id, tool, .. } => (
-            id.clone(),
-            "tool",
-            format!("built-in tool '{tool}' — stub"),
-        ),
+        WorkflowStep::Tool { id, tool, .. } => {
+            (id.clone(), "tool", format!("built-in tool '{tool}' — stub"))
+        }
         WorkflowStep::Transform { id, op, .. } => (
             id.clone(),
             "transform",
@@ -485,8 +495,8 @@ fn record_execution(
     completion_tokens: u64,
     latency_ms: u64,
 ) -> Result<()> {
-    let conn = Connection::open(&state.db_path)
-        .context("failed to open state DB to record execution")?;
+    let conn =
+        Connection::open(&state.db_path).context("failed to open state DB to record execution")?;
     conn.execute(
         "INSERT INTO execution_history (skill_id, version, status, prompt_tokens, completion_tokens, latency_ms)
          VALUES (?1, ?2, 'completed', ?3, ?4, ?5)",
@@ -510,7 +520,9 @@ fn check_model_requirements(
         );
     }
     if reqs.supports_structured_output == Some(true) {
-        tracing::info!("skill requires structured output support — requesting JSON format from model");
+        tracing::info!(
+            "skill requires structured output support — requesting JSON format from model"
+        );
     }
     if reqs.supports_tool_calling == Some(true) {
         tracing::warn!("skill requires tool calling — not yet supported by local Ollama backend");
@@ -526,13 +538,14 @@ fn check_model_requirements(
 mod tests {
     use super::*;
     use crate::{
-        install::install_unpacked_skill,
-        model::MockModelClient,
-        policy::MockPolicyClient,
+        install::install_unpacked_skill, model::MockModelClient, policy::MockPolicyClient,
         state::AppState,
     };
     use camino::Utf8PathBuf;
-    use std::{fs, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn temp_root(label: &str) -> Utf8PathBuf {
         let nanos = SystemTime::now()
@@ -585,7 +598,15 @@ mod tests {
         install_unpacked_skill(&state, &pkg).unwrap();
 
         let client = MockPolicyClient::new();
-        let result = run_skill(&state, &client, "test-skill", &serde_json::json!({}), None, None).unwrap();
+        let result = run_skill(
+            &state,
+            &client,
+            "test-skill",
+            &serde_json::json!({}),
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(result.skill_id, "test-skill");
         assert_eq!(result.steps.len(), 1);
@@ -602,8 +623,15 @@ mod tests {
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
 
         let client = MockPolicyClient::new();
-        let err = run_skill(&state, &client, "ghost-skill", &serde_json::json!({}), None, None)
-            .expect_err("uninstalled skill should fail");
+        let err = run_skill(
+            &state,
+            &client,
+            "ghost-skill",
+            &serde_json::json!({}),
+            None,
+            None,
+        )
+        .expect_err("uninstalled skill should fail");
 
         assert!(err.to_string().contains("not installed"), "got: {err}");
 
@@ -685,8 +713,15 @@ mod tests {
         install_unpacked_skill(&state, &pkg).unwrap();
 
         let client = MockPolicyClient::new();
-        let err = run_skill(&state, &client, "test-skill", &serde_json::json!({"other": 1}), None, None)
-            .expect_err("invalid input should fail");
+        let err = run_skill(
+            &state,
+            &client,
+            "test-skill",
+            &serde_json::json!({"other": 1}),
+            None,
+            None,
+        )
+        .expect_err("invalid input should fail");
 
         assert!(err.to_string().contains("validation"), "got: {err}");
 
@@ -804,10 +839,7 @@ mod tests {
         )
         .expect_err("schema mismatch should fail");
 
-        assert!(
-            err.to_string().contains("schema validation"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("schema validation"), "got: {err}");
 
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&skill_root);

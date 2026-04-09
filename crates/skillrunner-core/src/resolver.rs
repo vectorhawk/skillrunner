@@ -15,14 +15,9 @@ pub enum ResolveOutcome {
         install_path: String,
     },
     /// Policy has blocked this skill (or no valid replacement exists).
-    Blocked {
-        skill_id: String,
-        reason: String,
-    },
+    Blocked { skill_id: String, reason: String },
     /// Skill has never been installed locally.
-    NotInstalled {
-        skill_id: String,
-    },
+    NotInstalled { skill_id: String },
 }
 
 /// Resolve `skill_id` to a runnable path or a block/not-installed reason.
@@ -111,8 +106,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock before unix epoch")
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("forge-tests-resolver-{label}-{nanos}"));
+        let path = std::env::temp_dir().join(format!("forge-tests-resolver-{label}-{nanos}"));
         Utf8PathBuf::from_path_buf(path).expect("temporary test path should be utf-8")
     }
 
@@ -131,7 +125,12 @@ mod tests {
         let root = temp_root("active");
         let state = AppState::bootstrap_in(root.clone()).unwrap();
         let conn = Connection::open(&state.db_path).unwrap();
-        seed_installed(&conn, "contract-compare", "1.0.0", "/fake/skills/contract-compare");
+        seed_installed(
+            &conn,
+            "contract-compare",
+            "1.0.0",
+            "/fake/skills/contract-compare",
+        );
 
         let client = MockPolicyClient::new(); // default active, no constraints
         let outcome = resolve_skill(&state, &client, "contract-compare").unwrap();
@@ -169,7 +168,12 @@ mod tests {
         let root = temp_root("policy-blocked");
         let state = AppState::bootstrap_in(root.clone()).unwrap();
         let conn = Connection::open(&state.db_path).unwrap();
-        seed_installed(&conn, "contract-compare", "1.0.0", "/fake/skills/contract-compare");
+        seed_installed(
+            &conn,
+            "contract-compare",
+            "1.0.0",
+            "/fake/skills/contract-compare",
+        );
 
         let blocked_policy = Policy {
             skill_id: "contract-compare".to_string(),
@@ -197,7 +201,12 @@ mod tests {
         let state = AppState::bootstrap_in(root.clone()).unwrap();
         let conn = Connection::open(&state.db_path).unwrap();
         // Installed: 1.0.0 — policy requires >= 1.1.0.
-        seed_installed(&conn, "contract-compare", "1.0.0", "/fake/skills/contract-compare");
+        seed_installed(
+            &conn,
+            "contract-compare",
+            "1.0.0",
+            "/fake/skills/contract-compare",
+        );
 
         let policy = Policy {
             skill_id: "contract-compare".to_string(),
@@ -212,8 +221,14 @@ mod tests {
         match outcome {
             ResolveOutcome::Blocked { skill_id, reason } => {
                 assert_eq!(skill_id, "contract-compare");
-                assert!(reason.contains("1.0.0"), "reason should mention installed version");
-                assert!(reason.contains("1.1.0"), "reason should mention minimum version");
+                assert!(
+                    reason.contains("1.0.0"),
+                    "reason should mention installed version"
+                );
+                assert!(
+                    reason.contains("1.1.0"),
+                    "reason should mention minimum version"
+                );
             }
             other => panic!("expected Blocked, got {other:?}"),
         }
@@ -226,7 +241,12 @@ mod tests {
         let state = AppState::bootstrap_in(root.clone()).unwrap();
         let conn = Connection::open(&state.db_path).unwrap();
         // Installed: 1.1.0 — meets minimum of 1.1.0.
-        seed_installed(&conn, "contract-compare", "1.1.0", "/fake/skills/contract-compare");
+        seed_installed(
+            &conn,
+            "contract-compare",
+            "1.1.0",
+            "/fake/skills/contract-compare",
+        );
 
         let policy = Policy {
             skill_id: "contract-compare".to_string(),

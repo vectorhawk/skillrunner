@@ -67,8 +67,7 @@ for line in sys.stdin:
             .duration_since(UNIX_EPOCH)
             .expect("system clock ok")
             .as_nanos();
-        let path = std::env::temp_dir()
-            .join(format!("sr-aggregator-stdio-test-{name}-{nanos}"));
+        let path = std::env::temp_dir().join(format!("sr-aggregator-stdio-test-{name}-{nanos}"));
         let root = Utf8PathBuf::from_path_buf(path).expect("utf-8 path");
         AppState::bootstrap_in(root).expect("bootstrap")
     }
@@ -139,16 +138,19 @@ backends:
         std::fs::write(state.root_dir.join("backends.yaml"), yaml).expect("write yaml");
 
         let registry = BackendRegistry::new();
-        let count = registry.sync_local(&state).expect("sync_local should succeed");
+        let count = registry
+            .sync_local(&state)
+            .expect("sync_local should succeed");
         assert_eq!(count, 1, "one backend should be loaded");
         assert_eq!(registry.backend_count(), 1);
 
         let tools = registry.all_tools();
-        assert_eq!(tools.len(), 1, "echo backend should expose one namespaced tool");
         assert_eq!(
-            tools[0]["name"].as_str().unwrap_or(""),
-            "echo__echo_tool"
+            tools.len(),
+            1,
+            "echo backend should expose one namespaced tool"
         );
+        assert_eq!(tools[0]["name"].as_str().unwrap_or(""), "echo__echo_tool");
 
         registry.shutdown();
         cleanup(&state);
@@ -189,8 +191,7 @@ backends:
         // The result is the raw JSON-RPC result from the backend.
         // Echo server wraps args in content[].text.
         let text = value["content"][0]["text"].as_str().expect("text field");
-        let echoed: serde_json::Value =
-            serde_json::from_str(text).expect("text is JSON");
+        let echoed: serde_json::Value = serde_json::from_str(text).expect("text is JSON");
         assert_eq!(echoed["text"], "round-trip");
 
         registry.shutdown();
@@ -203,7 +204,9 @@ backends:
     fn dispatch_returns_none_for_skill_tool() {
         let registry = BackendRegistry::new();
         // This tool belongs to the skill layer, not an aggregator backend.
-        assert!(registry.dispatch("skillclub_search", &serde_json::Value::Null).is_none());
+        assert!(registry
+            .dispatch("skillclub_search", &serde_json::Value::Null)
+            .is_none());
     }
 
     // ── shutdown closes child processes ──────────────────────────────────────

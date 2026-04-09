@@ -6,19 +6,15 @@
 use crate::{
     aggregator::BackendRegistry,
     protocol::{
-        InitializeResult, JsonRpcRequest, JsonRpcResponse, ServerCapabilities,
-        ServerInfo, ToolCallParams, ToolDefinition, ToolsCapability, ToolsListResult,
-        INVALID_PARAMS, METHOD_NOT_FOUND,
+        InitializeResult, JsonRpcRequest, JsonRpcResponse, ServerCapabilities, ServerInfo,
+        ToolCallParams, ToolDefinition, ToolsCapability, ToolsListResult, INVALID_PARAMS,
+        METHOD_NOT_FOUND,
     },
     sampling::{HybridModelClient, McpSamplingClient, SharedIo},
     tools::{build_tool_list, handle_tool_call},
 };
 use anyhow::Result;
-use skillrunner_core::{
-    model::ModelClient,
-    ollama::OllamaClient,
-    state::AppState,
-};
+use skillrunner_core::{model::ModelClient, ollama::OllamaClient, state::AppState};
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -118,7 +114,11 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
 
     info!(
         "MCP server starting in standalone mode (ollama={}, registry=none)",
-        if ollama_available { "available" } else { "unavailable" },
+        if ollama_available {
+            "available"
+        } else {
+            "unavailable"
+        },
     );
 
     let mut server_state = ServerState::new();
@@ -200,9 +200,7 @@ fn dispatch_request(
     match request.method.as_str() {
         "initialize" => handle_initialize(request, state),
         "tools/list" => handle_tools_list(request, state, &_config.registry_url, aggregator),
-        "tools/call" => handle_tools_call(
-            request, state, model_client, aggregator,
-        ),
+        "tools/call" => handle_tools_call(request, state, model_client, aggregator),
         _ => JsonRpcResponse::error(
             request.id.clone(),
             METHOD_NOT_FOUND,
@@ -223,7 +221,10 @@ fn handle_initialize(request: &JsonRpcRequest, _state: &AppState) -> JsonRpcResp
         },
         instructions: None,
     };
-    JsonRpcResponse::success(request.id.clone(), serde_json::to_value(result).unwrap_or_default())
+    JsonRpcResponse::success(
+        request.id.clone(),
+        serde_json::to_value(result).unwrap_or_default(),
+    )
 }
 
 fn handle_tools_list(
@@ -236,9 +237,20 @@ fn handle_tools_list(
 
     // Convert aggregated backend tools to ToolDefinitions
     for agg_tool in aggregator.all_tools() {
-        let name = agg_tool.get("name").and_then(|n| n.as_str()).unwrap_or("unknown").to_string();
-        let description = agg_tool.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string();
-        let input_schema = agg_tool.get("inputSchema").cloned().unwrap_or(serde_json::json!({"type": "object"}));
+        let name = agg_tool
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let description = agg_tool
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("")
+            .to_string();
+        let input_schema = agg_tool
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or(serde_json::json!({"type": "object"}));
         tools.push(ToolDefinition {
             name,
             description,
@@ -247,7 +259,10 @@ fn handle_tools_list(
     }
 
     let result = ToolsListResult { tools };
-    JsonRpcResponse::success(request.id.clone(), serde_json::to_value(result).unwrap_or_default())
+    JsonRpcResponse::success(
+        request.id.clone(),
+        serde_json::to_value(result).unwrap_or_default(),
+    )
 }
 
 fn handle_tools_call(
@@ -287,14 +302,7 @@ fn handle_tools_call(
         };
     }
 
-    let result = handle_tool_call(
-        &params.name,
-        &args,
-        state,
-        model_client,
-        None::<&()>,
-        "",
-    );
+    let result = handle_tool_call(&params.name, &args, state, model_client, None::<&()>, "");
 
     let response_value = serde_json::to_value(result).unwrap_or_else(|e| {
         serde_json::json!({

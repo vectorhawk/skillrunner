@@ -25,7 +25,8 @@ pub fn auto_update_if_needed(
     skill_id: &str,
     policy: &Policy,
 ) -> Result<bool> {
-    let (Some(min_ver), Some(target_ver)) = (&policy.minimum_allowed_version, &policy.target_version)
+    let (Some(min_ver), Some(target_ver)) =
+        (&policy.minimum_allowed_version, &policy.target_version)
     else {
         return Ok(false);
     };
@@ -35,9 +36,8 @@ pub fn auto_update_if_needed(
         return Ok(false);
     };
 
-    let installed = Version::parse(&installed_str).with_context(|| {
-        format!("installed version '{installed_str}' is not valid semver")
-    })?;
+    let installed = Version::parse(&installed_str)
+        .with_context(|| format!("installed version '{installed_str}' is not valid semver"))?;
 
     if &installed >= min_ver {
         return Ok(false); // Already at or above the minimum.
@@ -93,10 +93,8 @@ pub fn package_skill(skill_dir: &Utf8Path) -> Result<(Utf8PathBuf, String)> {
         .with_context(|| format!("skill at {skill_dir} failed validation"))?;
 
     let filename = format!("{}-{}.cskill", pkg.manifest.id, pkg.manifest.version);
-    let archive_path = Utf8PathBuf::from_path_buf(
-        std::env::temp_dir().join(&filename),
-    )
-    .map_err(|_| anyhow::anyhow!("temp dir path is not valid UTF-8"))?;
+    let archive_path = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(&filename))
+        .map_err(|_| anyhow::anyhow!("temp dir path is not valid UTF-8"))?;
 
     let file = std::fs::File::create(&archive_path)
         .with_context(|| format!("failed to create {archive_path}"))?;
@@ -131,10 +129,8 @@ pub fn package_plugin(plugin_dir: &Utf8Path) -> Result<(Utf8PathBuf, String)> {
         .with_context(|| format!("plugin at {plugin_dir} failed validation"))?;
 
     let filename = format!("{}-{}.plugin", pkg.manifest.id, pkg.manifest.version);
-    let archive_path = Utf8PathBuf::from_path_buf(
-        std::env::temp_dir().join(&filename),
-    )
-    .map_err(|_| anyhow::anyhow!("temp dir path is not valid UTF-8"))?;
+    let archive_path = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(&filename))
+        .map_err(|_| anyhow::anyhow!("temp dir path is not valid UTF-8"))?;
 
     let file = std::fs::File::create(&archive_path)
         .with_context(|| format!("failed to create {archive_path}"))?;
@@ -191,9 +187,8 @@ fn download_and_install(
         .with_context(|| format!("failed to extract {skill_id}@{version}"))?;
 
     // 4. Validate the extracted bundle.
-    let pkg = SkillPackage::load_from_dir(&staging_path).with_context(|| {
-        format!("downloaded bundle for {skill_id}@{version} failed validation")
-    })?;
+    let pkg = SkillPackage::load_from_dir(&staging_path)
+        .with_context(|| format!("downloaded bundle for {skill_id}@{version} failed validation"))?;
 
     // 5. Install via the standard installer.
     install_unpacked_skill(state, &pkg)
@@ -224,7 +219,11 @@ pub fn install_plugin_from_registry(
         .map_err(|_| anyhow::anyhow!("temp dir path is not valid UTF-8"))?;
 
     registry
-        .download_artifact(&download_info.download_url, &download_info.sha256, &archive_path)
+        .download_artifact(
+            &download_info.download_url,
+            &download_info.sha256,
+            &archive_path,
+        )
         .with_context(|| format!("failed to download plugin '{slug}'"))?;
 
     // 3. Extract the tar.gz archive to a staging directory.
@@ -299,11 +298,11 @@ pub fn check_skill_updates(
 ) -> Result<usize> {
     // ── Phase 1: collect all installed skills (active + deactivated) ──────────
     let conn = Connection::open(&state.db_path).context("failed to open state DB")?;
-    let mut all_stmt = conn.prepare(
-        "SELECT skill_id, current_status FROM installed_skills",
-    )?;
+    let mut all_stmt = conn.prepare("SELECT skill_id, current_status FROM installed_skills")?;
     let all_installed: Vec<(String, String)> = all_stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
         .collect::<rusqlite::Result<_>>()
         .context("failed to read installed skills")?;
     drop(all_stmt);
@@ -330,73 +329,76 @@ pub fn check_skill_updates(
     // `published_ids` is Some(set) when the endpoint succeeded — only skills in
     // the set are eligible for version updates.  None means "skip lifecycle, update all active".
     // Only check registry status for non-plugin-owned skills
-    let registry_skill_ids: Vec<String> = all_skill_ids.iter()
+    let registry_skill_ids: Vec<String> = all_skill_ids
+        .iter()
         .filter(|id| !plugin_owned_skills.contains(id.as_str()))
         .cloned()
         .collect();
-    let published_ids: Option<std::collections::HashSet<String>> =
-        match registry.check_skill_status(&registry_skill_ids) {
-            Ok(status_resp) => {
-                let mut published = std::collections::HashSet::new();
-                for (skill_id, local_status) in &all_installed {
-                    if status_resp.unknown.contains(skill_id) && !plugin_owned_skills.contains(skill_id) {
-                        // Skill was deleted from registry — full cleanup.
-                        // Skip plugin-owned skills (local-only, not in registry).
-                        match uninstall_skill(state, skill_id) {
-                            Ok(Some(_)) => {
-                                info!(skill_id, "sync: skill removed from registry, uninstalled");
-                                changes += 1;
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                tracing::warn!(skill_id, error = %e, "sync: failed to uninstall unknown skill");
-                            }
+    let published_ids: Option<std::collections::HashSet<String>> = match registry
+        .check_skill_status(&registry_skill_ids)
+    {
+        Ok(status_resp) => {
+            let mut published = std::collections::HashSet::new();
+            for (skill_id, local_status) in &all_installed {
+                if status_resp.unknown.contains(skill_id) && !plugin_owned_skills.contains(skill_id)
+                {
+                    // Skill was deleted from registry — full cleanup.
+                    // Skip plugin-owned skills (local-only, not in registry).
+                    match uninstall_skill(state, skill_id) {
+                        Ok(Some(_)) => {
+                            info!(skill_id, "sync: skill removed from registry, uninstalled");
+                            changes += 1;
                         }
-                    } else if let Some(entry) = status_resp.statuses.get(skill_id) {
-                        match entry.status.as_str() {
-                            "unpublished" => {
-                                if local_status == "active" {
-                                    match deactivate_skill(state, skill_id) {
-                                        Ok(true) => {
-                                            info!(skill_id, "sync: skill unpublished, deactivated");
-                                            changes += 1;
-                                        }
-                                        Ok(false) => {}
-                                        Err(e) => {
-                                            tracing::warn!(skill_id, error = %e, "sync: failed to deactivate unpublished skill");
-                                        }
-                                    }
-                                }
-                            }
-                            "published" => {
-                                published.insert(skill_id.clone());
-                                if local_status == "deactivated" {
-                                    match reactivate_skill(state, skill_id) {
-                                        Ok(true) => {
-                                            info!(skill_id, "sync: skill republished, reactivated");
-                                            changes += 1;
-                                        }
-                                        Ok(false) => {}
-                                        Err(e) => {
-                                            tracing::warn!(skill_id, error = %e, "sync: failed to reactivate republished skill");
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {}
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(skill_id, error = %e, "sync: failed to uninstall unknown skill");
                         }
                     }
+                } else if let Some(entry) = status_resp.statuses.get(skill_id) {
+                    match entry.status.as_str() {
+                        "unpublished" => {
+                            if local_status == "active" {
+                                match deactivate_skill(state, skill_id) {
+                                    Ok(true) => {
+                                        info!(skill_id, "sync: skill unpublished, deactivated");
+                                        changes += 1;
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        tracing::warn!(skill_id, error = %e, "sync: failed to deactivate unpublished skill");
+                                    }
+                                }
+                            }
+                        }
+                        "published" => {
+                            published.insert(skill_id.clone());
+                            if local_status == "deactivated" {
+                                match reactivate_skill(state, skill_id) {
+                                    Ok(true) => {
+                                        info!(skill_id, "sync: skill republished, reactivated");
+                                        changes += 1;
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        tracing::warn!(skill_id, error = %e, "sync: failed to reactivate republished skill");
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-                Some(published)
             }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "skill lifecycle check unavailable; skipping, proceeding with version updates only"
-                );
-                None
-            }
-        };
+            Some(published)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "skill lifecycle check unavailable; skipping, proceeding with version updates only"
+            );
+            None
+        }
+    };
 
     // ── Phase 3: version updates ──────────────────────────────────────────────
     // Re-query active skills after lifecycle changes may have altered statuses.
@@ -542,7 +544,10 @@ mod tests {
     };
     use camino::Utf8PathBuf;
     use semver::Version;
-    use std::{fs, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn temp_root(label: &str) -> Utf8PathBuf {
         let nanos = SystemTime::now()
@@ -560,7 +565,8 @@ mod tests {
         fs::create_dir_all(root.join("prompts")).unwrap();
         fs::write(
             root.join("manifest.json"),
-            format!(r#"{{
+            format!(
+                r#"{{
   "schema_version": "1.0",
   "id": "test-skill",
   "name": "Test Skill",
@@ -571,7 +577,8 @@ mod tests {
   "outputs_schema": "schemas/output.schema.json",
   "permissions": {{ "filesystem": "none", "network": "none", "clipboard": false }},
   "execution": {{ "sandbox_profile": "strict", "timeout_seconds": 30, "memory_mb": 256 }}
-}}"#),
+}}"#
+            ),
         )
         .unwrap();
         fs::write(
@@ -630,7 +637,10 @@ mod tests {
         // RegistryClient pointing at a non-existent URL; should not be called.
         let registry = RegistryClient::new("http://localhost:0");
         let updated = auto_update_if_needed(&state, &registry, "test-skill", &policy).unwrap();
-        assert!(!updated, "should not update when no minimum_allowed_version");
+        assert!(
+            !updated,
+            "should not update when no minimum_allowed_version"
+        );
 
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&skill_root);
@@ -655,7 +665,10 @@ mod tests {
         };
         let registry = RegistryClient::new("http://localhost:0");
         let updated = auto_update_if_needed(&state, &registry, "test-skill", &policy).unwrap();
-        assert!(!updated, "should not update when installed version meets minimum");
+        assert!(
+            !updated,
+            "should not update when installed version meets minimum"
+        );
 
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&skill_root);
@@ -752,7 +765,10 @@ mod tests {
         let install_path = state
             .root_dir
             .join("skills/test-skill/versions/2.0.0/manifest.json");
-        assert!(install_path.exists(), "manifest.json should exist for v2.0.0");
+        assert!(
+            install_path.exists(),
+            "manifest.json should exist for v2.0.0"
+        );
 
         meta_mock.assert();
         dl_mock.assert();
@@ -955,7 +971,10 @@ mod tests {
         let policy_client = crate::policy::MockPolicyClient::new();
 
         let count = check_skill_updates(&state, &registry, &policy_client).unwrap();
-        assert_eq!(count, 1, "one lifecycle change (deactivation) should be counted");
+        assert_eq!(
+            count, 1,
+            "one lifecycle change (deactivation) should be counted"
+        );
 
         // Verify skill is deactivated in DB
         let conn = rusqlite::Connection::open(&state.db_path).unwrap();
@@ -1013,7 +1032,10 @@ mod tests {
         let policy_client = crate::policy::MockPolicyClient::new();
 
         let count = check_skill_updates(&state, &registry, &policy_client).unwrap();
-        assert_eq!(count, 1, "one lifecycle change (uninstall) should be counted");
+        assert_eq!(
+            count, 1,
+            "one lifecycle change (uninstall) should be counted"
+        );
 
         // Verify all files are gone
         assert!(!install_root.exists(), "skill dir should be removed");
@@ -1066,7 +1088,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(status, "deactivated", "skill should be deactivated before sync");
+        assert_eq!(
+            status, "deactivated",
+            "skill should be deactivated before sync"
+        );
         drop(conn);
 
         let mut server = Server::new();
@@ -1096,7 +1121,10 @@ mod tests {
         let policy_client = crate::policy::MockPolicyClient::new();
 
         let count = check_skill_updates(&state, &registry, &policy_client).unwrap();
-        assert_eq!(count, 1, "one lifecycle change (reactivation) should be counted");
+        assert_eq!(
+            count, 1,
+            "one lifecycle change (reactivation) should be counted"
+        );
 
         // Verify skill is active in DB
         let conn = rusqlite::Connection::open(&state.db_path).unwrap();
@@ -1111,7 +1139,10 @@ mod tests {
 
         // Verify active symlink is restored
         let active_path = state.root_dir.join("skills/test-skill/active");
-        assert!(active_path.exists(), "active symlink should be restored after reactivation");
+        assert!(
+            active_path.exists(),
+            "active symlink should be restored after reactivation"
+        );
 
         status_mock.assert();
         detail_mock.assert();

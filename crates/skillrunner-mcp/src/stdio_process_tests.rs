@@ -85,9 +85,15 @@ for line in sys.stdin:
 
     #[test]
     fn spawn_fails_for_nonexistent_command() {
-        let result =
-            StdioProcess::spawn("__nonexistent_binary_xyz__", &[] as &[&str], &HashMap::new());
-        assert!(result.is_err(), "spawning a missing binary should return an error");
+        let result = StdioProcess::spawn(
+            "__nonexistent_binary_xyz__",
+            &[] as &[&str],
+            &HashMap::new(),
+        );
+        assert!(
+            result.is_err(),
+            "spawning a missing binary should return an error"
+        );
     }
 
     #[test]
@@ -121,7 +127,9 @@ for line in sys.stdin:
         // StdioProcess should send initialize automatically if not yet done,
         // or the server may respond regardless — test that we handle it.
         let mut proc = spawn_echo_server();
-        let tools = proc.list_tools().expect("list_tools should succeed even without explicit initialize");
+        let tools = proc
+            .list_tools()
+            .expect("list_tools should succeed even without explicit initialize");
         assert!(!tools.is_empty());
     }
 
@@ -132,12 +140,17 @@ for line in sys.stdin:
         let mut proc = spawn_echo_server();
         proc.initialize().expect("initialize");
         let args = serde_json::json!({"text": "hello world"});
-        let result = proc.call_tool("echo_tool", &args).expect("call_tool should succeed");
+        let result = proc
+            .call_tool("echo_tool", &args)
+            .expect("call_tool should succeed");
         // The echo server returns a tools/call result with a `content` array.
         // `call_tool` should extract and return the result value as-is.
         let content = result.get("content").expect("result should have content");
-        let text = content[0]["text"].as_str().expect("first content should have text");
-        let echoed: serde_json::Value = serde_json::from_str(text).expect("text should be valid JSON");
+        let text = content[0]["text"]
+            .as_str()
+            .expect("first content should have text");
+        let echoed: serde_json::Value =
+            serde_json::from_str(text).expect("text should be valid JSON");
         assert_eq!(echoed["text"], "hello world");
     }
 
@@ -145,7 +158,9 @@ for line in sys.stdin:
     fn call_tool_with_empty_args_succeeds() {
         let mut proc = spawn_echo_server();
         proc.initialize().expect("initialize");
-        let result = proc.call_tool("echo_tool", &serde_json::Value::Null).expect("call_tool");
+        let result = proc
+            .call_tool("echo_tool", &serde_json::Value::Null)
+            .expect("call_tool");
         assert!(result.get("content").is_some());
     }
 
@@ -198,10 +213,12 @@ for line in sys.stdin:
         let mut env = HashMap::new();
         env.insert("PYTHONUNBUFFERED".to_string(), "1".to_string());
         env.insert("MY_SECRET_TOKEN".to_string(), "abc123".to_string());
-        let mut proc = StdioProcess::spawn("python3", &["-c", script], &env)
-            .expect("spawn env-echo server");
+        let mut proc =
+            StdioProcess::spawn("python3", &["-c", script], &env).expect("spawn env-echo server");
         proc.initialize().expect("initialize");
-        let result = proc.call_tool("env_echo", &serde_json::Value::Null).expect("call_tool");
+        let result = proc
+            .call_tool("env_echo", &serde_json::Value::Null)
+            .expect("call_tool");
         let text = result["content"][0]["text"].as_str().expect("text");
         assert_eq!(text, "abc123", "env var should reach child process");
     }
@@ -232,13 +249,18 @@ for line in sys.stdin:
 "#;
         let mut env = HashMap::new();
         env.insert("PYTHONUNBUFFERED".to_string(), "1".to_string());
-        let mut proc = StdioProcess::spawn("python3", &["-c", script], &env)
-            .expect("spawn error server");
+        let mut proc =
+            StdioProcess::spawn("python3", &["-c", script], &env).expect("spawn error server");
         proc.initialize().expect("initialize");
         let result = proc.call_tool("any_tool", &serde_json::Value::Null);
-        assert!(result.is_err(), "JSON-RPC error from backend should propagate as Err");
+        assert!(
+            result.is_err(),
+            "JSON-RPC error from backend should propagate as Err"
+        );
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("internal backend error") || msg.contains("JSON-RPC error"),
-            "error message should describe the backend error, got: {msg}");
+        assert!(
+            msg.contains("internal backend error") || msg.contains("JSON-RPC error"),
+            "error message should describe the backend error, got: {msg}"
+        );
     }
 }

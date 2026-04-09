@@ -35,7 +35,12 @@ struct OllamaTagsResponse {
 
 impl OllamaClient {
     pub fn new(base_url: impl Into<String>, model: impl Into<String>) -> Self {
-        Self::with_timeouts(base_url, model, Duration::from_secs(5), Duration::from_secs(30))
+        Self::with_timeouts(
+            base_url,
+            model,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        )
     }
 
     pub fn with_timeouts(
@@ -129,7 +134,11 @@ impl ModelClient for OllamaClient {
             prompt: &request.user_message,
             system: &request.system_prompt,
             stream: false,
-            format: if request.json_output { Some("json") } else { None },
+            format: if request.json_output {
+                Some("json")
+            } else {
+                None
+            },
         };
 
         let start = Instant::now();
@@ -181,9 +190,7 @@ pub fn resolve_model<T: AsRef<str>>(client: &OllamaClient, requested: T) -> Resu
         .context("failed to list Ollama models for model resolution")?;
 
     if models.is_empty() {
-        anyhow::bail!(
-            "Ollama has no models installed — run `ollama pull <model>` to install one"
-        );
+        anyhow::bail!("Ollama has no models installed — run `ollama pull <model>` to install one");
     }
 
     let available: Vec<&str> = models.iter().map(|m| m.name.as_str()).collect();
@@ -203,7 +210,11 @@ pub fn resolve_model<T: AsRef<str>>(client: &OllamaClient, requested: T) -> Resu
 
     // Use the first available model (covers both the "no preference" and
     // "fallback" cases handled above).
-    Ok(models.into_iter().next().map(|m| m.name).expect("non-empty list checked above"))
+    Ok(models
+        .into_iter()
+        .next()
+        .map(|m| m.name)
+        .expect("non-empty list checked above"))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -245,7 +256,11 @@ mod tests {
     #[test]
     fn health_check_returns_reachable_when_server_responds_200() {
         let mut server = mockito::Server::new();
-        let _m = server.mock("GET", "/").with_status(200).with_body("Ollama is running").create();
+        let _m = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_body("Ollama is running")
+            .create();
 
         let client = OllamaClient::new(server.url(), "test-model");
         let status = client.health_check();
@@ -338,10 +353,7 @@ mod tests {
             })
             .expect_err("should fail on bad json");
 
-        assert!(
-            err.to_string().contains("deserialize"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("deserialize"), "got: {err}");
     }
 
     #[test]

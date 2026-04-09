@@ -47,9 +47,7 @@ pub fn detect_ai_clients(_skillrunner_path: &str) -> Vec<ClientConfig> {
     //         ~/.config/Claude/claude_desktop_config.json (Linux)
     // Key: "mcpServers"
     if let Some(claude_desktop_config) = claude_desktop_config_path(&home) {
-        let claude_desktop_dir = claude_desktop_config
-            .parent()
-            .map(|p| p.to_path_buf());
+        let claude_desktop_dir = claude_desktop_config.parent().map(|p| p.to_path_buf());
         if claude_desktop_dir
             .as_ref()
             .map(|d| d.exists())
@@ -82,7 +80,10 @@ pub fn detect_ai_clients(_skillrunner_path: &str) -> Vec<ClientConfig> {
 
     // ── Windsurf ─────────────────────────────────────────────────────────────
     // Config: ~/.codeium/windsurf/mcp_config.json  (key: "mcpServers")
-    let windsurf_config = home.join(".codeium").join("windsurf").join("mcp_config.json");
+    let windsurf_config = home
+        .join(".codeium")
+        .join("windsurf")
+        .join("mcp_config.json");
     let windsurf_dir = home.join(".codeium").join("windsurf");
     if windsurf_dir.exists() || windsurf_config.exists() {
         let already = is_skillrunner_configured(&windsurf_config, "mcpServers");
@@ -655,7 +656,9 @@ fn install_npx_claude_hook_in(home: &std::path::Path) -> Result<bool> {
     let hooks_dir = home.join(".claude").join("hooks");
     let script_path = hooks_dir.join("skillclub-npx-guard.sh");
 
-    if !script_path.exists() || fs::read_to_string(&script_path).unwrap_or_default() != NPX_GUARD_SCRIPT {
+    if !script_path.exists()
+        || fs::read_to_string(&script_path).unwrap_or_default() != NPX_GUARD_SCRIPT
+    {
         fs::create_dir_all(&hooks_dir)?;
         fs::write(&script_path, NPX_GUARD_SCRIPT)?;
         #[cfg(target_family = "unix")]
@@ -726,11 +729,15 @@ fn install_npx_claude_hook_in(home: &std::path::Path) -> Result<bool> {
 /// Writes the wrapper to `~/Library/Application Support/SkillClub/SkillRunner/bin/npx`.
 /// The user or IT can add this directory to PATH to activate the wrapper.
 /// Returns the path to the wrapper if changes were made.
-pub fn install_npx_shell_wrapper(state: &skillrunner_core::state::AppState) -> Result<Option<String>> {
+pub fn install_npx_shell_wrapper(
+    state: &skillrunner_core::state::AppState,
+) -> Result<Option<String>> {
     let bin_dir = state.root_dir.join("bin");
     let wrapper_path = bin_dir.join("npx");
 
-    if wrapper_path.exists() && fs::read_to_string(&wrapper_path).unwrap_or_default() == NPX_SHELL_WRAPPER {
+    if wrapper_path.exists()
+        && fs::read_to_string(&wrapper_path).unwrap_or_default() == NPX_SHELL_WRAPPER
+    {
         return Ok(None);
     }
 
@@ -938,7 +945,10 @@ mod tests {
 
         let clients = detect_ai_clients("/usr/local/bin/skillrunner");
         let claude_desktop = clients.iter().find(|c| c.name == "Claude Desktop");
-        assert!(claude_desktop.is_some(), "Claude Desktop should be detected");
+        assert!(
+            claude_desktop.is_some(),
+            "Claude Desktop should be detected"
+        );
         assert_eq!(claude_desktop.unwrap().mcp_key, "mcpServers");
 
         let _ = fs::remove_dir_all(tmp.as_str());
@@ -1056,8 +1066,7 @@ mod tests {
     #[test]
     fn first_run_tracking() {
         let state_root = temp_root("first-run");
-        let state =
-            skillrunner_core::state::AppState::bootstrap_in(state_root.clone()).unwrap();
+        let state = skillrunner_core::state::AppState::bootstrap_in(state_root.clone()).unwrap();
 
         assert!(!first_run_offered(&state));
         mark_first_run_offered(&state).unwrap();
@@ -1094,7 +1103,10 @@ mod tests {
             .collect();
 
         assert_eq!(claude_unmanaged.len(), 2);
-        let names: Vec<&str> = claude_unmanaged.iter().map(|u| u.server_name.as_str()).collect();
+        let names: Vec<&str> = claude_unmanaged
+            .iter()
+            .map(|u| u.server_name.as_str())
+            .collect();
         assert!(names.contains(&"github-mcp"));
         assert!(names.contains(&"slack-mcp"));
 
@@ -1155,11 +1167,21 @@ mod tests {
 
         // Verify SKILL.md files exist and have YAML frontmatter
         for name in &installed {
-            let skill_file = tmp.join(".claude").join("skills").join(name).join("SKILL.md");
+            let skill_file = tmp
+                .join(".claude")
+                .join("skills")
+                .join(name)
+                .join("SKILL.md");
             assert!(skill_file.exists(), "SKILL.md missing for {name}");
             let content = fs::read_to_string(&skill_file).unwrap();
-            assert!(content.starts_with("---\n"), "SKILL.md for {name} must start with YAML frontmatter");
-            assert!(content.contains(&format!("name: {name}")), "SKILL.md for {name} must contain name field");
+            assert!(
+                content.starts_with("---\n"),
+                "SKILL.md for {name} must start with YAML frontmatter"
+            );
+            assert!(
+                content.contains(&format!("name: {name}")),
+                "SKILL.md for {name} must contain name field"
+            );
         }
 
         let _ = fs::remove_dir_all(tmp.as_str());
@@ -1176,7 +1198,11 @@ mod tests {
 
         // Second install — should skip all (identical content)
         let second = install_claude_skills_in(tmp.as_ref()).unwrap();
-        assert!(second.is_empty(), "should skip all skills on re-install, got: {:?}", second);
+        assert!(
+            second.is_empty(),
+            "should skip all skills on re-install, got: {:?}",
+            second
+        );
 
         let _ = fs::remove_dir_all(tmp.as_str());
     }
@@ -1190,7 +1216,11 @@ mod tests {
         install_claude_skills_in(tmp.as_ref()).unwrap();
 
         // Modify one skill file
-        let skill_file = tmp.join(".claude").join("skills").join("mcp-login").join("SKILL.md");
+        let skill_file = tmp
+            .join(".claude")
+            .join("skills")
+            .join("mcp-login")
+            .join("SKILL.md");
         fs::write(&skill_file, "old content").unwrap();
 
         // Re-install — should update the modified one
@@ -1209,9 +1239,18 @@ mod tests {
     fn skill_definitions_have_valid_structure() {
         for (name, content) in skill_definitions() {
             assert!(!name.is_empty(), "skill dir name must not be empty");
-            assert!(content.starts_with("---\n"), "{name}: must start with YAML frontmatter");
-            assert!(content.contains("description:"), "{name}: must have description field");
-            assert!(content.contains(&format!("name: {name}")), "{name}: name field must match dir name");
+            assert!(
+                content.starts_with("---\n"),
+                "{name}: must start with YAML frontmatter"
+            );
+            assert!(
+                content.contains("description:"),
+                "{name}: must have description field"
+            );
+            assert!(
+                content.contains(&format!("name: {name}")),
+                "{name}: name field must match dir name"
+            );
         }
     }
 

@@ -38,16 +38,16 @@
 //! 3. Backend proxied tools, ordered by `McpServerEntry::priority` descending
 //!    (default 50 when unset)
 
-use anyhow::Result;
 #[cfg(feature = "registry")]
 use anyhow::Context;
+use anyhow::Result;
 use serde_json::Value;
+use skillrunner_core::state::AppState;
 #[cfg(feature = "registry")]
 use skillrunner_core::{
     mcp_governance::{fetch_approved_servers, McpServerEntry, McpServersResponse},
     registry::RegistryClient,
 };
-use skillrunner_core::state::AppState;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -375,7 +375,7 @@ impl BackendRegistry {
                     command,
                     args,
                     env: HashMap::new(), // registry path: env from server_config not yet extracted
-                    tools: vec![], // populated by fetch_tools_from_backend
+                    tools: vec![],       // populated by fetch_tools_from_backend
                     tool_visibility: visibility,
                     priority,
                     process: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -399,15 +399,12 @@ impl BackendRegistry {
                         })
                     })
                 } else {
-                    entry
-                        .gateway_url
-                        .clone()
-                        .or_else(|| {
-                            entry
-                                .server_config
-                                .as_ref()
-                                .and_then(|c| c.get("url").and_then(|u| u.as_str()).map(String::from))
-                        })
+                    entry.gateway_url.clone().or_else(|| {
+                        entry
+                            .server_config
+                            .as_ref()
+                            .and_then(|c| c.get("url").and_then(|u| u.as_str()).map(String::from))
+                    })
                 };
 
                 match url {
@@ -515,29 +512,27 @@ impl BackendRegistry {
             // Stdio backends are always fetched regardless of feature flags.
             // HTTP backends require the registry feature for the reqwest client.
             let tools = match &conn {
-                BackendConnection::Stdio(_) => {
-                    self.fetch_tools_from_backend_stdio(&conn)
-                        .unwrap_or_else(|e| {
-                            warn!(
-                                server_id = %server_id,
-                                error = %e,
-                                "failed to fetch tools from stdio backend"
-                            );
-                            vec![]
-                        })
-                }
+                BackendConnection::Stdio(_) => self
+                    .fetch_tools_from_backend_stdio(&conn)
+                    .unwrap_or_else(|e| {
+                        warn!(
+                            server_id = %server_id,
+                            error = %e,
+                            "failed to fetch tools from stdio backend"
+                        );
+                        vec![]
+                    }),
                 BackendConnection::Http(_) => {
                     #[cfg(feature = "registry")]
                     {
-                        self.fetch_tools_from_backend(&conn)
-                            .unwrap_or_else(|e| {
-                                warn!(
-                                    server_id = %server_id,
-                                    error = %e,
-                                    "failed to fetch tools from local http backend"
-                                );
-                                vec![]
-                            })
+                        self.fetch_tools_from_backend(&conn).unwrap_or_else(|e| {
+                            warn!(
+                                server_id = %server_id,
+                                error = %e,
+                                "failed to fetch tools from local http backend"
+                            );
+                            vec![]
+                        })
                     }
                     #[cfg(not(feature = "registry"))]
                     vec![]
@@ -594,11 +589,8 @@ impl BackendRegistry {
                     "name": namespaced_name,
                 });
                 if let Some(desc) = &tool.description {
-                    tool_json["description"] = Value::String(format!(
-                        "[{}] {}",
-                        backend.name(),
-                        desc
-                    ));
+                    tool_json["description"] =
+                        Value::String(format!("[{}] {}", backend.name(), desc));
                 }
                 if let Some(schema) = &tool.input_schema {
                     tool_json["inputSchema"] = schema.clone();
@@ -628,7 +620,10 @@ impl BackendRegistry {
 
         enum DispatchTarget {
             #[cfg(feature = "registry")]
-            Http { url: String, auth_token: Option<String> },
+            Http {
+                url: String,
+                auth_token: Option<String>,
+            },
             #[cfg(not(feature = "registry"))]
             Http,
             Stdio {
@@ -682,13 +677,16 @@ impl BackendRegistry {
                 self.call_http_tool(&url, original_tool, args, auth_token.as_deref())
             }
             #[cfg(not(feature = "registry"))]
-            DispatchTarget::Http => {
-                Err(anyhow::anyhow!(
-                    "HTTP backend dispatch requires the 'registry' feature for '{}'",
-                    server_id
-                ))
-            }
-            DispatchTarget::Stdio { process, command, args_list, env } => {
+            DispatchTarget::Http => Err(anyhow::anyhow!(
+                "HTTP backend dispatch requires the 'registry' feature for '{}'",
+                server_id
+            )),
+            DispatchTarget::Stdio {
+                process,
+                command,
+                args_list,
+                env,
+            } => {
                 call_stdio_tool_with_arc(&process, &command, &args_list, &env, original_tool, args)
             }
         };
@@ -721,11 +719,7 @@ impl BackendRegistry {
 
     /// How long since the last successful sync, or `None` if never synced.
     pub fn time_since_sync(&self) -> Option<Duration> {
-        self.inner
-            .lock()
-            .unwrap()
-            .last_synced
-            .map(|t| t.elapsed())
+        self.inner.lock().unwrap().last_synced.map(|t| t.elapsed())
     }
 
     /// Number of currently active backends.
@@ -784,15 +778,12 @@ impl BackendRegistry {
                 let tools_url = http.url.trim_end_matches('/').to_string();
                 debug!(url = %tools_url, "fetching tools from HTTP backend");
 
-                let mut req = self
-                    .http
-                    .post(&tools_url)
-                    .json(&serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "tools/list",
-                        "params": {}
-                    }));
+                let mut req = self.http.post(&tools_url).json(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {}
+                }));
 
                 if let Some(token) = &http.auth_token {
                     req = req.header("authorization", format!("Bearer {token}"));
@@ -807,9 +798,7 @@ impl BackendRegistry {
                     anyhow::bail!("backend returned HTTP {status}");
                 }
 
-                let body: Value = resp
-                    .json()
-                    .context("failed to parse tools/list response")?;
+                let body: Value = resp.json().context("failed to parse tools/list response")?;
 
                 let tools = body
                     .get("result")
@@ -836,23 +825,26 @@ impl BackendRegistry {
 
     /// Call a tool on an HTTP backend and return the result.
     #[cfg(feature = "registry")]
-    fn call_http_tool(&self, base_url: &str, tool_name: &str, args: &Value, auth_token: Option<&str>) -> Result<Value> {
+    fn call_http_tool(
+        &self,
+        base_url: &str,
+        tool_name: &str,
+        args: &Value,
+        auth_token: Option<&str>,
+    ) -> Result<Value> {
         // MCP Streamable HTTP: POST JSON-RPC to the endpoint URL directly.
         let call_url = base_url.trim_end_matches('/').to_string();
         debug!(url = %call_url, tool = %tool_name, "dispatching tool call to HTTP backend");
 
-        let mut req = self
-            .http
-            .post(&call_url)
-            .json(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {
-                    "name": tool_name,
-                    "arguments": args,
-                }
-            }));
+        let mut req = self.http.post(&call_url).json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": args,
+            }
+        }));
 
         if let Some(token) = auth_token {
             req = req.header("authorization", format!("Bearer {token}"));
@@ -868,19 +860,14 @@ impl BackendRegistry {
             anyhow::bail!("backend tool call failed (HTTP {status}): {body}");
         }
 
-        let body: Value = resp
-            .json()
-            .context("failed to parse tools/call response")?;
+        let body: Value = resp.json().context("failed to parse tools/call response")?;
 
         // Unwrap the JSON-RPC result layer.
         if let Some(err) = body.get("error") {
             anyhow::bail!("backend returned JSON-RPC error: {err}");
         }
 
-        Ok(body
-            .get("result")
-            .cloned()
-            .unwrap_or(Value::Null))
+        Ok(body.get("result").cloned().unwrap_or(Value::Null))
     }
 
     /// Fetch the tool list from a stdio backend by spawning (or reusing) its
@@ -1094,7 +1081,10 @@ mod tests {
 
     #[test]
     fn namespace_tool_produces_double_underscore_prefix() {
-        assert_eq!(namespace_tool("sentry", "search_issues"), "sentry__search_issues");
+        assert_eq!(
+            namespace_tool("sentry", "search_issues"),
+            "sentry__search_issues"
+        );
         assert_eq!(namespace_tool("github", "create_pr"), "github__create_pr");
     }
 
@@ -1141,8 +1131,16 @@ mod tests {
     #[test]
     fn tool_visibility_all_passes_all_tools() {
         let tools = vec![
-            ToolDefinition { name: "a".to_string(), description: None, input_schema: None },
-            ToolDefinition { name: "b".to_string(), description: None, input_schema: None },
+            ToolDefinition {
+                name: "a".to_string(),
+                description: None,
+                input_schema: None,
+            },
+            ToolDefinition {
+                name: "b".to_string(),
+                description: None,
+                input_schema: None,
+            },
         ];
         let visible = ToolVisibility::All.filter(&tools);
         assert_eq!(visible.len(), 2);
@@ -1151,15 +1149,25 @@ mod tests {
     #[test]
     fn tool_visibility_curated_filters_to_allowed_list() {
         let tools = vec![
-            ToolDefinition { name: "create_issue".to_string(), description: None, input_schema: None },
-            ToolDefinition { name: "delete_repo".to_string(), description: None, input_schema: None },
-            ToolDefinition { name: "list_prs".to_string(), description: None, input_schema: None },
+            ToolDefinition {
+                name: "create_issue".to_string(),
+                description: None,
+                input_schema: None,
+            },
+            ToolDefinition {
+                name: "delete_repo".to_string(),
+                description: None,
+                input_schema: None,
+            },
+            ToolDefinition {
+                name: "list_prs".to_string(),
+                description: None,
+                input_schema: None,
+            },
         ];
-        let visible = ToolVisibility::Curated(vec![
-            "create_issue".to_string(),
-            "list_prs".to_string(),
-        ])
-        .filter(&tools);
+        let visible =
+            ToolVisibility::Curated(vec!["create_issue".to_string(), "list_prs".to_string()])
+                .filter(&tools);
         assert_eq!(visible.len(), 2);
         assert!(visible.iter().any(|t| t.name == "create_issue"));
         assert!(visible.iter().any(|t| t.name == "list_prs"));
@@ -1168,9 +1176,11 @@ mod tests {
 
     #[test]
     fn tool_visibility_on_demand_returns_empty() {
-        let tools = vec![
-            ToolDefinition { name: "a".to_string(), description: None, input_schema: None },
-        ];
+        let tools = vec![ToolDefinition {
+            name: "a".to_string(),
+            description: None,
+            input_schema: None,
+        }];
         assert!(ToolVisibility::OnDemand.filter(&tools).is_empty());
     }
 
@@ -1196,13 +1206,11 @@ mod tests {
                     server_id: "github".to_string(),
                     name: "GitHub".to_string(),
                     url: "http://unused".to_string(),
-                    tools: vec![
-                        ToolDefinition {
-                            name: "create_issue".to_string(),
-                            description: Some("Create an issue".to_string()),
-                            input_schema: None,
-                        },
-                    ],
+                    tools: vec![ToolDefinition {
+                        name: "create_issue".to_string(),
+                        description: Some("Create an issue".to_string()),
+                        input_schema: None,
+                    }],
                     tool_visibility: ToolVisibility::All,
                     priority: 50,
                     auth_token: None,
@@ -1223,7 +1231,10 @@ mod tests {
     fn dispatch_returns_none_for_non_namespaced_tool() {
         let registry = BackendRegistry::new();
         let result = registry.dispatch("skillclub_search", &Value::Null);
-        assert!(result.is_none(), "non-namespaced tool should not be dispatched by aggregator");
+        assert!(
+            result.is_none(),
+            "non-namespaced tool should not be dispatched by aggregator"
+        );
     }
 
     #[test]

@@ -256,7 +256,8 @@ mod tests {
 
     #[test]
     fn error_response_serializes_correctly() {
-        let resp = JsonRpcResponse::error(Some(serde_json::json!(2)), METHOD_NOT_FOUND, "not found");
+        let resp =
+            JsonRpcResponse::error(Some(serde_json::json!(2)), METHOD_NOT_FOUND, "not found");
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["error"]["code"], METHOD_NOT_FOUND);
         assert_eq!(json["error"]["message"], "not found");

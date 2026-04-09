@@ -131,9 +131,7 @@ impl StdioProcess {
         if body.get("error").is_some() {
             bail!(
                 "backend rejected initialize: {}",
-                body["error"]["message"]
-                    .as_str()
-                    .unwrap_or("unknown error")
+                body["error"]["message"].as_str().unwrap_or("unknown error")
             );
         }
 
@@ -175,7 +173,11 @@ impl StdioProcess {
     ///
     /// Returns the raw `result` value from the JSON-RPC response.
     /// Calls `initialize` automatically if not already done.
-    pub fn call_tool(&mut self, name: &str, arguments: &serde_json::Value) -> Result<serde_json::Value> {
+    pub fn call_tool(
+        &mut self,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
         self.ensure_initialized()?;
 
         let id = self.next_id();
@@ -193,16 +195,22 @@ impl StdioProcess {
             serde_json::from_str(&resp).context("tools/call response is not valid JSON")?;
 
         if let Some(err) = body.get("error") {
-            bail!("backend returned JSON-RPC error: {}", err["message"].as_str().unwrap_or("unknown"));
+            bail!(
+                "backend returned JSON-RPC error: {}",
+                err["message"].as_str().unwrap_or("unknown")
+            );
         }
 
-        Ok(body.get("result").cloned().unwrap_or(serde_json::Value::Null))
+        Ok(body
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
     }
 
     /// Returns true if the child process is still running.
     pub fn is_alive(&mut self) -> bool {
         match self.child.try_wait() {
-            Ok(None) => true,           // still running
+            Ok(None) => true,              // still running
             Ok(Some(_)) | Err(_) => false, // exited or error
         }
     }
@@ -256,9 +264,7 @@ impl StdioProcess {
         self.stdin
             .write_all(b"\n")
             .context("failed to write newline to child stdin")?;
-        self.stdin
-            .flush()
-            .context("failed to flush child stdin")?;
+        self.stdin.flush().context("failed to flush child stdin")?;
         Ok(())
     }
 
@@ -344,9 +350,16 @@ fn extract_tools_from_response(body: &serde_json::Value) -> Vec<ToolDefinition> 
         .iter()
         .filter_map(|v| {
             let name = v.get("name")?.as_str()?.to_string();
-            let description = v.get("description").and_then(|d| d.as_str()).map(String::from);
+            let description = v
+                .get("description")
+                .and_then(|d| d.as_str())
+                .map(String::from);
             let input_schema = v.get("inputSchema").cloned();
-            Some(ToolDefinition { name, description, input_schema })
+            Some(ToolDefinition {
+                name,
+                description,
+                input_schema,
+            })
         })
         .collect()
 }

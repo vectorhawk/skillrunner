@@ -281,9 +281,17 @@ impl PluginPackage {
     }
 }
 
-fn validate_plugin_manifest(root: &Utf8Path, manifest: &PluginManifest) -> Result<(), ManifestError> {
-    if manifest.id.trim().is_empty() || manifest.name.trim().is_empty() || manifest.publisher.trim().is_empty() {
-        return Err(ManifestError::Invalid("id, name, and publisher must be non-empty".to_string()));
+fn validate_plugin_manifest(
+    root: &Utf8Path,
+    manifest: &PluginManifest,
+) -> Result<(), ManifestError> {
+    if manifest.id.trim().is_empty()
+        || manifest.name.trim().is_empty()
+        || manifest.publisher.trim().is_empty()
+    {
+        return Err(ManifestError::Invalid(
+            "id, name, and publisher must be non-empty".to_string(),
+        ));
     }
 
     if manifest.schema_version != "1.0" {
@@ -294,7 +302,8 @@ fn validate_plugin_manifest(root: &Utf8Path, manifest: &PluginManifest) -> Resul
     }
 
     // Must have at least one component
-    if manifest.skills.is_empty() && manifest.mcp_servers.is_empty() && manifest.commands.is_empty() {
+    if manifest.skills.is_empty() && manifest.mcp_servers.is_empty() && manifest.commands.is_empty()
+    {
         return Err(ManifestError::Invalid(
             "plugin must contain at least one skill, MCP server, or command".to_string(),
         ));
@@ -305,9 +314,7 @@ fn validate_plugin_manifest(root: &Utf8Path, manifest: &PluginManifest) -> Resul
         if let Some(path) = &skill_ref.path {
             let skill_dir = root.join(path);
             if !skill_dir.join("manifest.json").exists() {
-                return Err(ManifestError::MissingFile(format!(
-                    "{path}/manifest.json"
-                )));
+                return Err(ManifestError::MissingFile(format!("{path}/manifest.json")));
             }
         }
         // registry_id refs are validated at install time, not load time
@@ -486,8 +493,7 @@ steps:
         fs::remove_file(root.join("prompts/compare.txt"))
             .expect("prompt file should be removable for the test");
 
-        let error =
-            SkillPackage::load_from_dir(&root).expect_err("missing prompt ref should fail");
+        let error = SkillPackage::load_from_dir(&root).expect_err("missing prompt ref should fail");
 
         match error {
             ManifestError::MissingFile(path) => {
@@ -548,7 +554,9 @@ steps:
         let skill_dir = root.join("skills").join("my-skill");
         fs::create_dir_all(skill_dir.join("schemas")).unwrap();
         fs::create_dir_all(skill_dir.join("prompts")).unwrap();
-        fs::write(skill_dir.join("manifest.json"), r#"{
+        fs::write(
+            skill_dir.join("manifest.json"),
+            r#"{
             "schema_version": "1.0", "id": "my-skill", "name": "My Skill",
             "version": "0.1.0", "publisher": "test",
             "entrypoint": "workflow.yaml",
@@ -556,7 +564,9 @@ steps:
             "outputs_schema": "schemas/output.schema.json",
             "permissions": {"filesystem": "none", "network": "none", "clipboard": false},
             "execution": {"sandbox_profile": "strict", "timeout_seconds": 30, "memory_mb": 512}
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         fs::write(skill_dir.join("workflow.yaml"), "name: test\nsteps: []").unwrap();
         fs::write(skill_dir.join("schemas/input.schema.json"), "{}").unwrap();
         fs::write(skill_dir.join("schemas/output.schema.json"), "{}").unwrap();
@@ -565,10 +575,16 @@ steps:
         // Create command
         let cmd_dir = root.join("commands");
         fs::create_dir_all(&cmd_dir).unwrap();
-        fs::write(cmd_dir.join("my-command.md"), "---\nname: my-command\ndescription: test\n---\nDo the thing.").unwrap();
+        fs::write(
+            cmd_dir.join("my-command.md"),
+            "---\nname: my-command\ndescription: test\n---\nDo the thing.",
+        )
+        .unwrap();
 
         // Create plugin.json
-        fs::write(root.join("plugin.json"), r#"{
+        fs::write(
+            root.join("plugin.json"),
+            r#"{
             "schema_version": "1.0",
             "id": "test-plugin",
             "name": "Test Plugin",
@@ -593,7 +609,9 @@ steps:
             "user_config": {
                 "api_key": { "description": "Your API key", "sensitive": true }
             }
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -621,10 +639,14 @@ steps:
     fn plugin_rejects_empty_components() {
         let root = temp_root("plugin-empty");
         fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("plugin.json"), r#"{
+        fs::write(
+            root.join("plugin.json"),
+            r#"{
             "schema_version": "1.0", "id": "empty", "name": "Empty",
             "version": "0.1.0", "publisher": "test"
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
 
         let err = PluginPackage::load_from_dir(&root).expect_err("empty plugin should fail");
         assert!(matches!(err, ManifestError::Invalid(msg) if msg.contains("at least one")));
@@ -636,13 +658,18 @@ steps:
     fn plugin_rejects_missing_skill_manifest() {
         let root = temp_root("plugin-missing-skill");
         fs::create_dir_all(root.join("skills/bad-skill")).unwrap();
-        fs::write(root.join("plugin.json"), r#"{
+        fs::write(
+            root.join("plugin.json"),
+            r#"{
             "schema_version": "1.0", "id": "bad", "name": "Bad",
             "version": "0.1.0", "publisher": "test",
             "skills": [{ "path": "./skills/bad-skill" }]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
 
-        let err = PluginPackage::load_from_dir(&root).expect_err("missing skill manifest should fail");
+        let err =
+            PluginPackage::load_from_dir(&root).expect_err("missing skill manifest should fail");
         assert!(matches!(err, ManifestError::MissingFile(f) if f.contains("manifest.json")));
 
         let _ = fs::remove_dir_all(root);
@@ -652,11 +679,15 @@ steps:
     fn plugin_rejects_skill_ref_without_path_or_registry_id() {
         let root = temp_root("plugin-bad-ref");
         fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("plugin.json"), r#"{
+        fs::write(
+            root.join("plugin.json"),
+            r#"{
             "schema_version": "1.0", "id": "bad", "name": "Bad",
             "version": "0.1.0", "publisher": "test",
             "skills": [{}]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
 
         let err = PluginPackage::load_from_dir(&root).expect_err("bad ref should fail");
         assert!(matches!(err, ManifestError::Invalid(msg) if msg.contains("path")));
@@ -671,17 +702,28 @@ steps:
         // Command needed so plugin has at least one component besides the registry skill
         let cmd_dir = root.join("commands");
         fs::create_dir_all(&cmd_dir).unwrap();
-        fs::write(cmd_dir.join("cmd.md"), "---\nname: cmd\ndescription: test\n---\nDo it.").unwrap();
+        fs::write(
+            cmd_dir.join("cmd.md"),
+            "---\nname: cmd\ndescription: test\n---\nDo it.",
+        )
+        .unwrap();
 
-        fs::write(root.join("plugin.json"), r#"{
+        fs::write(
+            root.join("plugin.json"),
+            r#"{
             "schema_version": "1.0", "id": "reg", "name": "Registry Ref",
             "version": "0.1.0", "publisher": "test",
             "skills": [{ "registry_id": "sprint-planning", "min_version": "1.0.0" }],
             "commands": [{ "path": "./commands/cmd.md" }]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
 
         let pkg = PluginPackage::load_from_dir(&root).expect("registry ref should load");
-        assert_eq!(pkg.manifest.skills[0].registry_id.as_deref(), Some("sprint-planning"));
+        assert_eq!(
+            pkg.manifest.skills[0].registry_id.as_deref(),
+            Some("sprint-planning")
+        );
 
         let _ = fs::remove_dir_all(root);
     }

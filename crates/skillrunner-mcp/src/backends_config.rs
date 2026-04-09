@@ -24,13 +24,13 @@
 //! ```
 
 use crate::aggregator::{
-    BackendConnection, HttpBackend, StdioBackend, ToolVisibility, sanitize_id,
+    sanitize_id, BackendConnection, HttpBackend, StdioBackend, ToolVisibility,
 };
-use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use skillrunner_core::state::AppState;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
 /// Top-level structure of `backends.yaml`.
@@ -109,8 +109,8 @@ pub fn load_local_backends(state: &AppState) -> Result<Vec<BackendConnection>> {
         return Ok(vec![]);
     }
 
-    let config: BackendsConfig = serde_yaml::from_str(&content)
-        .with_context(|| format!("failed to parse {config_path}"))?;
+    let config: BackendsConfig =
+        serde_yaml::from_str(&content).with_context(|| format!("failed to parse {config_path}"))?;
 
     let mut connections = Vec::new();
 
@@ -224,7 +224,10 @@ backends:
         assert_eq!(entry.name, "GitHub");
         assert_eq!(entry.transport, "stdio");
         assert_eq!(entry.command.as_deref(), Some("npx"));
-        assert_eq!(entry.args, vec!["-y", "@modelcontextprotocol/server-github"]);
+        assert_eq!(
+            entry.args,
+            vec!["-y", "@modelcontextprotocol/server-github"]
+        );
         assert_eq!(
             entry.env.get("GITHUB_TOKEN").map(String::as_str),
             Some("ghp_xxxx")
@@ -375,7 +378,10 @@ backends:
         .expect("write config");
 
         let backends = load_local_backends(&state).expect("should succeed");
-        assert!(backends.is_empty(), "backend without command should be skipped");
+        assert!(
+            backends.is_empty(),
+            "backend without command should be skipped"
+        );
         cleanup(&state);
     }
 

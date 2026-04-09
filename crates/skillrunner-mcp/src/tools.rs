@@ -238,7 +238,8 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
 
         tools.push(ToolDefinition {
             name: "skillclub_logout".to_string(),
-            description: "Log out of the SkillClub registry. Clears stored authentication tokens.".to_string(),
+            description: "Log out of the SkillClub registry. Clears stored authentication tokens."
+                .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {},
@@ -278,7 +279,8 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
 
         tools.push(ToolDefinition {
             name: "skillclub_info".to_string(),
-            description: "Show detailed information about an installed SkillClub skill.".to_string(),
+            description: "Show detailed information about an installed SkillClub skill."
+                .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -575,7 +577,14 @@ pub fn handle_tool_call(
         "skillclub_plugin_publish" => handle_plugin_publish(arguments, state, registry_url),
         "skillclub_plugin_export" => handle_plugin_export(arguments),
         "skillclub_plugin_import" => handle_plugin_import(arguments),
-        _ => handle_skill_run(name, arguments, state, policy_client, model_client, registry_client),
+        _ => handle_skill_run(
+            name,
+            arguments,
+            state,
+            policy_client,
+            model_client,
+            registry_client,
+        ),
     };
 
     // Buffer audit event for tool calls (best-effort, don't fail the call)
@@ -624,7 +633,11 @@ fn handle_list(state: &AppState) -> ToolCallResult {
 
     let skills: Vec<serde_json::Value> = rows.filter_map(|r| r.ok()).collect();
 
-    let footer = if is_managed(state) { GOVERNANCE_FOOTER } else { "" };
+    let footer = if is_managed(state) {
+        GOVERNANCE_FOOTER
+    } else {
+        ""
+    };
 
     if skills.is_empty() {
         ToolCallResult::success(format!("No skills installed.{footer}"))
@@ -642,7 +655,10 @@ fn handle_search(arguments: &serde_json::Value, registry_url: &Option<String>) -
         None => return ToolCallResult::error("No registry URL configured"),
     };
 
-    let query = arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    let query = arguments
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     let registry = RegistryClient::new(url);
     match registry.search_skills(query) {
@@ -686,7 +702,11 @@ fn handle_install(
             let utf8_path = camino::Utf8Path::new(local_path);
             let pkg = match SkillPackage::load_from_dir(utf8_path) {
                 Ok(p) => p,
-                Err(e) => return ToolCallResult::error(format!("Failed to load skill bundle at {local_path}: {e}")),
+                Err(e) => {
+                    return ToolCallResult::error(format!(
+                        "Failed to load skill bundle at {local_path}: {e}"
+                    ))
+                }
             };
             let id = pkg.manifest.id.clone();
             let ver = pkg.manifest.version.to_string();
@@ -701,7 +721,11 @@ fn handle_install(
         (None, Some(id)) => {
             let url = match registry_url {
                 Some(u) => u,
-                None => return ToolCallResult::error("No registry URL configured. Provide a local 'path' instead."),
+                None => {
+                    return ToolCallResult::error(
+                        "No registry URL configured. Provide a local 'path' instead.",
+                    )
+                }
             };
             let version = arguments.get("version").and_then(|v| v.as_str());
             let registry = RegistryClient::new(url);
@@ -713,7 +737,9 @@ fn handle_install(
             }
         }
         // Neither provided
-        (None, None) => ToolCallResult::error("Provide either 'path' (local install) or 'skill_id' (registry install)"),
+        (None, None) => ToolCallResult::error(
+            "Provide either 'path' (local install) or 'skill_id' (registry install)",
+        ),
     }
 }
 
@@ -724,9 +750,9 @@ fn handle_uninstall(arguments: &serde_json::Value, state: &AppState) -> ToolCall
     };
 
     match uninstall_skill(state, skill_id) {
-        Ok(Some(version)) => ToolCallResult::success(format!(
-            "Successfully uninstalled {skill_id}@{version}."
-        )),
+        Ok(Some(version)) => {
+            ToolCallResult::success(format!("Successfully uninstalled {skill_id}@{version}."))
+        }
         Ok(None) => ToolCallResult::error(format!("Skill '{skill_id}' is not installed.")),
         Err(e) => ToolCallResult::error(format!("Failed to uninstall '{skill_id}': {e}")),
     }
@@ -845,7 +871,13 @@ fn handle_author(arguments: &serde_json::Value) -> ToolCallResult {
     let skill_id: String = name
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .split('-')
         .filter(|s| !s.is_empty())
@@ -937,9 +969,7 @@ fn handle_publish(
     let tokens = match auth::load_tokens(state, url) {
         Ok(Some(t)) => t,
         Ok(None) => {
-            return ToolCallResult::error(
-                "Not logged in. Run `skillrunner auth login` first.",
-            )
+            return ToolCallResult::error("Not logged in. Run `skillrunner auth login` first.")
         }
         Err(e) => return ToolCallResult::error(format!("Failed to load auth tokens: {e}")),
     };
@@ -958,8 +988,14 @@ fn handle_publish(
             // Clean up archive
             let _ = fs::remove_file(&archive_path);
 
-            let skill_id = resp.get("skill_id").and_then(|v| v.as_str()).unwrap_or("unknown");
-            let version = resp.get("version").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let skill_id = resp
+                .get("skill_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let version = resp
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             format!("Published {skill_id}@{version} to registry successfully.")
         }
         Err(e) => {
@@ -990,11 +1026,16 @@ fn handle_publish(
 /// 1. Load stored tokens
 /// 2. If tokens exist, return the access token (caller will handle 401 retry)
 /// 3. If no tokens, return an elicitation prompt
-fn ensure_auth(state: &AppState, registry_url: &str) -> std::result::Result<String, ToolCallResult> {
+fn ensure_auth(
+    state: &AppState,
+    registry_url: &str,
+) -> std::result::Result<String, ToolCallResult> {
     match auth::load_tokens(state, registry_url) {
         Ok(Some(tokens)) => Ok(tokens.access_token),
         Ok(None) => Err(auth_elicitation_prompt(registry_url)),
-        Err(e) => Err(ToolCallResult::error(format!("Failed to load auth tokens: {e}"))),
+        Err(e) => Err(ToolCallResult::error(format!(
+            "Failed to load auth tokens: {e}"
+        ))),
     }
 }
 
@@ -1093,7 +1134,11 @@ fn handle_login(
 
     let user_info = match auth_client.me(&tokens.access_token) {
         Ok(u) => u,
-        Err(e) => return ToolCallResult::error(format!("Login succeeded but failed to fetch user info: {e}")),
+        Err(e) => {
+            return ToolCallResult::error(format!(
+                "Login succeeded but failed to fetch user info: {e}"
+            ))
+        }
     };
 
     ToolCallResult::success(format!(
@@ -1150,7 +1195,11 @@ fn handle_mcp_catalog(state: &AppState, registry_url: &Option<String>) -> ToolCa
                 })
                 .collect();
 
-            let footer = if is_managed(state) { GOVERNANCE_FOOTER } else { "" };
+            let footer = if is_managed(state) {
+                GOVERNANCE_FOOTER
+            } else {
+                ""
+            };
 
             if formatted.is_empty() {
                 ToolCallResult::success(format!(
@@ -1219,7 +1268,9 @@ fn handle_mcp_request(
                 // Retry with refreshed token
                 match registry.submit_mcp_request(server_name, package_source, &new_token) {
                     Ok(v) => v,
-                    Err(e) => return ToolCallResult::error(format!("Failed to submit request: {e}")),
+                    Err(e) => {
+                        return ToolCallResult::error(format!("Failed to submit request: {e}"))
+                    }
                 }
             } else {
                 return ToolCallResult::error(format!("Failed to submit request: {e}"));
@@ -1233,13 +1284,11 @@ fn handle_mcp_request(
         .unwrap_or("unknown");
 
     match req_status {
-        "approved" => {
-            ToolCallResult::success(format!(
-                "Request for '{}' was approved! \
+        "approved" => ToolCallResult::success(format!(
+            "Request for '{}' was approved! \
                  Use `skillclub_mcp_install` with server_name '{}' to activate it now.",
-                server_name, server_name
-            ))
-        }
+            server_name, server_name
+        )),
         "pending" => ToolCallResult::success(format!(
             "Request for '{}' has been submitted and is pending IT review.\n\n\
              Your admin will review it in the SkillClub portal. \
@@ -1247,10 +1296,7 @@ fn handle_mcp_request(
              `skillclub_mcp_install` to activate it once approved.",
             server_name
         )),
-        _ => ToolCallResult::success(format!(
-            "Request submitted with status: {}",
-            req_status
-        )),
+        _ => ToolCallResult::success(format!("Request submitted with status: {}", req_status)),
     }
 }
 
@@ -1283,7 +1329,9 @@ fn handle_mcp_status(state: &AppState, registry_url: &Option<String>) -> ToolCal
                 };
                 match registry.list_mcp_requests(&new_token) {
                     Ok(v) => v,
-                    Err(e) => return ToolCallResult::error(format!("Failed to fetch requests: {e}")),
+                    Err(e) => {
+                        return ToolCallResult::error(format!("Failed to fetch requests: {e}"))
+                    }
                 }
             } else {
                 return ToolCallResult::error(format!("Failed to fetch requests: {e}"));
@@ -1423,9 +1471,18 @@ fn format_import_preview(preview: &serde_json::Value) -> String {
     match import_type {
         "skill" => {
             let name = preview.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-            let skill_id = preview.get("skill_id").and_then(|v| v.as_str()).unwrap_or("?");
-            let version = preview.get("version").and_then(|v| v.as_str()).unwrap_or("?");
-            let publisher = preview.get("publisher").and_then(|v| v.as_str()).unwrap_or("?");
+            let skill_id = preview
+                .get("skill_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let version = preview
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let publisher = preview
+                .get("publisher")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
             let desc = preview
                 .get("description")
                 .and_then(|v| v.as_str())
@@ -1488,7 +1545,10 @@ fn format_import_result(result: &serde_json::Value) -> String {
                 .get("skill_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
-            let version = result.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+            let version = result
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
             let status = result
                 .get("review_status")
                 .and_then(|v| v.as_str())
@@ -1510,7 +1570,11 @@ fn format_import_result(result: &serde_json::Value) -> String {
             let status = result.get("status").and_then(|v| v.as_str()).unwrap_or("?");
             let mut text = format!(
                 "MCP Server import {}!\n  Server: {}\n  Package: {}\n  Status: {}",
-                if status == "approved" { "approved" } else { "submitted" },
+                if status == "approved" {
+                    "approved"
+                } else {
+                    "submitted"
+                },
                 name,
                 pkg,
                 status
@@ -1624,7 +1688,10 @@ fn handle_plugin_search(
         None => return ToolCallResult::error("No registry URL configured."),
     };
 
-    let query = arguments.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    let query = arguments
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     let registry = RegistryClient::new(url);
     match registry.search_plugins(query) {
@@ -1662,19 +1729,22 @@ fn handle_plugin_info(arguments: &serde_json::Value, state: &AppState) -> ToolCa
     };
 
     match skillrunner_core::plugin::get_installed_plugin(state, plugin_id) {
-        Ok(Some(plugin)) => ToolCallResult::success(serde_json::to_string_pretty(&serde_json::json!({
-            "id": plugin.id,
-            "name": plugin.manifest.name,
-            "version": plugin.version,
-            "description": plugin.manifest.description,
-            "status": plugin.status,
-            "components": {
-                "skills": plugin.components.skill_ids,
-                "mcp_servers": plugin.components.mcp_server_names,
-                "commands": plugin.components.command_names,
-            },
-            "installed_at": plugin.installed_at,
-        })).unwrap_or_default()),
+        Ok(Some(plugin)) => ToolCallResult::success(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": plugin.id,
+                "name": plugin.manifest.name,
+                "version": plugin.version,
+                "description": plugin.manifest.description,
+                "status": plugin.status,
+                "components": {
+                    "skills": plugin.components.skill_ids,
+                    "mcp_servers": plugin.components.mcp_server_names,
+                    "commands": plugin.components.command_names,
+                },
+                "installed_at": plugin.installed_at,
+            }))
+            .unwrap_or_default(),
+        ),
         Ok(None) => ToolCallResult::error(format!("Plugin '{plugin_id}' is not installed.")),
         Err(e) => ToolCallResult::error(format!("Failed to get plugin info: {e}")),
     }
@@ -1711,7 +1781,8 @@ fn install_plugin_from_local(state: &AppState, plugin_path: &camino::Utf8Path) -
                 "installed_commands": result.components.command_names,
             });
             if !result.components.mcp_server_names.is_empty() {
-                response["mcp_servers_pending"] = serde_json::json!(result.components.mcp_server_names);
+                response["mcp_servers_pending"] =
+                    serde_json::json!(result.components.mcp_server_names);
                 response["note"] = serde_json::json!(
                     "MCP servers require approval. Use skillclub_mcp_request to request access, then skillclub_mcp_install to activate."
                 );
@@ -1749,14 +1820,17 @@ fn install_plugin_from_registry_slug(
                 "installed_commands": result.components.command_names,
             });
             if !result.components.mcp_server_names.is_empty() {
-                response["mcp_servers_pending"] = serde_json::json!(result.components.mcp_server_names);
+                response["mcp_servers_pending"] =
+                    serde_json::json!(result.components.mcp_server_names);
                 response["note"] = serde_json::json!(
                     "MCP servers require approval. Use skillclub_mcp_request to request access, then skillclub_mcp_install to activate."
                 );
             }
             ToolCallResult::success(serde_json::to_string_pretty(&response).unwrap_or_default())
         }
-        Err(e) => ToolCallResult::error(format!("Failed to install plugin '{slug}' from registry: {e}")),
+        Err(e) => ToolCallResult::error(format!(
+            "Failed to install plugin '{slug}' from registry: {e}"
+        )),
     }
 }
 
@@ -1767,11 +1841,14 @@ fn handle_plugin_uninstall(arguments: &serde_json::Value, state: &AppState) -> T
     };
 
     match skillrunner_core::plugin::uninstall_plugin(state, plugin_id) {
-        Ok(Some(version)) => ToolCallResult::success(serde_json::to_string_pretty(&serde_json::json!({
-            "status": "success",
-            "plugin_id": plugin_id,
-            "version_removed": version,
-        })).unwrap_or_default()),
+        Ok(Some(version)) => ToolCallResult::success(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "success",
+                "plugin_id": plugin_id,
+                "version_removed": version,
+            }))
+            .unwrap_or_default(),
+        ),
         Ok(None) => ToolCallResult::error(format!("Plugin '{plugin_id}' is not installed.")),
         Err(e) => ToolCallResult::error(format!("Failed to uninstall plugin: {e}")),
     }
@@ -1779,9 +1856,7 @@ fn handle_plugin_uninstall(arguments: &serde_json::Value, state: &AppState) -> T
 
 fn handle_plugin_list(state: &AppState) -> ToolCallResult {
     match skillrunner_core::plugin::list_installed_plugins(state) {
-        Ok(plugins) if plugins.is_empty() => {
-            ToolCallResult::success("No plugins installed.")
-        }
+        Ok(plugins) if plugins.is_empty() => ToolCallResult::success("No plugins installed."),
         Ok(plugins) => {
             let list: Vec<serde_json::Value> = plugins
                 .iter()
@@ -1797,7 +1872,9 @@ fn handle_plugin_list(state: &AppState) -> ToolCallResult {
                     })
                 })
                 .collect();
-            ToolCallResult::success(serde_json::to_string_pretty(&serde_json::json!(list)).unwrap_or_default())
+            ToolCallResult::success(
+                serde_json::to_string_pretty(&serde_json::json!(list)).unwrap_or_default(),
+            )
         }
         Err(e) => ToolCallResult::error(format!("Failed to list plugins: {e}")),
     }
@@ -1817,7 +1894,13 @@ fn handle_plugin_author(arguments: &serde_json::Value) -> ToolCallResult {
     // Derive plugin ID: lowercase, spaces and special chars become hyphens
     let plugin_id: String = name
         .chars()
-        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .split('-')
         .filter(|s| !s.is_empty())
@@ -1910,8 +1993,14 @@ fn handle_plugin_publish(
     let result = match registry.publish_plugin(&archive_path) {
         Ok(resp) => {
             let _ = fs::remove_file(&archive_path);
-            let slug = resp.get("slug").and_then(|v| v.as_str()).unwrap_or("unknown");
-            let version = resp.get("version").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let slug = resp
+                .get("slug")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let version = resp
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             format!("Published plugin {slug}@{version} to registry successfully.")
         }
         Err(e) => {
@@ -1952,9 +2041,7 @@ fn handle_plugin_export(arguments: &serde_json::Value) -> ToolCallResult {
     let out_path = camino::Utf8Path::new(output_dir);
 
     let result = match format {
-        "claude-code" => {
-            skillrunner_core::plugin_export::export_claude_code(plugin_path, out_path)
-        }
+        "claude-code" => skillrunner_core::plugin_export::export_claude_code(plugin_path, out_path),
         "mcpb" => skillrunner_core::plugin_export::export_mcpb(plugin_path, out_path),
         other => {
             return ToolCallResult::error(format!(
@@ -1964,9 +2051,9 @@ fn handle_plugin_export(arguments: &serde_json::Value) -> ToolCallResult {
     };
 
     match result {
-        Ok(exported_path) => ToolCallResult::success(format!(
-            "Plugin exported successfully to: {exported_path}"
-        )),
+        Ok(exported_path) => {
+            ToolCallResult::success(format!("Plugin exported successfully to: {exported_path}"))
+        }
         Err(e) => ToolCallResult::error(format!("Export failed: {e}")),
     }
 }
@@ -1989,11 +2076,13 @@ fn handle_plugin_import(arguments: &serde_json::Value) -> ToolCallResult {
 
     let format = match plugin_import::detect_plugin_format(&path) {
         Some(f) => f,
-        None => return ToolCallResult::error(format!(
-            "Could not detect plugin format at '{}'. \
+        None => {
+            return ToolCallResult::error(format!(
+                "Could not detect plugin format at '{}'. \
              Expected a Claude Code plugin directory (with .claude-plugin/) or a .mcpb file.",
-            path
-        )),
+                path
+            ))
+        }
     };
 
     let format_label = format!("{:?}", format);
@@ -2002,9 +2091,7 @@ fn handle_plugin_import(arguments: &serde_json::Value) -> ToolCallResult {
         plugin_import::ExternalPluginFormat::ClaudeCode => {
             plugin_import::import_claude_code_plugin(&path, &out)
         }
-        plugin_import::ExternalPluginFormat::Mcpb => {
-            plugin_import::import_mcpb(&path, &out)
-        }
+        plugin_import::ExternalPluginFormat::Mcpb => plugin_import::import_mcpb(&path, &out),
     };
 
     match result {
@@ -2054,7 +2141,14 @@ fn handle_skill_run(
         }
     }
 
-    match run_skill(state, policy_client, skill_id, arguments, model_client, registry_client) {
+    match run_skill(
+        state,
+        policy_client,
+        skill_id,
+        arguments,
+        model_client,
+        registry_client,
+    ) {
         Ok(result) => {
             // Return the last step's output, or a summary if no output
             let output = result
@@ -2095,10 +2189,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        Utf8PathBuf::from_path_buf(
-            std::env::temp_dir().join(format!("mcp-tests-{label}-{nanos}")),
-        )
-        .unwrap()
+        Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!("mcp-tests-{label}-{nanos}")))
+            .unwrap()
     }
 
     fn write_test_skill(root: &Utf8PathBuf) {
@@ -2185,16 +2277,21 @@ mod tests {
         let tools = build_tool_list(&state, &None);
         let skill_tool = tools.iter().find(|t| t.name == "test-skill");
 
-        assert!(skill_tool.is_some(), "installed skill should appear as tool");
+        assert!(
+            skill_tool.is_some(),
+            "installed skill should appear as tool"
+        );
         let tool = skill_tool.unwrap();
         // Description includes auto-generated triggers from the description
         assert!(
-            tool.description.starts_with("A test skill for MCP testing (v0.1.0)"),
+            tool.description
+                .starts_with("A test skill for MCP testing (v0.1.0)"),
             "description should start with versioned desc, got: {}",
             tool.description
         );
         assert!(
-            tool.description.contains("Use this tool when the user asks to:"),
+            tool.description
+                .contains("Use this tool when the user asks to:"),
             "description should contain auto-generated trigger phrases, got: {}",
             tool.description
         );
@@ -2219,7 +2316,10 @@ mod tests {
         let result = handle_list(&state);
         assert!(result.is_error.is_none());
         let text = &result.content[0].text;
-        assert!(text.contains("test-skill"), "should list test-skill, got: {text}");
+        assert!(
+            text.contains("test-skill"),
+            "should list test-skill, got: {text}"
+        );
 
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&skill_root);
@@ -2255,7 +2355,9 @@ mod tests {
             &Some("http://localhost:8000".to_string()),
         );
         assert_eq!(result.is_error, Some(true));
-        assert!(result.content[0].text.contains("path") || result.content[0].text.contains("skill_id"));
+        assert!(
+            result.content[0].text.contains("path") || result.content[0].text.contains("skill_id")
+        );
 
         let _ = fs::remove_dir_all(&state_root);
     }
@@ -2273,7 +2375,11 @@ mod tests {
             &state,
             &None, // no registry needed for local install
         );
-        assert!(result.is_error.is_none(), "got: {:?}", result.content[0].text);
+        assert!(
+            result.is_error.is_none(),
+            "got: {:?}",
+            result.content[0].text
+        );
         assert!(result.content[0].text.contains("test-skill"));
         assert!(result.content[0].text.contains("0.1.0"));
 
@@ -2347,7 +2453,11 @@ mod tests {
             "output_dir": out_dir.as_str(),
         }));
 
-        assert!(result.is_error.is_none(), "got: {:?}", result.content[0].text);
+        assert!(
+            result.is_error.is_none(),
+            "got: {:?}",
+            result.content[0].text
+        );
         let text = &result.content[0].text;
         assert!(text.contains("my-test-skill"), "got: {text}");
 
@@ -2429,11 +2539,7 @@ mod tests {
         let state_root = temp_root("publish-no-reg");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
 
-        let result = handle_publish(
-            &serde_json::json!({"path": "/tmp/fake"}),
-            &state,
-            &None,
-        );
+        let result = handle_publish(&serde_json::json!({"path": "/tmp/fake"}), &state, &None);
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("registry"));
 
@@ -2586,9 +2692,7 @@ mod tests {
             .mock("GET", "/portal/auth/me")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(
-                r#"{"id":"user-1","email":"alice@example.com","display_name":"Alice"}"#,
-            )
+            .with_body(r#"{"id":"user-1","email":"alice@example.com","display_name":"Alice"}"#)
             .create();
 
         let state_root = temp_root("login-success");
@@ -2756,8 +2860,14 @@ mod tests {
         let tools = build_tool_list(&state, &Some("http://localhost:8000".to_string()));
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
-        assert!(names.contains(&"skillclub_login"), "login tool missing: {names:?}");
-        assert!(names.contains(&"skillclub_logout"), "logout tool missing: {names:?}");
+        assert!(
+            names.contains(&"skillclub_login"),
+            "login tool missing: {names:?}"
+        );
+        assert!(
+            names.contains(&"skillclub_logout"),
+            "logout tool missing: {names:?}"
+        );
 
         let _ = fs::remove_dir_all(&state_root);
     }
@@ -2770,8 +2880,14 @@ mod tests {
         let tools = build_tool_list(&state, &None);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
-        assert!(!names.contains(&"skillclub_login"), "login should not appear without registry");
-        assert!(!names.contains(&"skillclub_logout"), "logout should not appear without registry");
+        assert!(
+            !names.contains(&"skillclub_login"),
+            "login should not appear without registry"
+        );
+        assert!(
+            !names.contains(&"skillclub_logout"),
+            "logout should not appear without registry"
+        );
 
         let _ = fs::remove_dir_all(&state_root);
     }
@@ -2835,12 +2951,7 @@ mod tests {
         let aggregator = crate::aggregator::BackendRegistry::new();
         let registry_url = Some("http://localhost:8000".to_string());
 
-        let result = handle_mcp_install(
-            &serde_json::json!({}),
-            &state,
-            &registry_url,
-            &aggregator,
-        );
+        let result = handle_mcp_install(&serde_json::json!({}), &state, &registry_url, &aggregator);
         assert!(result.is_error.unwrap_or(false));
         assert!(result.content[0].text.contains("server_name"));
 
@@ -2896,7 +3007,9 @@ mod tests {
         );
         // After sync succeeds with empty list, server won't be in aggregator
         assert!(
-            result.content[0].text.contains("not in the approved server list"),
+            result.content[0]
+                .text
+                .contains("not in the approved server list"),
             "error should mention approval, got: {}",
             result.content[0].text
         );
@@ -2973,11 +3086,7 @@ mod tests {
         let aggregator = crate::aggregator::BackendRegistry::new();
         let registry_url = Some("http://localhost:8000".to_string());
 
-        let result = handle_mcp_uninstall(
-            &serde_json::json!({}),
-            &registry_url,
-            &aggregator,
-        );
+        let result = handle_mcp_uninstall(&serde_json::json!({}), &registry_url, &aggregator);
         assert!(result.is_error.unwrap_or(false));
         assert!(result.content[0].text.contains("server_name"));
     }

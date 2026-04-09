@@ -85,10 +85,7 @@ pub fn uninstall_skill(state: &AppState, skill_id: &str) -> Result<Option<String
     }
 
     // Remove DB records
-    conn.execute(
-        "DELETE FROM skill_versions WHERE skill_id = ?1",
-        [skill_id],
-    )?;
+    conn.execute("DELETE FROM skill_versions WHERE skill_id = ?1", [skill_id])?;
     conn.execute(
         "DELETE FROM installed_skills WHERE skill_id = ?1",
         [skill_id],
@@ -324,7 +321,10 @@ mod tests {
         let version = install_example_skill(&state);
 
         let install_root = state.root_dir.join("skills").join("contract-compare");
-        assert!(install_root.exists(), "install dir should exist before uninstall");
+        assert!(
+            install_root.exists(),
+            "install dir should exist before uninstall"
+        );
 
         let result = uninstall_skill(&state, "contract-compare").expect("uninstall should succeed");
         assert_eq!(result, Some(version), "should return the active version");
@@ -376,14 +376,24 @@ mod tests {
         let active_path = install_root.join("active");
 
         #[cfg(target_family = "unix")]
-        assert!(active_path.exists(), "active symlink should exist before deactivate");
+        assert!(
+            active_path.exists(),
+            "active symlink should exist before deactivate"
+        );
 
-        let changed = deactivate_skill(&state, "contract-compare").expect("deactivate should succeed");
-        assert!(changed, "should return true when deactivating an active skill");
+        let changed =
+            deactivate_skill(&state, "contract-compare").expect("deactivate should succeed");
+        assert!(
+            changed,
+            "should return true when deactivating an active skill"
+        );
 
         // Symlink should be removed
         #[cfg(target_family = "unix")]
-        assert!(!active_path.exists() && !active_path.is_symlink(), "active symlink should be removed");
+        assert!(
+            !active_path.exists() && !active_path.is_symlink(),
+            "active symlink should be removed"
+        );
 
         // Versioned files should still exist
         let conn = Connection::open(&state.db_path).unwrap();
@@ -409,8 +419,12 @@ mod tests {
         deactivate_skill(&state, "contract-compare").expect("deactivate should succeed");
 
         // Now reactivate
-        let changed = reactivate_skill(&state, "contract-compare").expect("reactivate should succeed");
-        assert!(changed, "should return true when reactivating a deactivated skill");
+        let changed =
+            reactivate_skill(&state, "contract-compare").expect("reactivate should succeed");
+        assert!(
+            changed,
+            "should return true when reactivating a deactivated skill"
+        );
 
         let install_root = state.root_dir.join("skills").join("contract-compare");
         let active_path = install_root.join("active");
@@ -438,7 +452,8 @@ mod tests {
         install_example_skill(&state);
 
         deactivate_skill(&state, "contract-compare").expect("first deactivate should succeed");
-        let changed = deactivate_skill(&state, "contract-compare").expect("second deactivate should not error");
+        let changed = deactivate_skill(&state, "contract-compare")
+            .expect("second deactivate should not error");
         assert!(!changed, "should return false when already deactivated");
 
         let _ = fs::remove_dir_all(&state.root_dir);

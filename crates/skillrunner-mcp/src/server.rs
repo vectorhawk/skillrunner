@@ -85,14 +85,18 @@ impl ServerState {
             return false;
         };
 
-        let policy_client = HttpPolicyClient::new(RegistryClient::new(&registry.base_url), app_state);
+        let policy_client =
+            HttpPolicyClient::new(RegistryClient::new(&registry.base_url), app_state);
 
         self.last_skill_sync = Some(Instant::now());
 
         match check_skill_updates(app_state, registry, &policy_client) {
             Ok(0) => false,
             Ok(count) => {
-                info!(count, "background skill sync updated skills — will fire list_changed");
+                info!(
+                    count,
+                    "background skill sync updated skills — will fire list_changed"
+                );
                 true
             }
             Err(e) => {
@@ -284,7 +288,11 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
 
     info!(
         "MCP server starting (ollama={}, registry={})",
-        if ollama_available { "available" } else { "unavailable" },
+        if ollama_available {
+            "available"
+        } else {
+            "unavailable"
+        },
         config.registry_url.as_deref().unwrap_or("none"),
     );
 
@@ -541,10 +549,7 @@ fn handle_tools_list(
         if name.is_empty() {
             continue;
         }
-        let description = bt["description"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let description = bt["description"].as_str().unwrap_or("").to_string();
         let input_schema = bt
             .get("inputSchema")
             .cloned()
@@ -598,11 +603,8 @@ fn handle_tools_call(
         );
     }
     if params.name == "skillclub_mcp_uninstall" {
-        let result = crate::tools::handle_mcp_uninstall(
-            &params.arguments,
-            &config.registry_url,
-            aggregator,
-        );
+        let result =
+            crate::tools::handle_mcp_uninstall(&params.arguments, &config.registry_url, aggregator);
         return JsonRpcResponse::success(
             request.id.clone(),
             serde_json::to_value(result).unwrap_or_default(),
@@ -670,7 +672,9 @@ fn handle_tools_call(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aggregator::{BackendConnection, HttpBackend, ToolDefinition as AggToolDef, ToolVisibility};
+    use crate::aggregator::{
+        BackendConnection, HttpBackend, ToolDefinition as AggToolDef, ToolVisibility,
+    };
 
     fn temp_state(label: &str) -> (AppState, camino::Utf8PathBuf) {
         let nanos = std::time::SystemTime::now()
@@ -761,7 +765,8 @@ mod tests {
         std::fs::write(
             state.root_dir.join("managed.json"),
             r#"{"managed": true, "org": "Acme Corp"}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let req = make_request(1, "initialize");
         let resp = handle_initialize(&req, &state);
@@ -781,7 +786,12 @@ mod tests {
         let req = make_request(2, "tools/list");
         let aggregator = BackendRegistry::new();
 
-        let resp = handle_tools_list(&req, &state, &Some("http://localhost:8000".to_string()), &aggregator);
+        let resp = handle_tools_list(
+            &req,
+            &state,
+            &Some("http://localhost:8000".to_string()),
+            &aggregator,
+        );
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
@@ -806,13 +816,11 @@ mod tests {
                     server_id: "github".to_string(),
                     name: "GitHub".to_string(),
                     url: "http://unused".to_string(),
-                    tools: vec![
-                        AggToolDef {
-                            name: "create_issue".to_string(),
-                            description: Some("Create a GitHub issue".to_string()),
-                            input_schema: None,
-                        },
-                    ],
+                    tools: vec![AggToolDef {
+                        name: "create_issue".to_string(),
+                        description: Some("Create a GitHub issue".to_string()),
+                        input_schema: None,
+                    }],
                     tool_visibility: ToolVisibility::All,
                     priority: 50,
                     auth_token: None,
@@ -827,7 +835,10 @@ mod tests {
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         // Namespaced aggregator tool should appear
-        assert!(names.contains(&"github__create_issue"), "expected github__create_issue in tool list: {names:?}");
+        assert!(
+            names.contains(&"github__create_issue"),
+            "expected github__create_issue in tool list: {names:?}"
+        );
         // Existing skill tool should still appear
         assert!(names.contains(&"skillclub_list"));
 
@@ -863,7 +874,10 @@ mod tests {
         }
 
         // Dispatch a namespaced tool call
-        let dispatch_result = aggregator.dispatch("github__create_issue", &serde_json::json!({"title": "test"}));
+        let dispatch_result = aggregator.dispatch(
+            "github__create_issue",
+            &serde_json::json!({"title": "test"}),
+        );
         // Should get Some(Err(...)) because the backend is unreachable, not None
         assert!(
             dispatch_result.is_some(),
@@ -894,7 +908,15 @@ mod tests {
             params: serde_json::json!({}),
         };
 
-        let resp = dispatch_request(&req, &state, &config, None, None, &aggregator, "test-machine");
+        let resp = dispatch_request(
+            &req,
+            &state,
+            &config,
+            None,
+            None,
+            &aggregator,
+            "test-machine",
+        );
         assert!(resp.error.is_some());
         assert_eq!(resp.error.as_ref().unwrap().code, METHOD_NOT_FOUND);
 
@@ -934,8 +956,7 @@ mod tests {
         );
 
         // Force the timestamp to look like it was 301 s ago → should attempt again.
-        server_state2.last_skill_sync =
-            Some(Instant::now() - Duration::from_secs(301));
+        server_state2.last_skill_sync = Some(Instant::now() - Duration::from_secs(301));
         // No skills installed so nothing updates, but the call should proceed (not throttle).
         // Result doesn't matter — we just verify no panic and the stamp is refreshed.
         let _result_unthrottled = server_state2.maybe_sync_skills(&state);

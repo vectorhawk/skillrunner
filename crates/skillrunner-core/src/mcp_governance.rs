@@ -81,7 +81,8 @@ impl RegistryClient {
             anyhow::bail!("registry returned HTTP {status} for MCP servers: {body}");
         }
 
-        resp.json().context("failed to deserialize MCP servers response")
+        resp.json()
+            .context("failed to deserialize MCP servers response")
     }
 }
 
@@ -117,7 +118,8 @@ impl RegistryClient {
             anyhow::bail!("request submission failed (HTTP {status}): {body}");
         }
 
-        resp.json().context("failed to deserialize request response")
+        resp.json()
+            .context("failed to deserialize request response")
     }
 
     /// List the current user's MCP server requests (portal endpoint).
@@ -140,7 +142,8 @@ impl RegistryClient {
             anyhow::bail!("failed to fetch requests (HTTP {status}): {body}");
         }
 
-        resp.json().context("failed to deserialize requests response")
+        resp.json()
+            .context("failed to deserialize requests response")
     }
 
     /// Preview an external import (skill or MCP server) before submitting.
@@ -169,7 +172,8 @@ impl RegistryClient {
             anyhow::bail!("import preview failed (HTTP {status}): {body}");
         }
 
-        resp.json().context("failed to deserialize import preview response")
+        resp.json()
+            .context("failed to deserialize import preview response")
     }
 
     /// Submit an external import (skill or MCP server) for approval.
@@ -197,7 +201,8 @@ impl RegistryClient {
             anyhow::bail!("import submit failed (HTTP {status}): {body}");
         }
 
-        resp.json().context("failed to deserialize import submit response")
+        resp.json()
+            .context("failed to deserialize import submit response")
     }
 }
 
@@ -351,9 +356,8 @@ pub fn flush_audit_buffer(state: &AppState, registry: &RegistryClient) -> Result
     ensure_audit_table(&conn)?;
 
     // Read all buffered events
-    let mut stmt = conn.prepare(
-        "SELECT id, event_json FROM mcp_audit_buffer ORDER BY id ASC LIMIT 500",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT id, event_json FROM mcp_audit_buffer ORDER BY id ASC LIMIT 500")?;
     let rows: Vec<(i64, String)> = stmt
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .filter_map(|r| r.ok())
@@ -387,7 +391,10 @@ pub fn flush_audit_buffer(state: &AppState, registry: &RegistryClient) -> Result
         .iter()
         .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
         .collect();
-    conn.execute(&sql, rusqlite::params_from_iter(params.iter().map(|b| b.as_ref())))?;
+    conn.execute(
+        &sql,
+        rusqlite::params_from_iter(params.iter().map(|b| b.as_ref())),
+    )?;
 
     info!(count = ids.len(), "flushed audit events to registry");
     Ok(ids.len())
@@ -607,17 +614,23 @@ mod tests {
             .match_header("authorization", "Bearer test-token")
             .with_status(201)
             .with_header("content-type", "application/json")
-            .with_body(r#"{
+            .with_body(
+                r#"{
                 "id": "req-123",
                 "server_name": "slack-mcp",
                 "status": "approved",
                 "reviewed_by": "system/auto-approve"
-            }"#)
+            }"#,
+            )
             .create();
 
         let client = RegistryClient::new(server.url());
         let result = client
-            .submit_mcp_request("slack-mcp", Some("@modelcontextprotocol/server-slack"), "test-token")
+            .submit_mcp_request(
+                "slack-mcp",
+                Some("@modelcontextprotocol/server-slack"),
+                "test-token",
+            )
             .unwrap();
 
         assert_eq!(result["status"].as_str().unwrap(), "approved");
@@ -651,13 +664,15 @@ mod tests {
             .match_header("authorization", "Bearer user-token")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{
+            .with_body(
+                r#"{
                 "items": [
                     {"id": "r1", "server_name": "github", "status": "approved"},
                     {"id": "r2", "server_name": "slack", "status": "pending"}
                 ],
                 "total": 2
-            }"#)
+            }"#,
+            )
             .create();
 
         let client = RegistryClient::new(server.url());
@@ -825,5 +840,4 @@ mod tests {
         assert!(entry.visible_tools.is_none());
         assert!(entry.priority.is_none());
     }
-
 }
