@@ -26,6 +26,7 @@
 use crate::aggregator::{
     BackendConnection, HttpBackend, StdioBackend, ToolVisibility, sanitize_id,
 };
+use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use skillrunner_core::state::AppState;
@@ -130,9 +131,11 @@ pub fn load_local_backends(state: &AppState) -> Result<Vec<BackendConnection>> {
                     name: entry.name.clone(),
                     command: command.clone(),
                     args: entry.args.clone(),
+                    env: entry.env.clone(),
                     tools: vec![],
                     tool_visibility: ToolVisibility::All,
                     priority: entry.priority,
+                    process: Arc::new(Mutex::new(None)),
                 }));
             }
             "http" => {

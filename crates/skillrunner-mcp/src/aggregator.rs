@@ -53,9 +53,9 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use tracing::{debug, info};
-#[cfg(feature = "registry")]
-use tracing::warn;
+use tracing::{debug, info, warn};
+
+use crate::stdio_process::StdioProcess;
 
 // ── Tool budget ───────────────────────────────────────────────────────────────
 
@@ -151,6 +151,10 @@ pub struct HttpBackend {
 }
 
 /// A stdio MCP backend — managed as a child process.
+///
+/// The `process` field holds the live child process once it has been lazily
+/// spawned. It is wrapped in `Arc<Mutex<Option<...>>>` so the struct remains
+/// `Clone` while still providing safe interior mutability.
 #[derive(Debug, Clone)]
 pub struct StdioBackend {
     /// Stable ID (used for tool namespacing).
@@ -161,12 +165,22 @@ pub struct StdioBackend {
     pub command: String,
     /// Arguments.
     pub args: Vec<String>,
+    /// Environment variables to pass to the child process.
+    pub env: HashMap<String, String>,
     /// Tools fetched from this backend (original names, not namespaced).
     pub tools: Vec<ToolDefinition>,
     /// Tool visibility policy from the registry catalog.
     pub tool_visibility: ToolVisibility,
     /// Priority for budget allocation.
     pub priority: u8,
+    /// Shared slot for the live child process (lazily spawned on first use).
+    ///
+    /// - `Arc` — `Clone` of `StdioBackend` shares the same running process.
+    /// - `Mutex<Option<...>>` — interior mutability; `None` until first use.
+    ///
+    /// Initialised to `Arc::new(Mutex::new(None))` at construction time and
+    /// preserved across `rebuild_with_tools` calls so we never orphan a child.
+    pub process: Arc<Mutex<Option<StdioProcess>>>,
 }
 
 /// A single MCP tool definition as returned by a backend's `tools/list`.
@@ -360,9 +374,11 @@ impl BackendRegistry {
                     name: entry.name.clone(),
                     command,
                     args,
+                    env: HashMap::new(), // registry path: env from server_config not yet extracted
                     tools: vec![], // populated by fetch_tools_from_backend
                     tool_visibility: visibility,
                     priority,
+                    process: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 })
             } else {
                 // HTTP backend — URL from gateway_url or server_config URL.
@@ -496,22 +512,37 @@ impl BackendRegistry {
             let server_id = conn.server_id().to_string();
 
             // Fetch tools from the backend (best-effort).
-            // When the registry feature is disabled, we skip HTTP tool fetching
-            // and register backends with empty tool lists (they'll be populated
-            // when the client sends tools/list to a running stdio process).
-            #[cfg(feature = "registry")]
-            let tools = self
-                .fetch_tools_from_backend(&conn)
-                .unwrap_or_else(|e| {
-                    warn!(
-                        server_id = %server_id,
-                        error = %e,
-                        "failed to fetch tools from local backend"
-                    );
+            // Stdio backends are always fetched regardless of feature flags.
+            // HTTP backends require the registry feature for the reqwest client.
+            let tools = match &conn {
+                BackendConnection::Stdio(_) => {
+                    self.fetch_tools_from_backend_stdio(&conn)
+                        .unwrap_or_else(|e| {
+                            warn!(
+                                server_id = %server_id,
+                                error = %e,
+                                "failed to fetch tools from stdio backend"
+                            );
+                            vec![]
+                        })
+                }
+                BackendConnection::Http(_) => {
+                    #[cfg(feature = "registry")]
+                    {
+                        self.fetch_tools_from_backend(&conn)
+                            .unwrap_or_else(|e| {
+                                warn!(
+                                    server_id = %server_id,
+                                    error = %e,
+                                    "failed to fetch tools from local http backend"
+                                );
+                                vec![]
+                            })
+                    }
+                    #[cfg(not(feature = "registry"))]
                     vec![]
-                });
-            #[cfg(not(feature = "registry"))]
-            let tools: Vec<ToolDefinition> = vec![];
+                }
+            };
 
             // Apply budget.
             let budget_slots = if inner.budget.has_room_for(tools.len()) {
@@ -583,42 +614,82 @@ impl BackendRegistry {
     ///
     /// Returns `None` if the tool name does not match any registered backend
     /// (i.e. it should be handled by the skill/governance layer instead).
+    ///
+    /// For HTTP backends the `inner` lock is held during the network call
+    /// (pre-existing behaviour). For stdio backends we extract the shared
+    /// process `Arc` and release `inner` before doing any I/O so that concurrent
+    /// `tools/list` requests are not blocked during a long-running tool call.
     #[allow(unused_variables)] // args used only with registry feature
     pub fn dispatch(&self, namespaced_tool: &str, args: &Value) -> Option<Result<Value>> {
         let (server_id, original_tool) = parse_tool_name(namespaced_tool)?;
 
-        let inner = self.inner.lock().unwrap();
-        let backend = inner.backends.get(server_id)?;
+        // ── Gather what we need from the locked inner state ──────────────────
+        // We extract the minimum information and release the lock before any I/O.
 
-        // Verify the tool exists on this backend.
-        let tool_exists = backend.tools().iter().any(|t| t.name == original_tool);
-        if !tool_exists {
-            return Some(Err(anyhow::anyhow!(
-                "tool '{}' not found on backend '{}'",
-                original_tool,
-                server_id
-            )));
+        enum DispatchTarget {
+            #[cfg(feature = "registry")]
+            Http { url: String, auth_token: Option<String> },
+            #[cfg(not(feature = "registry"))]
+            Http,
+            Stdio {
+                process: Arc<Mutex<Option<StdioProcess>>>,
+                command: String,
+                args_list: Vec<String>,
+                env: HashMap<String, String>,
+            },
         }
 
-        let result = match backend {
+        let target = {
+            let inner = self.inner.lock().unwrap();
+            let backend = inner.backends.get(server_id)?;
+
+            // Verify the tool exists on this backend.
+            let tool_exists = backend.tools().iter().any(|t| t.name == original_tool);
+            if !tool_exists {
+                return Some(Err(anyhow::anyhow!(
+                    "tool '{}' not found on backend '{}'",
+                    original_tool,
+                    server_id
+                )));
+            }
+
+            match backend {
+                #[cfg(feature = "registry")]
+                BackendConnection::Http(http) => DispatchTarget::Http {
+                    url: http.url.clone(),
+                    auth_token: http.auth_token.clone(),
+                },
+                #[cfg(not(feature = "registry"))]
+                BackendConnection::Http(_) => DispatchTarget::Http,
+                BackendConnection::Stdio(stdio) => {
+                    // Ensure the process handle exists; create it if this is
+                    // the first dispatch on this backend.
+                    let proc_arc = ensure_process_arc(stdio);
+                    DispatchTarget::Stdio {
+                        process: proc_arc,
+                        command: stdio.command.clone(),
+                        args_list: stdio.args.clone(),
+                        env: stdio.env.clone(),
+                    }
+                }
+            }
+            // inner lock released here
+        };
+
+        let result = match target {
             #[cfg(feature = "registry")]
-            BackendConnection::Http(http) => {
-                self.call_http_tool(&http.url, original_tool, args, http.auth_token.as_deref())
+            DispatchTarget::Http { url, auth_token } => {
+                self.call_http_tool(&url, original_tool, args, auth_token.as_deref())
             }
             #[cfg(not(feature = "registry"))]
-            BackendConnection::Http(_) => {
+            DispatchTarget::Http => {
                 Err(anyhow::anyhow!(
                     "HTTP backend dispatch requires the 'registry' feature for '{}'",
                     server_id
                 ))
             }
-            BackendConnection::Stdio(_stdio) => {
-                // Stdio dispatch is stubbed — full child-process management
-                // is out of scope for the initial aggregator implementation.
-                Err(anyhow::anyhow!(
-                    "stdio backend dispatch not yet implemented for '{}'",
-                    server_id
-                ))
+            DispatchTarget::Stdio { process, command, args_list, env } => {
+                call_stdio_tool_with_arc(&process, &command, &args_list, &env, original_tool, args)
             }
         };
 
@@ -626,9 +697,23 @@ impl BackendRegistry {
     }
 
     /// Shut down all backend connections gracefully.
+    ///
+    /// For stdio backends this sends a kill signal to each child process.
+    /// The backends map is cleared afterwards.
     pub fn shutdown(&self) {
         let mut inner = self.inner.lock().unwrap();
         let count = inner.backends.len();
+
+        for backend in inner.backends.values() {
+            if let BackendConnection::Stdio(stdio) = backend {
+                if let Ok(mut guard) = stdio.process.lock() {
+                    if let Some(proc) = guard.as_mut() {
+                        let _ = proc.shutdown();
+                    }
+                }
+            }
+        }
+
         inner.backends.clear();
         inner.budget.reset();
         info!(backends = count, "aggregator shut down");
@@ -739,10 +824,12 @@ impl BackendRegistry {
 
                 Ok(tools)
             }
-            BackendConnection::Stdio(_) => {
-                // Stdio tool listing requires spawning the process, which is
-                // deferred to a future implementation phase.
-                Ok(vec![])
+            BackendConnection::Stdio(stdio) => {
+                // Delegate to the shared stdio implementation.
+                self.fetch_tools_from_backend_stdio(conn).map_err(|e| {
+                    debug!(server_id = %stdio.server_id, error = %e, "stdio tool fetch failed");
+                    e
+                })
             }
         }
     }
@@ -794,6 +881,26 @@ impl BackendRegistry {
             .get("result")
             .cloned()
             .unwrap_or(Value::Null))
+    }
+
+    /// Fetch the tool list from a stdio backend by spawning (or reusing) its
+    /// child process. Exposed as `pub(crate)` so integration tests can call it
+    /// directly without going through the full `sync_local` path.
+    pub(crate) fn fetch_tools_from_backend_stdio(
+        &self,
+        conn: &BackendConnection,
+    ) -> Result<Vec<ToolDefinition>> {
+        let BackendConnection::Stdio(stdio) = conn else {
+            anyhow::bail!("fetch_tools_from_backend_stdio called on non-stdio backend");
+        };
+
+        let proc_arc = ensure_process_arc(stdio);
+        let mut guard = proc_arc.lock().unwrap();
+
+        spawn_if_needed(&mut guard, &stdio.command, &stdio.args, &stdio.env)?;
+
+        let proc = guard.as_mut().unwrap(); // guaranteed by spawn_if_needed
+        proc.list_tools()
     }
 }
 
@@ -875,7 +982,10 @@ fn extract_stdio_command(entry: &McpServerEntry) -> (String, Vec<String>) {
     )
 }
 
-/// Rebuild a `BackendConnection` with a new tool list (other fields unchanged).
+/// Rebuild a `BackendConnection` with a new tool list (all other fields unchanged).
+///
+/// For stdio backends the live `process` handle is preserved across rebuilds so
+/// we do not accidentally orphan a running child process when re-syncing.
 fn rebuild_with_tools(conn: BackendConnection, tools: Vec<ToolDefinition>) -> BackendConnection {
     match conn {
         BackendConnection::Http(mut b) => {
@@ -887,6 +997,68 @@ fn rebuild_with_tools(conn: BackendConnection, tools: Vec<ToolDefinition>) -> Ba
             BackendConnection::Stdio(b)
         }
     }
+}
+
+// ── Stdio process lifecycle helpers ───────────────────────────────────────────
+
+/// Return the shared process `Arc` from a `StdioBackend`.
+///
+/// The Arc is always present (initialised at construction time). Callers must
+/// use `spawn_if_needed` after locking the Arc to ensure the process is alive.
+fn ensure_process_arc(stdio: &StdioBackend) -> Arc<Mutex<Option<StdioProcess>>> {
+    stdio.process.clone()
+}
+
+/// Spawn a new `StdioProcess` into `slot` if the slot is `None` or the
+/// existing process is no longer alive.
+///
+/// Performs one restart attempt if the process has died. On failure the slot
+/// is left as `None` and the error is returned.
+fn spawn_if_needed(
+    slot: &mut Option<StdioProcess>,
+    command: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+) -> anyhow::Result<()> {
+    let needs_spawn = match slot.as_mut() {
+        None => true,
+        Some(p) => !p.is_alive(),
+    };
+
+    if !needs_spawn {
+        return Ok(());
+    }
+
+    if slot.is_some() {
+        warn!(command = %command, "stdio backend process died — attempting restart");
+        *slot = None;
+    }
+
+    let proc = StdioProcess::spawn(command, args, env)
+        .with_context(|| format!("failed to spawn stdio backend '{command}'"))?;
+
+    *slot = Some(proc);
+    debug!(command = %command, "stdio backend process spawned");
+    Ok(())
+}
+
+/// Call a tool on a stdio backend, handling lazy spawn and one-shot restart.
+///
+/// Accepts the `Arc<Mutex<Option<StdioProcess>>>` extracted from the backend
+/// so the outer `inner` lock can be released before any blocking I/O.
+fn call_stdio_tool_with_arc(
+    proc_arc: &Arc<Mutex<Option<StdioProcess>>>,
+    command: &str,
+    args_list: &[String],
+    env: &HashMap<String, String>,
+    tool_name: &str,
+    arguments: &Value,
+) -> Result<Value> {
+    let mut guard = proc_arc.lock().unwrap();
+    spawn_if_needed(&mut guard, command, args_list, env)?;
+
+    let proc = guard.as_mut().unwrap(); // guaranteed by spawn_if_needed
+    proc.call_tool(tool_name, arguments)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1184,3 +1356,7 @@ mod tests {
         assert!(registry.backend_tools("unknown").is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "aggregator_stdio_tests.rs"]
+mod stdio_tests;

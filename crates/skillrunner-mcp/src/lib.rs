@@ -3,6 +3,7 @@ pub mod backends_config;
 pub mod protocol;
 pub mod sampling;
 pub mod setup;
+pub mod stdio_process;
 
 #[cfg(feature = "registry")]
 pub mod server;
