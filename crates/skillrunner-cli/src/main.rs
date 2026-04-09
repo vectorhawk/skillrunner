@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
+use rusqlite::Connection;
 use skillrunner_core::{
     app::SkillRunnerApp,
     auth::{self, AuthClient},
@@ -18,10 +19,12 @@ use skillrunner_core::{
 };
 use skillrunner_manifest::SkillPackage;
 use skillrunner_mcp::{
-    server::{McpServerConfig, run_server},
-    setup::{configure_client, detect_ai_clients, install_claude_skills, install_npx_claude_hook, install_npx_shell_wrapper, mark_first_run_offered},
+    server::{run_server, McpServerConfig},
+    setup::{
+        configure_client, detect_ai_clients, install_claude_skills, install_npx_claude_hook,
+        install_npx_shell_wrapper, mark_first_run_offered,
+    },
 };
-use rusqlite::Connection;
 
 #[derive(Parser)]
 #[command(name = "skillrunner", version)]
@@ -131,14 +134,18 @@ enum AuthCommands {
 
 #[derive(Subcommand)]
 enum SkillCommands {
-    Import { path: Utf8PathBuf },
+    Import {
+        path: Utf8PathBuf,
+    },
     Search {
         query: String,
         /// SkillClub registry URL (overrides SKILLCLUB_REGISTRY_URL)
         #[arg(long)]
         registry_url: Option<String>,
     },
-    Info { path: Utf8PathBuf },
+    Info {
+        path: Utf8PathBuf,
+    },
     /// Install a skill from a local path or from the registry by ID
     Install {
         /// Skill ID (for registry install) or local path to a skill directory
@@ -159,9 +166,13 @@ enum SkillCommands {
         registry_url: Option<String>,
     },
     /// Uninstall an installed skill
-    Uninstall { skill_id: String },
+    Uninstall {
+        skill_id: String,
+    },
     List,
-    Resolve { skill_id: String },
+    Resolve {
+        skill_id: String,
+    },
     Run {
         skill_id: String,
         #[arg(long)]
@@ -179,7 +190,9 @@ enum SkillCommands {
         #[arg(long)]
         registry_url: Option<String>,
     },
-    Validate { path: Utf8PathBuf },
+    Validate {
+        path: Utf8PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -256,7 +269,12 @@ fn main() -> Result<()> {
 
     // MCP serve mode: force logs to stderr with no ANSI colors to avoid
     // contaminating the stdio JSON-RPC transport on stdout.
-    let is_mcp_serve = matches!(cli.command, Commands::Mcp { command: McpCommands::Serve { .. } });
+    let is_mcp_serve = matches!(
+        cli.command,
+        Commands::Mcp {
+            command: McpCommands::Serve { .. }
+        }
+    );
     if is_mcp_serve {
         tracing_subscriber::fmt()
             .with_env_filter("info")
@@ -267,11 +285,14 @@ fn main() -> Result<()> {
         tracing_subscriber::fmt().with_env_filter("info").init();
     }
     let app = SkillRunnerApp::bootstrap()?;
-    let managed_registry_url: Option<String> = load_managed_config(&app.state)
-        .and_then(|c| c.registry_url);
+    let managed_registry_url: Option<String> =
+        load_managed_config(&app.state).and_then(|c| c.registry_url);
 
     match cli.command {
-        Commands::Doctor { ollama_url, registry_url } => {
+        Commands::Doctor {
+            ollama_url,
+            registry_url,
+        } => {
             println!("SkillRunner root: {}", app.state.root_dir);
             println!("State DB:         {}", app.state.db_path);
             println!("Status:           OK");
@@ -281,7 +302,11 @@ fn main() -> Result<()> {
             if health.reachable {
                 match ollama.list_models() {
                     Ok(models) => {
-                        println!("Ollama:           OK ({} models available) at {}", models.len(), ollama_url);
+                        println!(
+                            "Ollama:           OK ({} models available) at {}",
+                            models.len(),
+                            ollama_url
+                        );
                         for m in &models {
                             println!("  - {}", m.name);
                         }
@@ -342,13 +367,22 @@ fn main() -> Result<()> {
             }
 
             // Aggregator backend status (from cache if available)
-            let effective_url_for_backends = resolve_registry_url(None, managed_registry_url.as_deref());
+            let effective_url_for_backends =
+                resolve_registry_url(None, managed_registry_url.as_deref());
             if let Some(url) = effective_url_for_backends {
                 let reg = RegistryClient::new(&url);
                 match mcp_governance::fetch_approved_servers(&app.state, &reg) {
                     Ok(resp) => {
-                        let approved = resp.servers.iter().filter(|s| s.status != "blocked").count();
-                        let blocked = resp.servers.iter().filter(|s| s.status == "blocked").count();
+                        let approved = resp
+                            .servers
+                            .iter()
+                            .filter(|s| s.status != "blocked")
+                            .count();
+                        let blocked = resp
+                            .servers
+                            .iter()
+                            .filter(|s| s.status == "blocked")
+                            .count();
                         println!(
                             "Aggregator:       {} backend(s) approved, {} blocked (run `skillrunner mcp backends` for details)",
                             approved, blocked
@@ -363,7 +397,11 @@ fn main() -> Result<()> {
             }
         }
         Commands::Auth { command } => match command {
-            AuthCommands::Login { registry_url, email, password } => {
+            AuthCommands::Login {
+                registry_url,
+                email,
+                password,
+            } => {
                 let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
 
                 let email = match email {
@@ -382,10 +420,18 @@ fn main() -> Result<()> {
                 };
                 let auth_client = AuthClient::new(&url);
                 let tokens = auth_client.login(&email, &password)?;
-                auth::save_tokens(&app.state, &url, &tokens.access_token, &tokens.refresh_token)?;
+                auth::save_tokens(
+                    &app.state,
+                    &url,
+                    &tokens.access_token,
+                    &tokens.refresh_token,
+                )?;
 
                 let user = auth_client.me(&tokens.access_token)?;
-                println!("Logged in as {} ({}) at {}", user.display_name, user.email, url);
+                println!(
+                    "Logged in as {} ({}) at {}",
+                    user.display_name, user.email, url
+                );
             }
             AuthCommands::Logout { registry_url } => {
                 let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
@@ -407,8 +453,13 @@ fn main() -> Result<()> {
             }
         },
         Commands::Mcp { command } => match command {
-            McpCommands::Serve { registry_url, ollama_url, model } => {
-                let effective_url = resolve_registry_url(registry_url, managed_registry_url.as_deref());
+            McpCommands::Serve {
+                registry_url,
+                ollama_url,
+                model,
+            } => {
+                let effective_url =
+                    resolve_registry_url(registry_url, managed_registry_url.as_deref());
                 let config = McpServerConfig {
                     registry_url: effective_url,
                     ollama_url,
@@ -416,8 +467,13 @@ fn main() -> Result<()> {
                 };
                 run_server(app.state, config)?;
             }
-            McpCommands::Setup { registry_url, client, auto } => {
-                let effective_url = resolve_registry_url(registry_url, managed_registry_url.as_deref());
+            McpCommands::Setup {
+                registry_url,
+                client,
+                auto,
+            } => {
+                let effective_url =
+                    resolve_registry_url(registry_url, managed_registry_url.as_deref());
                 let skillrunner_path = std::env::current_exe()
                     .ok()
                     .and_then(|p| p.to_str().map(|s| s.to_string()))
@@ -483,9 +539,15 @@ fn main() -> Result<()> {
                 match install_claude_skills() {
                     Ok(installed) => {
                         if !auto && !installed.is_empty() {
-                            println!("\n  Installed {} slash command(s): {}",
+                            println!(
+                                "\n  Installed {} slash command(s): {}",
                                 installed.len(),
-                                installed.iter().map(|s| format!("/{s}")).collect::<Vec<_>>().join(", "));
+                                installed
+                                    .iter()
+                                    .map(|s| format!("/{s}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
                         }
                     }
                     Err(e) => {
@@ -515,7 +577,10 @@ fn main() -> Result<()> {
                     Ok(Some(path)) => {
                         if !auto {
                             println!("  NPX shell wrapper — installed ✓");
-                            println!("    To activate: add {} to your PATH", path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(&path));
+                            println!(
+                                "    To activate: add {} to your PATH",
+                                path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or(&path)
+                            );
                         }
                     }
                     Ok(None) => {} // already installed
@@ -542,28 +607,47 @@ fn main() -> Result<()> {
                         let registry = RegistryClient::new(&url);
                         match mcp_governance::fetch_approved_servers(&app.state, &registry) {
                             Ok(resp) => {
-                                let approved: Vec<_> = resp.servers.iter()
+                                let approved: Vec<_> = resp
+                                    .servers
+                                    .iter()
                                     .filter(|s| s.status != "blocked")
                                     .collect();
-                                let blocked: Vec<_> = resp.servers.iter()
+                                let blocked: Vec<_> = resp
+                                    .servers
+                                    .iter()
                                     .filter(|s| s.status == "blocked")
                                     .collect();
 
                                 println!("Approval mode:    {}", resp.approval_mode);
-                                println!("Backends:         {} approved, {} blocked", approved.len(), blocked.len());
+                                println!(
+                                    "Backends:         {} approved, {} blocked",
+                                    approved.len(),
+                                    blocked.len()
+                                );
                                 println!();
 
                                 if approved.is_empty() {
                                     println!("No approved backends. Ask your IT admin to approve servers via the SkillClub portal.");
                                 } else {
-                                    println!("{:<25} {:<12} {:<12} {:<8} VISIBILITY", "NAME", "SERVER ID", "TRANSPORT", "PRIORITY");
+                                    println!(
+                                        "{:<25} {:<12} {:<12} {:<8} VISIBILITY",
+                                        "NAME", "SERVER ID", "TRANSPORT", "PRIORITY"
+                                    );
                                     println!("{}", "-".repeat(75));
                                     for s in &approved {
                                         let server_id = s.server_id.as_deref().unwrap_or(&s.name);
-                                        let transport = s.transport_type.as_deref().unwrap_or("http");
-                                        let priority = s.priority.map(|p| p.to_string()).unwrap_or_else(|| "50".to_string());
-                                        let visibility = s.tool_visibility.as_deref().unwrap_or("all");
-                                        println!("{:<25} {:<12} {:<12} {:<8} {}", s.name, server_id, transport, priority, visibility);
+                                        let transport =
+                                            s.transport_type.as_deref().unwrap_or("http");
+                                        let priority = s
+                                            .priority
+                                            .map(|p| p.to_string())
+                                            .unwrap_or_else(|| "50".to_string());
+                                        let visibility =
+                                            s.tool_visibility.as_deref().unwrap_or("all");
+                                        println!(
+                                            "{:<25} {:<12} {:<12} {:<8} {}",
+                                            s.name, server_id, transport, priority, visibility
+                                        );
                                     }
                                 }
 
@@ -610,7 +694,10 @@ fn main() -> Result<()> {
                     println!("  wrote {f}");
                 }
             }
-            SkillCommands::Search { query, registry_url } => {
+            SkillCommands::Search {
+                query,
+                registry_url,
+            } => {
                 let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
                 let reg = RegistryClient::new(&url);
                 let results = reg.search_skills(&query)?;
@@ -645,7 +732,11 @@ fn main() -> Result<()> {
                     None => println!("Skill '{}' is not installed.", skill_id),
                 }
             }
-            SkillCommands::Install { skill_ref, version, registry_url } => {
+            SkillCommands::Install {
+                skill_ref,
+                version,
+                registry_url,
+            } => {
                 // Heuristic: if skill_ref looks like a path, install from local dir.
                 let is_local = skill_ref.contains('/')
                     || skill_ref.starts_with('.')
@@ -670,10 +761,11 @@ fn main() -> Result<()> {
             }
             SkillCommands::Publish { path, registry_url } => {
                 let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
-                let tokens = auth::load_tokens(&app.state, &url)?
-                    .ok_or_else(|| anyhow::anyhow!(
+                let tokens = auth::load_tokens(&app.state, &url)?.ok_or_else(|| {
+                    anyhow::anyhow!(
                         "not logged in; run `skillrunner auth login --registry-url {url}` first"
-                    ))?;
+                    )
+                })?;
 
                 let (archive_path, _sha) = package_skill(&path)?;
                 println!("Packaged {}", archive_path);
@@ -693,8 +785,14 @@ fn main() -> Result<()> {
                         // Try token refresh before giving up
                         let auth_client = AuthClient::new(&url);
                         if let Ok(new_tokens) = auth_client.refresh(&tokens.refresh_token) {
-                            auth::save_tokens(&app.state, &url, &new_tokens.access_token, &new_tokens.refresh_token)?;
-                            let registry = RegistryClient::new(&url).with_auth(&new_tokens.access_token);
+                            auth::save_tokens(
+                                &app.state,
+                                &url,
+                                &new_tokens.access_token,
+                                &new_tokens.refresh_token,
+                            )?;
+                            let registry =
+                                RegistryClient::new(&url).with_auth(&new_tokens.access_token);
                             let resp = registry.publish_skill(&archive_path)?;
                             println!("Published successfully!");
                             if let Some(id) = resp.get("skill_id").and_then(|v| v.as_str()) {
@@ -729,8 +827,11 @@ fn main() -> Result<()> {
                 }
             }
             SkillCommands::Resolve { skill_id } => {
-                let outcome = if let Some(url) = resolve_registry_url(None, managed_registry_url.as_deref()) {
-                    let policy_client = HttpPolicyClient::new(RegistryClient::new(&url), &app.state);
+                let outcome = if let Some(url) =
+                    resolve_registry_url(None, managed_registry_url.as_deref())
+                {
+                    let policy_client =
+                        HttpPolicyClient::new(RegistryClient::new(&url), &app.state);
                     resolve_skill(&app.state, &policy_client, &skill_id)?
                 } else {
                     let policy_client = MockPolicyClient::new();
@@ -758,7 +859,14 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            SkillCommands::Run { skill_id, input, ollama_url, model, stub, registry_url } => {
+            SkillCommands::Run {
+                skill_id,
+                input,
+                ollama_url,
+                model,
+                stub,
+                registry_url,
+            } => {
                 let input_text = std::fs::read_to_string(&input)
                     .map_err(|e| anyhow::anyhow!("failed to read {input}: {e}"))?;
                 let input_json: serde_json::Value = serde_json::from_str(&input_text)
@@ -773,31 +881,52 @@ fn main() -> Result<()> {
                     model.clone()
                 } else {
                     let probe = OllamaClient::new(&ollama_url, "");
-                    resolve_model(&probe, &model)
-                        .with_context(|| format!("failed to resolve model '{model}' from Ollama at {ollama_url}"))?
+                    resolve_model(&probe, &model).with_context(|| {
+                        format!("failed to resolve model '{model}' from Ollama at {ollama_url}")
+                    })?
                 };
 
                 let ollama = OllamaClient::new(ollama_url, effective_model);
-                let model_client: Option<&dyn skillrunner_core::model::ModelClient> = if stub {
-                    None
-                } else {
-                    Some(&ollama)
-                };
+                let model_client: Option<&dyn skillrunner_core::model::ModelClient> =
+                    if stub { None } else { Some(&ollama) };
 
-                let effective_url = resolve_registry_url(registry_url, managed_registry_url.as_deref());
+                let effective_url =
+                    resolve_registry_url(registry_url, managed_registry_url.as_deref());
                 let result = if let Some(url) = effective_url {
                     let registry = RegistryClient::new(&url);
                     let http_policy = HttpPolicyClient::new(RegistryClient::new(&url), &app.state);
-                    run_skill(&app.state, &http_policy, &skill_id, &input_json, model_client, Some(&registry))?
+                    run_skill(
+                        &app.state,
+                        &http_policy,
+                        &skill_id,
+                        &input_json,
+                        model_client,
+                        Some(&registry),
+                    )?
                 } else {
                     let policy_client = MockPolicyClient::new();
-                    run_skill(&app.state, &policy_client, &skill_id, &input_json, model_client, None)?
+                    run_skill(
+                        &app.state,
+                        &policy_client,
+                        &skill_id,
+                        &input_json,
+                        model_client,
+                        None,
+                    )?
                 };
                 println!("Running {}@{}", result.skill_id, result.version);
                 for step in &result.steps {
-                    println!("  [{}] {}: {}", step.step_type.to_uppercase(), step.id, step.note);
+                    println!(
+                        "  [{}] {}: {}",
+                        step.step_type.to_uppercase(),
+                        step.id,
+                        step.note
+                    );
                     if let Some(output) = &step.output {
-                        println!("       output: {}", serde_json::to_string_pretty(output).unwrap_or_default());
+                        println!(
+                            "       output: {}",
+                            serde_json::to_string_pretty(output).unwrap_or_default()
+                        );
                     }
                 }
                 println!(
@@ -830,7 +959,10 @@ fn main() -> Result<()> {
         Commands::Plugin { command } => match command {
             PluginCommands::Install { path } => {
                 let pkg = skillrunner_manifest::PluginPackage::load_from_dir(&path)?;
-                println!("Installing plugin '{}' v{}", pkg.manifest.name, pkg.manifest.version);
+                println!(
+                    "Installing plugin '{}' v{}",
+                    pkg.manifest.name, pkg.manifest.version
+                );
 
                 let result = skillrunner_core::plugin::install_plugin_from_dir(&app.state, &path)?;
 
@@ -838,10 +970,22 @@ fn main() -> Result<()> {
                     println!("  Skills: {}", result.components.skill_ids.join(", "));
                 }
                 if !result.components.mcp_server_names.is_empty() {
-                    println!("  MCP servers (pending approval): {}", result.components.mcp_server_names.join(", "));
+                    println!(
+                        "  MCP servers (pending approval): {}",
+                        result.components.mcp_server_names.join(", ")
+                    );
                 }
                 if !result.components.command_names.is_empty() {
-                    println!("  Commands: {}", result.components.command_names.iter().map(|c| format!("/{c}")).collect::<Vec<_>>().join(", "));
+                    println!(
+                        "  Commands: {}",
+                        result
+                            .components
+                            .command_names
+                            .iter()
+                            .map(|c| format!("/{c}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
                 }
                 println!("  Status: {}", result.status);
                 println!("\nPlugin '{}' installed.", result.id);
@@ -863,10 +1007,21 @@ fn main() -> Result<()> {
                             println!("    skills: {}", p.components.skill_ids.join(", "));
                         }
                         if !p.components.mcp_server_names.is_empty() {
-                            println!("    mcp servers: {}", p.components.mcp_server_names.join(", "));
+                            println!(
+                                "    mcp servers: {}",
+                                p.components.mcp_server_names.join(", ")
+                            );
                         }
                         if !p.components.command_names.is_empty() {
-                            println!("    commands: {}", p.components.command_names.iter().map(|c| format!("/{c}")).collect::<Vec<_>>().join(", "));
+                            println!(
+                                "    commands: {}",
+                                p.components
+                                    .command_names
+                                    .iter()
+                                    .map(|c| format!("/{c}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
                         }
                     }
                 }
@@ -906,13 +1061,24 @@ fn main() -> Result<()> {
                             println!("MCP:    {}", p.components.mcp_server_names.join(", "));
                         }
                         if !p.components.command_names.is_empty() {
-                            println!("Cmds:   {}", p.components.command_names.iter().map(|c| format!("/{c}")).collect::<Vec<_>>().join(", "));
+                            println!(
+                                "Cmds:   {}",
+                                p.components
+                                    .command_names
+                                    .iter()
+                                    .map(|c| format!("/{c}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
                         }
                     }
                     None => println!("Plugin '{plugin_id}' is not installed."),
                 }
             }
-            PluginCommands::Search { query, registry_url } => {
+            PluginCommands::Search {
+                query,
+                registry_url,
+            } => {
                 let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
                 let query_str = query.as_deref().unwrap_or("");
                 let registry = RegistryClient::new(&url);
@@ -939,8 +1105,9 @@ fn main() -> Result<()> {
                     .with_context(|| format!("failed to package plugin at {path}"))?;
                 println!("Packaged plugin: {archive_path}");
 
-                let token = auth::load_tokens(&app.state, &url)?
-                    .ok_or_else(|| anyhow::anyhow!("not logged in; run `skillrunner auth login` first"))?;
+                let token = auth::load_tokens(&app.state, &url)?.ok_or_else(|| {
+                    anyhow::anyhow!("not logged in; run `skillrunner auth login` first")
+                })?;
 
                 let registry = RegistryClient::new(&url).with_auth(&token.access_token);
                 let resp = registry
@@ -949,25 +1116,38 @@ fn main() -> Result<()> {
 
                 let _ = std::fs::remove_file(&archive_path);
 
-                let slug = resp.get("slug").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let version = resp.get("version").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let slug = resp
+                    .get("slug")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let version = resp
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
                 println!("Published plugin {slug}@{version} to registry.");
             }
-            PluginCommands::Export { path, format, output_dir } => {
+            PluginCommands::Export {
+                path,
+                format,
+                output_dir,
+            } => {
                 let out = output_dir
                     .as_deref()
                     .unwrap_or_else(|| camino::Utf8Path::new("."));
                 let result = match format.as_str() {
                     "claude-code" => {
                         skillrunner_core::plugin_export::export_claude_code(&path, out)
-                            .with_context(|| format!("failed to export plugin at {path} as claude-code"))?
+                            .with_context(|| {
+                                format!("failed to export plugin at {path} as claude-code")
+                            })?
                     }
-                    "mcpb" => {
-                        skillrunner_core::plugin_export::export_mcpb(&path, out)
-                            .with_context(|| format!("failed to export plugin at {path} as mcpb"))?
-                    }
+                    "mcpb" => skillrunner_core::plugin_export::export_mcpb(&path, out)
+                        .with_context(|| format!("failed to export plugin at {path} as mcpb"))?,
                     other => {
-                        anyhow::bail!("unsupported format '{}'. Use 'claude-code' or 'mcpb'", other)
+                        anyhow::bail!(
+                            "unsupported format '{}'. Use 'claude-code' or 'mcpb'",
+                            other
+                        )
                     }
                 };
                 println!("Exported to {result}");
@@ -985,7 +1165,9 @@ fn main() -> Result<()> {
                 let result = match format {
                     skillrunner_core::plugin_import::ExternalPluginFormat::ClaudeCode => {
                         skillrunner_core::plugin_import::import_claude_code_plugin(&path, out)
-                            .with_context(|| format!("failed to import Claude Code plugin at {path}"))?
+                            .with_context(|| {
+                                format!("failed to import Claude Code plugin at {path}")
+                            })?
                     }
                     skillrunner_core::plugin_import::ExternalPluginFormat::Mcpb => {
                         skillrunner_core::plugin_import::import_mcpb(&path, out)
@@ -1003,7 +1185,13 @@ fn main() -> Result<()> {
                 // Derive plugin ID: lowercase, non-alphanumeric chars become hyphens
                 let plugin_id: String = name
                     .chars()
-                    .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+                    .map(|c| {
+                        if c.is_alphanumeric() {
+                            c.to_ascii_lowercase()
+                        } else {
+                            '-'
+                        }
+                    })
                     .collect::<String>()
                     .split('-')
                     .filter(|s| !s.is_empty())
@@ -1029,8 +1217,9 @@ fn main() -> Result<()> {
                 });
                 let manifest_str = serde_json::to_string_pretty(&manifest)
                     .context("failed to serialize plugin.json")?;
-                std::fs::write(plugin_dir.join("plugin.json"), &manifest_str)
-                    .with_context(|| format!("failed to write {}", plugin_dir.join("plugin.json")))?;
+                std::fs::write(plugin_dir.join("plugin.json"), &manifest_str).with_context(
+                    || format!("failed to write {}", plugin_dir.join("plugin.json")),
+                )?;
 
                 std::fs::write(plugin_dir.join("README.md"), format!("# {name}\n"))
                     .with_context(|| format!("failed to write {}", plugin_dir.join("README.md")))?;
@@ -1047,7 +1236,9 @@ fn main() -> Result<()> {
 }
 
 fn registry_url_from_env() -> Option<String> {
-    std::env::var("SKILLCLUB_REGISTRY_URL").ok().filter(|s| !s.is_empty())
+    std::env::var("SKILLCLUB_REGISTRY_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// Resolve the effective registry URL using priority order:
@@ -1063,6 +1254,8 @@ fn resolve_registry_url(flag: Option<String>, managed_url: Option<&str>) -> Opti
 
 fn require_registry_url(flag: Option<String>, managed_url: Option<&str>) -> Result<String> {
     resolve_registry_url(flag, managed_url).ok_or_else(|| {
-        anyhow::anyhow!("no registry URL configured; set SKILLCLUB_REGISTRY_URL or use --registry-url")
+        anyhow::anyhow!(
+            "no registry URL configured; set SKILLCLUB_REGISTRY_URL or use --registry-url"
+        )
     })
 }

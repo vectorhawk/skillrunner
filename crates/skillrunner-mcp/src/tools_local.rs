@@ -8,13 +8,8 @@ use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use rusqlite::Connection;
 use skillrunner_core::{
-    executor::run_skill,
-    import::import_skill_md,
-    install::install_unpacked_skill,
-    model::ModelClient,
-    policy::MockPolicyClient,
-    state::AppState,
-    validator::validate_bundle,
+    executor::run_skill, import::import_skill_md, install::install_unpacked_skill,
+    model::ModelClient, policy::MockPolicyClient, state::AppState, validator::validate_bundle,
 };
 use skillrunner_manifest::SkillPackage;
 
@@ -85,26 +80,30 @@ pub fn handle_tool_call(
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn skill_tools_from_db(state: &AppState) -> Result<Vec<ToolDefinition>> {
-    let conn = Connection::open(&state.db_path)
-        .context("failed to open state database")?;
+    let conn = Connection::open(&state.db_path).context("failed to open state database")?;
     let mut stmt = conn.prepare(
         "SELECT skill_id, active_version, install_root FROM installed_skills WHERE current_status = 'active'"
     ).context("failed to query installed skills")?;
 
     let mut tools = Vec::new();
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    }).context("failed to iterate installed skills")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .context("failed to iterate installed skills")?;
 
     for row in rows {
         let (skill_id, _version, install_root) = row.context("failed to read skill row")?;
         let active_path = Utf8PathBuf::from(&install_root).join("active");
         if let Ok(pkg) = SkillPackage::load_from_dir(&active_path) {
-            let description = pkg.manifest.description.clone()
+            let description = pkg
+                .manifest
+                .description
+                .clone()
                 .unwrap_or_else(|| format!("Run the {skill_id} skill"));
 
             tools.push(ToolDefinition {
@@ -124,7 +123,7 @@ fn handle_list(state: &AppState) -> ToolCallResult {
     };
 
     let mut stmt = match conn.prepare(
-        "SELECT skill_id, active_version, current_status FROM installed_skills ORDER BY skill_id"
+        "SELECT skill_id, active_version, current_status FROM installed_skills ORDER BY skill_id",
     ) {
         Ok(s) => s,
         Err(e) => return ToolCallResult::error(format!("Failed to query skills: {e}")),
@@ -182,12 +181,13 @@ fn handle_import(args: &serde_json::Value, state: &AppState) -> ToolCallResult {
             let bundle_path = scaffolded.output_dir.clone();
             match SkillPackage::load_from_dir(&bundle_path) {
                 Ok(pkg) => match install_unpacked_skill(state, &pkg) {
-                    Ok(()) => ToolCallResult::success(
-                        format!("Imported and installed skill '{}' from {path}", pkg.manifest.id)
-                    ),
-                    Err(e) => ToolCallResult::success(
-                        format!("Imported to {bundle_path} but install failed: {e}")
-                    ),
+                    Ok(()) => ToolCallResult::success(format!(
+                        "Imported and installed skill '{}' from {path}",
+                        pkg.manifest.id
+                    )),
+                    Err(e) => ToolCallResult::success(format!(
+                        "Imported to {bundle_path} but install failed: {e}"
+                    )),
                 },
                 Err(e) => ToolCallResult::error(format!("Failed to load imported bundle: {e}")),
             }
@@ -205,7 +205,9 @@ fn handle_skill_run(
     let policy_client = MockPolicyClient::new();
     match run_skill(state, &policy_client, skill_id, args, model_client, None) {
         Ok(result) => {
-            let output = result.steps.last()
+            let output = result
+                .steps
+                .last()
                 .and_then(|s| s.output.as_ref())
                 .map(|v| serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()))
                 .unwrap_or_else(|| "Skill completed (no output)".to_string());

@@ -146,8 +146,8 @@ impl ModelClient for McpSamplingClient {
             .result
             .ok_or_else(|| anyhow::anyhow!("sampling response has no result"))?;
 
-        let result: SamplingCreateMessageResult = serde_json::from_value(result_value)
-            .context("failed to parse sampling result")?;
+        let result: SamplingCreateMessageResult =
+            serde_json::from_value(result_value).context("failed to parse sampling result")?;
 
         Ok(ModelResponse {
             text: result.content.text,
@@ -390,7 +390,7 @@ mod tests {
     fn shared_io_read_and_write() {
         let input = b"hello world\n";
         let reader = Box::new(Cursor::new(input.to_vec()));
-        let writer: Box<Vec<u8>> = Box::new(Vec::new());
+        let writer: Box<Vec<u8>> = Box::default();
 
         let io = Arc::new(Mutex::new(SharedIo::new(writer, reader)));
 

@@ -91,7 +91,10 @@ fn fail(name: &str, detail: &str) -> CheckResult {
 mod tests {
     use super::*;
     use camino::Utf8PathBuf;
-    use std::{fs, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn temp_dir(label: &str) -> Utf8PathBuf {
         let nanos = SystemTime::now()
@@ -129,8 +132,16 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("prompts/system.txt"), "Do the thing.").unwrap();
-        fs::write(root.join("schemas/input.schema.json"), r#"{"type":"object"}"#).unwrap();
-        fs::write(root.join("schemas/output.schema.json"), r#"{"type":"object"}"#).unwrap();
+        fs::write(
+            root.join("schemas/input.schema.json"),
+            r#"{"type":"object"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("schemas/output.schema.json"),
+            r#"{"type":"object"}"#,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -140,7 +151,10 @@ mod tests {
 
         let report = validate_bundle(&dir);
 
-        assert!(report.all_passed(), "expected all checks to pass: {report:?}");
+        assert!(
+            report.all_passed(),
+            "expected all checks to pass: {report:?}"
+        );
         assert_eq!(report.checks.len(), 3);
 
         let _ = fs::remove_dir_all(&dir);
@@ -154,9 +168,13 @@ mod tests {
 
         let report = validate_bundle(&dir);
 
-        let manifest_check = report.checks.iter().find(|c| c.name == "manifest and workflow").unwrap();
+        let manifest_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "manifest and workflow")
+            .unwrap();
         assert!(!manifest_check.passed);
-        assert_eq!(report.all_passed(), false);
+        assert!(!report.all_passed());
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -175,7 +193,11 @@ mod tests {
             .find(|c| c.name.contains("input"))
             .unwrap();
         assert!(!schema_check.passed);
-        assert!(schema_check.detail.as_deref().unwrap_or("").contains("JSON"));
+        assert!(schema_check
+            .detail
+            .as_deref()
+            .unwrap_or("")
+            .contains("JSON"));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -190,10 +212,18 @@ mod tests {
         let report = validate_bundle(&dir);
 
         // Manifest check still runs and passes.
-        let manifest_check = report.checks.iter().find(|c| c.name == "manifest and workflow").unwrap();
+        let manifest_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "manifest and workflow")
+            .unwrap();
         assert!(manifest_check.passed);
         // Output schema check fails.
-        let output_check = report.checks.iter().find(|c| c.name.contains("output")).unwrap();
+        let output_check = report
+            .checks
+            .iter()
+            .find(|c| c.name.contains("output"))
+            .unwrap();
         assert!(!output_check.passed);
 
         let _ = fs::remove_dir_all(&dir);
