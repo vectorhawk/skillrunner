@@ -1250,7 +1250,7 @@ fn main() -> Result<()> {
 }
 
 /// Default registry URL for release builds.
-const DEFAULT_REGISTRY_URL: &str = "https://vectorhawk.ai/registry";
+const DEFAULT_REGISTRY_URL: &str = "https://app.vectorhawk.ai";
 
 fn registry_url_from_env() -> Option<String> {
     std::env::var("VECTORHAWK_REGISTRY_URL")
@@ -1262,7 +1262,7 @@ fn registry_url_from_env() -> Option<String> {
 /// 1. managed.json registry_url (IT override, already resolved before call)
 /// 2. --registry-url CLI flag
 /// 3. VECTORHAWK_REGISTRY_URL env var
-/// 4. Built-in default (https://vectorhawk.ai/registry)
+/// 4. Built-in default (https://app.vectorhawk.ai)
 fn resolve_registry_url(flag: Option<String>, managed_url: Option<&str>) -> Option<String> {
     managed_url
         .map(|s| s.to_string())

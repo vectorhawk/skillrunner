@@ -817,7 +817,7 @@ mod tests {
         configure_client(
             &client,
             "/usr/local/bin/skillrunner",
-            &Some("https://vectorhawk.ai/registry".to_string()),
+            &Some("https://app.vectorhawk.ai".to_string()),
         )
         .unwrap();
 
@@ -832,7 +832,7 @@ mod tests {
         assert_eq!(content["mcpServers"]["skillrunner"]["args"][1], "serve");
         assert_eq!(
             content["mcpServers"]["skillrunner"]["env"]["VECTORHAWK_REGISTRY_URL"],
-            "https://vectorhawk.ai/registry"
+            "https://app.vectorhawk.ai"
         );
 
         let _ = fs::remove_dir_all(tmp.as_str());
