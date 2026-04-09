@@ -11,16 +11,16 @@ It also has its own skill format -- portable, versioned bundles of prompts and w
 ### Homebrew
 
 ```bash
-brew install skillclub/tap/skillrunner
+brew install vectorhawk/tap/skillrunner
 ```
 
 ### Pre-built binaries
 
-Binaries for macOS (arm64, x86_64) and Linux (x86_64, arm64) are attached to each [GitHub release](https://github.com/skillclub/skillrunner/releases).
+Binaries for macOS (arm64, x86_64) and Linux (x86_64, arm64) are attached to each [GitHub release](https://github.com/vectorhawk/skillrunner/releases).
 
 ```bash
 # macOS Apple Silicon
-curl -L https://github.com/skillclub/skillrunner/releases/latest/download/skillrunner-aarch64-apple-darwin.tar.gz | tar xz
+curl -L https://github.com/vectorhawk/skillrunner/releases/latest/download/skillrunner-aarch64-apple-darwin.tar.gz | tar xz
 sudo mv skillrunner /usr/local/bin/
 ```
 
@@ -29,7 +29,7 @@ sudo mv skillrunner /usr/local/bin/
 Requires Rust 1.75+.
 
 ```bash
-git clone https://github.com/skillclub/skillrunner.git
+git clone https://github.com/vectorhawk/skillrunner.git
 cd skillrunner
 cargo build --release
 cp target/release/skillrunner /usr/local/bin/
@@ -60,7 +60,7 @@ playwright__screenshot   <- Playwright MCP server
 
 ### Configure backends
 
-Create `~/Library/Application Support/SkillClub/SkillRunner/backends.yaml`:
+Create `~/Library/Application Support/VectorHawk/SkillRunner/backends.yaml`:
 
 ```yaml
 backends:
@@ -187,7 +187,7 @@ Four-crate Rust workspace:
 
 ### Feature flags
 
-The `registry` feature (default: on) enables SkillClub registry integration -- auth, remote policy, auto-updates, governance tools. Disable it to build a fully standalone binary:
+The `registry` feature (default: on) enables VectorHawk registry integration -- auth, remote policy, auto-updates, governance tools. Disable it to build a fully standalone binary:
 
 ```bash
 # Library crates compile without registry support

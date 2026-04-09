@@ -22,12 +22,12 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 TARGET=""          # empty = native (no --target flag passed to cargo)
 OUTPUT_DIR="$REPO_ROOT/dist"
 
-PACKAGE_NAME="skillclub-skillrunner"
-DISPLAY_NAME="SkillClub SkillRunner"
+PACKAGE_NAME="vectorhawk-skillrunner"
+DISPLAY_NAME="VectorHawk SkillRunner"
 VERSION="0.1.0"
-DESCRIPTION="SkillClub SkillRunner — governed AI platform runtime for skills, MCP servers, and plugins with enterprise policy, audit, and credential brokering."
-AUTHOR_NAME="SkillClub"
-AUTHOR_URL="https://skillclub.io"
+DESCRIPTION="VectorHawk SkillRunner — local AI skill runtime and MCP aggregator for portable skills, tool namespacing, and multi-client setup."
+AUTHOR_NAME="VectorHawk"
+AUTHOR_URL="https://vectorhawk.io"
 
 # ---------------------------------------------------------------------------
 # Argument parsing
