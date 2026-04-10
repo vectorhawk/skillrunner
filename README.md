@@ -190,6 +190,20 @@ skillrunner skill validate ./path/to/skill # validate without installing
 skillrunner skill resolve my-skill        # check install status and policy
 ```
 
+### Why this format
+
+Raw prompts and ad-hoc scripts are black boxes. The skill bundle format makes AI tools inspectable and predictable:
+
+**Bounded inputs and outputs.** Every skill declares JSON Schemas for what it accepts and what it returns. The runner validates both before and after execution. Unexpected data never reaches the model, and malformed output is caught immediately.
+
+**Auditable prompts.** Prompts live in separate files (`prompts/system.txt`), not buried in code. You can review exactly what the model will see before you run anything.
+
+**Declared permissions.** The manifest states what a skill needs -- filesystem access, network access, clipboard. A skill that declares `"network": "none"` cannot phone home.
+
+**Execution constraints.** Each skill specifies a sandbox profile, timeout, and memory limit. A runaway skill gets killed, not tolerated.
+
+**Policy before execution.** Every `skill run` goes through resolve (is this version allowed?) -> validate (does the input match the schema?) -> execute. Blocked versions never run. Invalid input never reaches the model.
+
 ## Architecture
 
 Four-crate Rust workspace:
