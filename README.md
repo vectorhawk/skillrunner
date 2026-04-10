@@ -2,7 +2,7 @@
 
 A local runtime for portable AI skills and an MCP aggregator that connects your AI coding tools to every backend they need.
 
-SkillRunner sits between your AI client (Claude Code, Cursor, Windsurf, VS Code, Gemini CLI) and the MCP servers you depend on. It manages tool namespacing, enforces a tool budget so clients don't choke, and lets you define your entire backend stack in a single `backends.yaml` file.
+SkillRunner sits between your AI client (Claude Code, Cursor, Windsurf, VS Code, Gemini CLI) and the MCP servers you depend on. It prevents tool name collisions, keeps you under client tool limits, and lets you define your entire backend stack in a single `backends.yaml` file.
 
 It also has its own skill format -- portable, versioned bundles of prompts and workflows that execute locally via Ollama or delegate to MCP sampling.
 
