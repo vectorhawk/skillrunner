@@ -186,6 +186,17 @@ jobs:
               bin.install "skillrunner"
             end
 
+            def post_install
+              system bin/"skillrunner", "mcp", "setup"
+            end
+
+            def caveats
+              <<~EOS
+                SkillRunner has been configured as an MCP server for your AI clients.
+                Restart Claude Code, Cursor, or other AI clients to pick up the changes.
+              EOS
+            end
+
             test do
               assert_match "skillrunner", shell_output("#{bin}/skillrunner --version")
             end

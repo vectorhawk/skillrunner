@@ -8,11 +8,13 @@ It also has its own skill format -- portable, versioned bundles of prompts and w
 
 ## Install
 
-### Homebrew
+### Homebrew (recommended)
 
 ```bash
 brew install vectorhawk/tap/skillrunner
 ```
+
+This installs the binary and automatically configures SkillRunner as an MCP server for any detected AI clients (Claude Code, Cursor, etc.). Restart your AI client after installing.
 
 ### Pre-built binaries
 
@@ -30,6 +32,14 @@ mkdir -p ~/.local/bin && mv skillrunner ~/.local/bin/
 # echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
 ```
 
+After installing manually, run the setup to connect SkillRunner to your AI clients:
+
+```bash
+skillrunner mcp setup
+```
+
+Then restart your AI client.
+
 ### Build from source
 
 Requires Rust 1.75+.
@@ -39,19 +49,19 @@ git clone https://github.com/vectorhawk/skillrunner.git
 cd skillrunner
 cargo build --release
 cp target/release/skillrunner /usr/local/bin/
+skillrunner mcp setup
 ```
 
 ## Quick start
+
+After installing, restart your AI client (Claude Code, Cursor, etc.). SkillRunner tools will be available automatically.
 
 ```bash
 # Check your setup
 skillrunner doctor
 
-# Set up SkillRunner as an MCP server for your AI clients
+# Verify MCP is configured for your clients
 skillrunner mcp setup
-
-# Start the MCP server (usually managed by your AI client after setup)
-skillrunner mcp serve
 ```
 
 ## MCP aggregator
