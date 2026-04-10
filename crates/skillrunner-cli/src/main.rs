@@ -19,6 +19,7 @@ use skillrunner_core::{
 };
 use skillrunner_manifest::SkillPackage;
 use skillrunner_mcp::{
+    migration::{list_backups, migrate_existing_servers, restore_backup},
     server::{run_server, McpServerConfig},
     setup::{
         configure_client, detect_ai_clients, install_claude_skills, install_npx_claude_hook,
@@ -89,6 +90,20 @@ enum McpCommands {
         /// Non-interactive mode for automated installs
         #[arg(long)]
         auto: bool,
+        /// Migrate existing MCP servers into backends.yaml without prompting (for Homebrew post_install)
+        #[arg(long, conflicts_with = "no_migrate")]
+        migrate_all: bool,
+        /// Skip the migration step entirely
+        #[arg(long, conflicts_with = "migrate_all")]
+        no_migrate: bool,
+    },
+    /// Migrate existing MCP servers from AI client configs into backends.yaml
+    Migrate,
+    /// List available config backups and optionally restore one
+    Restore {
+        /// Path to the backup file to restore (if omitted, lists available backups)
+        #[arg(long)]
+        backup: Option<String>,
     },
     /// Show aggregator backend status (approved servers from registry)
     Backends {
@@ -471,6 +486,8 @@ fn main() -> Result<()> {
                 registry_url,
                 client,
                 auto,
+                migrate_all,
+                no_migrate,
             } => {
                 let effective_url =
                     resolve_registry_url(registry_url, managed_registry_url.as_deref());
@@ -595,6 +612,44 @@ fn main() -> Result<()> {
 
                 if !auto && configured > 0 {
                     println!("\nRestart your AI client to activate SkillRunner MCP.");
+                }
+
+                // ── Migration step ───────────────────────────────────────────
+                if !no_migrate {
+                    run_migration_step(&app.state, &clients, migrate_all, auto)?;
+                }
+            }
+            McpCommands::Migrate => {
+                let skillrunner_path = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.to_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "skillrunner".to_string());
+                let clients = detect_ai_clients(&skillrunner_path);
+                run_migration_step(&app.state, &clients, true, false)?;
+            }
+            McpCommands::Restore { backup } => {
+                match backup {
+                    Some(path) => {
+                        restore_backup(std::path::Path::new(&path))
+                            .with_context(|| format!("failed to restore backup {path}"))?;
+                        println!("Restored backup: {path}");
+                    }
+                    None => {
+                        let backups = list_backups(&app.state)?;
+                        if backups.is_empty() {
+                            println!("No backups found in {}/backups/", app.state.root_dir);
+                        } else {
+                            println!("Available backups:");
+                            for b in &backups {
+                                println!(
+                                    "  {} ({})",
+                                    b.path.display(),
+                                    b.original_path.display()
+                                );
+                            }
+                            println!("\nTo restore: skillrunner mcp restore --backup <path>");
+                        }
+                    }
                 }
             }
             McpCommands::Backends { registry_url } => {
@@ -1277,4 +1332,96 @@ fn require_registry_url(flag: Option<String>, managed_url: Option<&str>) -> Resu
             "no registry URL configured; set VECTORHAWK_REGISTRY_URL or use --registry-url"
         )
     })
+}
+
+/// Run the migration step: scan client configs for non-SkillRunner MCP servers
+/// and move them into `backends.yaml`.
+///
+/// - `migrate_all` true  → run silently (no prompt, for `--migrate-all` and Homebrew post_install)
+/// - `migrate_all` false → interactive prompt (Y/s/N) unless `auto` is also true (non-TTY)
+/// - `auto` true         → skip the interactive prompt and don't migrate (conservative default
+///   for `--auto` without an explicit `--migrate-all`)
+fn run_migration_step(
+    state: &skillrunner_core::state::AppState,
+    clients: &[skillrunner_mcp::setup::ClientConfig],
+    migrate_all: bool,
+    auto: bool,
+) -> Result<()> {
+    // Peek at what would be migrated so we can show an informative prompt.
+    use skillrunner_mcp::setup::detect_unmanaged_servers;
+    let unmanaged = detect_unmanaged_servers();
+
+    if unmanaged.is_empty() {
+        if !auto && !migrate_all {
+            println!("\nNo existing MCP servers found to migrate.");
+        }
+        return Ok(());
+    }
+
+    let should_migrate = if migrate_all {
+        // Non-interactive path: always migrate.
+        true
+    } else if auto {
+        // --auto without --migrate-all: skip migration to avoid surprises in
+        // non-interactive environments where we can't read stdin safely.
+        false
+    } else {
+        // Interactive path: prompt the user.
+        println!("\nFound {} existing MCP server(s) in your AI client configs:", unmanaged.len());
+        for s in &unmanaged {
+            println!("  {} ({})", s.server_name, s.client_name);
+        }
+        println!("\nMigrate these into SkillRunner's aggregator (backends.yaml)?");
+        println!("  [Y]es — migrate and remove from client configs (recommended)");
+        println!("  [S]kip — leave them as-is (you can run `skillrunner mcp migrate` later)");
+        print!("  Choice [Y/s]: ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).ok();
+        let trimmed = input.trim().to_lowercase();
+        trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
+    };
+
+    if !should_migrate {
+        if !auto {
+            println!("  Skipped. Run `skillrunner mcp migrate` at any time to migrate.");
+        }
+        return Ok(());
+    }
+
+    match migrate_existing_servers(state, clients) {
+        Ok(report) => {
+            if !auto || migrate_all {
+                if report.migrated.is_empty() {
+                    println!("  No new servers to migrate (already in backends.yaml).");
+                } else {
+                    println!("\n  Migrated {} server(s) to backends.yaml:", report.migrated.len());
+                    for m in &report.migrated {
+                        println!("    {} ({})", m.server_name, m.transport);
+                    }
+                    if !report.backups.is_empty() {
+                        println!(
+                            "  Original configs backed up to {}/backups/",
+                            state.root_dir
+                        );
+                        println!("  To restore: skillrunner mcp restore");
+                    }
+                    if !report.skipped.is_empty() {
+                        println!(
+                            "  {} server(s) skipped (disabled or duplicate).",
+                            report.skipped.len()
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            if !auto {
+                println!("  Migration warning: {e}");
+            }
+        }
+    }
+    Ok(())
 }

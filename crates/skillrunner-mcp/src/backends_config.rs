@@ -27,14 +27,14 @@ use crate::aggregator::{
     sanitize_id, BackendConnection, HttpBackend, StdioBackend, ToolVisibility,
 };
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use skillrunner_core::state::AppState;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
 /// Top-level structure of `backends.yaml`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct BackendsConfig {
     /// List of backend server declarations.
     #[serde(default)]
@@ -42,7 +42,7 @@ pub struct BackendsConfig {
 }
 
 /// A single backend server entry in the local config.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct BackendEntry {
     /// Human-readable display name (required).
     pub name: String,
@@ -172,6 +172,62 @@ pub fn load_local_backends(state: &AppState) -> Result<Vec<BackendConnection>> {
         "loaded local backends from config"
     );
     Ok(connections)
+}
+
+/// Append new `BackendEntry` items to `{state_dir}/backends.yaml`, skipping
+/// any entry whose `name` already exists in the file.
+///
+/// Reads the existing file (creating an empty config if absent), merges the
+/// new entries, then atomically writes back via a temp file + rename.
+pub fn append_backends(state: &AppState, new_entries: Vec<BackendEntry>) -> Result<()> {
+    let config_path = state.root_dir.join("backends.yaml");
+
+    // Read existing config or start with an empty one.
+    let mut config: BackendsConfig = if config_path.exists() {
+        let content = std::fs::read_to_string(&config_path)
+            .with_context(|| format!("failed to read {config_path}"))?;
+        if content.trim().is_empty() {
+            BackendsConfig { backends: vec![] }
+        } else {
+            serde_yaml::from_str(&content)
+                .with_context(|| format!("failed to parse {config_path}"))?
+        }
+    } else {
+        BackendsConfig { backends: vec![] }
+    };
+
+    // Collect existing names to avoid duplicates.
+    let existing_names: std::collections::HashSet<String> = config
+        .backends
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+
+    let mut added = 0usize;
+    for entry in new_entries {
+        if existing_names.contains(&entry.name) {
+            debug!(name = %entry.name, "skipping duplicate backend entry");
+            continue;
+        }
+        config.backends.push(entry);
+        added += 1;
+    }
+
+    if added == 0 {
+        debug!("no new backends to append — backends.yaml unchanged");
+        return Ok(());
+    }
+
+    // Write via temp file + rename for atomicity.
+    let tmp_path = config_path.with_extension("yaml.tmp");
+    let yaml = serde_yaml::to_string(&config).context("failed to serialize backends.yaml")?;
+    std::fs::write(&tmp_path, &yaml)
+        .with_context(|| format!("failed to write temp file {tmp_path}"))?;
+    std::fs::rename(&tmp_path, &config_path)
+        .with_context(|| format!("failed to rename temp file to {config_path}"))?;
+
+    info!(count = added, path = %config_path, "appended backends to config");
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
