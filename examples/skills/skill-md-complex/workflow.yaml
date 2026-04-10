@@ -1,0 +1,14 @@
+name: passage_analyzer
+steps:
+  - id: extract
+    type: llm
+    prompt: prompts/extract.md
+  - id: summarize
+    type: llm
+    prompt: prompts/summarize.md
+  - id: key_points
+    type: llm
+    prompt: prompts/key_points.md
+  - id: finalize
+    type: llm
+    prompt: prompts/finalize.md

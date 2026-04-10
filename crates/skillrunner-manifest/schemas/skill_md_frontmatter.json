@@ -1,0 +1,169 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.vectorhawk.dev/skill_md_frontmatter.json",
+  "title": "VectorHawk SKILL.md Frontmatter",
+  "description": "Schema for the YAML frontmatter block at the top of a VectorHawk SKILL.md file. Standard Anthropic Agent Skills fields (name, description, license) plus vh_*-prefixed VectorHawk extensions. Unknown vh_* fields are rejected; unknown non-vh_* fields are passed through (the AUTH1c registry compile step logs a warning for them so we can track upstream Anthropic spec evolution).",
+
+  "type": "object",
+
+  "required": ["name", "description", "license"],
+
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Standard Anthropic field. Skill handle used as the canonical identifier. Conventionally kebab-case. Maps to manifest.id and manifest.name in AUTH1b."
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Standard Anthropic field. One-sentence human-readable summary of what the skill does. Used by AI clients to decide when to invoke this skill."
+    },
+    "license": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Standard Anthropic field. SPDX identifier (e.g. Apache-2.0, MIT). REQUIRED because cisco-ai-skill-scanner emits MANIFEST_MISSING_LICENSE INFO findings when absent (SEC1-T2 empirical finding). Without this, every benign skill flips to a non-clean verdict."
+    },
+
+    "vh_version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$",
+      "description": "VectorHawk: semver version of this skill (e.g. 1.2.0). Required for registry publish. Maps to Manifest.version in AUTH1b. NEW FOR AUTH1 — not in existing Rust types as a separate field (current Manifest uses a top-level `version` field)."
+    },
+    "vh_publisher": {
+      "type": "string",
+      "minLength": 1,
+      "description": "VectorHawk: publisher id (e.g. 'vectorhawk', 'acme-corp'). Maps to Manifest.publisher in AUTH1b."
+    },
+
+    "vh_permissions": {
+      "type": "object",
+      "description": "VectorHawk: declared capability surface. The AUTH1c registry compile step injects org defaults for any missing sub-field and rejects requests that exceed org-maximum permissions. Maps to Manifest.permissions (with a shape change — see NEW FOR AUTH1 notes).",
+      "additionalProperties": false,
+      "properties": {
+        "network": {
+          "type": "string",
+          "enum": ["none", "registry", "full"],
+          "description": "VectorHawk: network egress scope. NEW FOR AUTH1 — existing Rust Permissions.network is a free-form String; this enum tightens the shape."
+        },
+        "filesystem": {
+          "type": "string",
+          "enum": ["none", "read-only", "full"],
+          "description": "VectorHawk: filesystem scope. NEW FOR AUTH1 — existing Rust uses hyphenless 'read_only_scoped'; AUTH1b will need to add a variant mapping for 'read-only'."
+        },
+        "clipboard": {
+          "type": "string",
+          "enum": ["none", "read", "write", "full"],
+          "description": "VectorHawk: clipboard scope. NEW FOR AUTH1 — existing Rust Permissions.clipboard is a bool; AUTH1b must widen to an enum."
+        }
+      }
+    },
+
+    "vh_execution": {
+      "type": "object",
+      "description": "VectorHawk: execution constraints. Compile step injects org defaults for missing fields. Maps to Manifest.execution.",
+      "additionalProperties": false,
+      "properties": {
+        "timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "VectorHawk: hard timeout in milliseconds. NEW FOR AUTH1 — existing Rust Execution.timeout_seconds is seconds; AUTH1b converts ms→s on load."
+        },
+        "memory_mb": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "VectorHawk: memory limit in MB. Maps 1:1 to Execution.memory_mb."
+        },
+        "sandbox": {
+          "type": "string",
+          "enum": ["strict", "relaxed", "unrestricted"],
+          "description": "VectorHawk: sandbox profile. NEW FOR AUTH1 — existing Rust Execution.sandbox_profile is a free-form String; this enum tightens the shape."
+        }
+      }
+    },
+
+    "vh_model": {
+      "type": "object",
+      "description": "VectorHawk: model requirements and recommendations. Optional. Maps to Manifest.model_requirements with added min_params_b + recommended + fallback fields (NEW FOR AUTH1).",
+      "additionalProperties": false,
+      "properties": {
+        "min_params_b": {
+          "type": "number",
+          "minimum": 0,
+          "description": "VectorHawk: minimum model size in billions of parameters. NEW FOR AUTH1 — not in existing Rust ModelRequirements."
+        },
+        "recommended": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1},
+          "description": "VectorHawk: ordered list of recommended model identifiers (e.g. ['llama3.1:8b', 'claude-3-haiku']). NEW FOR AUTH1."
+        },
+        "fallback": {
+          "type": "string",
+          "enum": ["mcp_sampling", "error"],
+          "description": "VectorHawk: behavior when no recommended model is available locally. NEW FOR AUTH1."
+        }
+      }
+    },
+
+    "vh_schemas": {
+      "type": "object",
+      "description": "VectorHawk: inline I/O JSON Schemas. Optional — a skill without declared schemas accepts and returns arbitrary strings. Maps to files referenced by Manifest.inputs_schema / Manifest.outputs_schema (AUTH1b will materialize these to disk during load OR pass them through in memory).",
+      "additionalProperties": false,
+      "properties": {
+        "inputs": {
+          "type": "object",
+          "description": "VectorHawk: JSON Schema Draft 2020-12 describing the skill's input object. The compile step validates that this is itself a valid schema."
+        },
+        "outputs": {
+          "type": "object",
+          "description": "VectorHawk: JSON Schema Draft 2020-12 describing the skill's output object."
+        }
+      }
+    },
+
+    "vh_workflow": {
+      "type": "array",
+      "minItems": 1,
+      "description": "VectorHawk: inline workflow definition. Use this for simple workflows (rule of thumb: <5 steps, <30 lines). For larger workflows use vh_workflow_ref instead. Mutually exclusive with vh_workflow_ref. Maps to Workflow.steps in AUTH1b.",
+      "items": {
+        "type": "object",
+        "required": ["id", "type"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Unique step identifier within the workflow."
+          },
+          "type": {
+            "type": "string",
+            "enum": ["llm", "tool", "transform", "validate"],
+            "description": "Step kind. Matches existing Rust WorkflowStep variants."
+          }
+        }
+      }
+    },
+
+    "vh_workflow_ref": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\.ya?ml$",
+      "description": "VectorHawk: relative path to a sibling workflow.yaml file. Escape hatch for workflows too large or complex to inline. Mutually exclusive with vh_workflow. The referenced file is parsed as existing workflow.yaml format (reuses Workflow type verbatim)."
+    }
+  },
+
+  "patternProperties": {
+    "^vh_(?!version$|publisher$|permissions$|execution$|model$|schemas$|workflow$|workflow_ref$).*$": {
+      "not": {},
+      "description": "Reject any vh_*-prefixed field not in the explicit allowlist above. This is the namespace guard: unknown vh_* fields are rejected at compile time so typos and outdated authoring guides surface as hard errors, not silent drops."
+    }
+  },
+
+  "allOf": [
+    {
+      "description": "vh_workflow and vh_workflow_ref are mutually exclusive; exactly one MAY be present (neither is allowed for metadata-only skills).",
+      "not": {
+        "required": ["vh_workflow", "vh_workflow_ref"]
+      }
+    }
+  ]
+}
