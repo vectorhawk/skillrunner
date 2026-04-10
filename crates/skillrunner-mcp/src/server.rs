@@ -795,9 +795,14 @@ mod tests {
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
+        // Without auth tokens, only local tools and login should appear
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"skillclub_list"));
-        assert!(names.contains(&"skillclub_search"));
+        assert!(names.contains(&"skillclub_login"));
+        assert!(
+            !names.contains(&"skillclub_search"),
+            "search requires login"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

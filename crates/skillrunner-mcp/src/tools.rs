@@ -31,12 +31,22 @@ fn is_managed(state: &AppState) -> bool {
 pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<ToolDefinition> {
     let mut tools = Vec::new();
 
+    // Check if user has auth tokens (logged in to registry)
+    let logged_in = registry_url
+        .as_ref()
+        .and_then(|url| {
+            skillrunner_core::auth::load_tokens(state, url)
+                .ok()
+                .flatten()
+        })
+        .is_some();
+
     // Add installed skills as tools
     if let Ok(skill_tools) = skill_tools_from_db(state) {
         tools.extend(skill_tools);
     }
 
-    // Add management tools
+    // Add management tools (always available — these work locally)
     tools.push(ToolDefinition {
         name: "skillclub_list".to_string(),
         description: "List all installed skills available to the user. Use this when the user asks 'what skills do I have', 'what tools are available', or 'what can you do'. Shows skill IDs, versions, and descriptions."
@@ -135,8 +145,8 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
         }),
     });
 
-    // MCP Governance tools (always available when registry is configured)
-    if registry_url.is_some() {
+    // MCP Governance tools (only shown when logged in to registry)
+    if logged_in {
         tools.push(ToolDefinition {
             name: "skillclub_mcp_catalog".to_string(),
             description: "Browse approved MCP servers in your organisation's catalog. Shows available servers with their status, version pins, and credential notes.".to_string(),
@@ -212,20 +222,21 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
         });
     }
 
-    if registry_url.is_some() {
+    // Login is always available when a registry URL exists (so users can log in)
+    if registry_url.is_some() && !logged_in {
         tools.push(ToolDefinition {
             name: "skillclub_login".to_string(),
-            description: "Log in to the SkillClub registry. Required before publishing skills or accessing registry-gated features. Saves your session so you don't need to log in again.".to_string(),
+            description: "Log in to the VectorHawk registry to unlock publishing, searching, and governance features.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "email": {
                         "type": "string",
-                        "description": "Your SkillClub account email address"
+                        "description": "Your VectorHawk account email address"
                     },
                     "password": {
                         "type": "string",
-                        "description": "Your SkillClub account password"
+                        "description": "Your VectorHawk account password"
                     },
                     "registry_url": {
                         "type": "string",
@@ -235,10 +246,13 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
                 "required": ["email", "password"]
             }),
         });
+    }
 
+    // Registry tools that require authentication
+    if logged_in {
         tools.push(ToolDefinition {
             name: "skillclub_logout".to_string(),
-            description: "Log out of the SkillClub registry. Clears stored authentication tokens."
+            description: "Log out of the VectorHawk registry. Clears stored authentication tokens."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -276,25 +290,26 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
                 "required": ["path"]
             }),
         });
+    } // end logged_in block for search/publish/logout
 
-        tools.push(ToolDefinition {
-            name: "skillclub_info".to_string(),
-            description: "Show detailed information about an installed SkillClub skill."
-                .to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "skill_id": {
-                        "type": "string",
-                        "description": "The ID of the installed skill to get info about"
-                    }
-                },
-                "required": ["skill_id"]
-            }),
-        });
+    // Info and import are always available (local operations)
+    tools.push(ToolDefinition {
+        name: "skillclub_info".to_string(),
+        description: "Show detailed information about an installed SkillClub skill.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "skill_id": {
+                    "type": "string",
+                    "description": "The ID of the installed skill to get info about"
+                }
+            },
+            "required": ["skill_id"]
+        }),
+    });
 
-        tools.push(ToolDefinition {
-            name: "skillclub_import".to_string(),
+    tools.push(ToolDefinition {
+        name: "skillclub_import".to_string(),
             description: "Import an external skill or MCP server into SkillClub. Paste an npm package name (e.g. @modelcontextprotocol/server-github), npx command, or GitHub URL. The system detects whether it's a skill or MCP server and routes to the appropriate approval workflow.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -312,7 +327,8 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
             }),
         });
 
-        // Plugin tools (registry-dependent)
+    // Plugin tools that require registry auth
+    if logged_in {
         tools.push(ToolDefinition {
             name: "skillclub_plugin_search".to_string(),
             description: "Search the SkillClub registry for plugins. Plugins are composite bundles that include skills, MCP servers, and slash commands packaged together for a complete workflow.".to_string(),
@@ -327,54 +343,54 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
                 "required": []
             }),
         });
-
-        tools.push(ToolDefinition {
-            name: "skillclub_plugin_info".to_string(),
-            description: "Get detailed information about a plugin including its skills, MCP servers, commands, and configuration requirements.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "plugin_id": {
-                        "type": "string",
-                        "description": "The ID of the plugin to get info about"
-                    }
-                },
-                "required": ["plugin_id"]
-            }),
-        });
-
-        tools.push(ToolDefinition {
-            name: "skillclub_plugin_install".to_string(),
-            description: "Install a plugin from a local directory or the SkillClub registry. Installs embedded skills, requests MCP server access through governance, and sets up slash commands.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path_or_id": {
-                        "type": "string",
-                        "description": "Local directory path to a plugin bundle, or a registry plugin ID"
-                    }
-                },
-                "required": ["path_or_id"]
-            }),
-        });
-
-        tools.push(ToolDefinition {
-            name: "skillclub_plugin_uninstall".to_string(),
-            description: "Uninstall a plugin. Removes all its skills, disconnects MCP servers, and deletes slash commands.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "plugin_id": {
-                        "type": "string",
-                        "description": "The ID of the installed plugin to uninstall"
-                    }
-                },
-                "required": ["plugin_id"]
-            }),
-        });
     }
 
-    // Plugin tools (always available)
+    // Plugin tools (always available — local operations)
+    tools.push(ToolDefinition {
+        name: "skillclub_plugin_info".to_string(),
+        description: "Get detailed information about a plugin including its skills, MCP servers, commands, and configuration requirements.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "plugin_id": {
+                    "type": "string",
+                    "description": "The ID of the plugin to get info about"
+                }
+            },
+            "required": ["plugin_id"]
+        }),
+    });
+
+    tools.push(ToolDefinition {
+        name: "skillclub_plugin_install".to_string(),
+        description: "Install a plugin from a local directory or the registry.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path_or_id": {
+                    "type": "string",
+                    "description": "Local directory path to a plugin bundle, or a registry plugin ID"
+                }
+            },
+            "required": ["path_or_id"]
+        }),
+    });
+
+    tools.push(ToolDefinition {
+        name: "skillclub_plugin_uninstall".to_string(),
+        description: "Uninstall a plugin. Removes all its skills, disconnects MCP servers, and deletes slash commands.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "plugin_id": {
+                    "type": "string",
+                    "description": "The ID of the installed plugin to uninstall"
+                }
+            },
+            "required": ["plugin_id"]
+        }),
+    });
+
     tools.push(ToolDefinition {
         name: "skillclub_plugin_import".to_string(),
         description: "Import a Claude Code plugin or .mcpb Desktop Extension into SkillClub plugin format. Auto-detects the external format and converts it.".to_string(),
@@ -453,7 +469,7 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
         }),
     });
 
-    if registry_url.is_some() {
+    if logged_in {
         tools.push(ToolDefinition {
             name: "skillclub_plugin_publish".to_string(),
             description: "Package and publish a plugin bundle to the SkillClub registry. Requires authentication.".to_string(),
@@ -2211,12 +2227,19 @@ mod tests {
         fs::write(root.join("schemas/output.schema.json"), "{}").unwrap();
     }
 
+    /// Store fake auth tokens so build_tool_list sees the user as logged in.
+    fn fake_login(state: &AppState, url: &str) {
+        skillrunner_core::auth::save_tokens(state, url, "fake-access", "fake-refresh").unwrap();
+    }
+
     #[test]
     fn build_tool_list_includes_management_tools() {
         let state_root = temp_root("tool-list");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let url = "http://localhost:8000".to_string();
+        fake_login(&state, &url);
 
-        let tools = build_tool_list(&state, &Some("http://localhost:8000".to_string()));
+        let tools = build_tool_list(&state, &Some(url));
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
         assert!(names.contains(&"skillclub_list"));
@@ -2837,7 +2860,7 @@ mod tests {
     }
 
     #[test]
-    fn build_tool_list_includes_login_logout_with_registry() {
+    fn build_tool_list_shows_login_when_not_logged_in() {
         let state_root = temp_root("tool-list-auth");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
 
@@ -2846,11 +2869,41 @@ mod tests {
 
         assert!(
             names.contains(&"skillclub_login"),
-            "login tool missing: {names:?}"
+            "login tool should show when not logged in: {names:?}"
+        );
+        assert!(
+            !names.contains(&"skillclub_logout"),
+            "logout should not show when not logged in: {names:?}"
+        );
+        assert!(
+            !names.contains(&"skillclub_search"),
+            "search should not show when not logged in: {names:?}"
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn build_tool_list_shows_logout_when_logged_in() {
+        let state_root = temp_root("tool-list-auth-logged-in");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let url = "http://localhost:8000".to_string();
+        fake_login(&state, &url);
+
+        let tools = build_tool_list(&state, &Some(url));
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+
+        assert!(
+            !names.contains(&"skillclub_login"),
+            "login should not show when logged in: {names:?}"
         );
         assert!(
             names.contains(&"skillclub_logout"),
-            "logout tool missing: {names:?}"
+            "logout tool should show when logged in: {names:?}"
+        );
+        assert!(
+            names.contains(&"skillclub_search"),
+            "search should show when logged in: {names:?}"
         );
 
         let _ = fs::remove_dir_all(&state_root);
@@ -2889,11 +2942,13 @@ mod tests {
     // ── Governance edge case tests ───────────────────────────────────────────
 
     #[test]
-    fn build_tool_list_includes_mcp_install_uninstall_with_registry() {
+    fn build_tool_list_includes_mcp_install_uninstall_when_logged_in() {
         let state_root = temp_root("tool-list-mcp-install");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let url = "http://localhost:8000".to_string();
+        fake_login(&state, &url);
 
-        let tools = build_tool_list(&state, &Some("http://localhost:8000".to_string()));
+        let tools = build_tool_list(&state, &Some(url));
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
 
         assert!(
