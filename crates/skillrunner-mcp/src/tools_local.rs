@@ -153,7 +153,12 @@ fn handle_list(state: &AppState) -> ToolCallResult {
     }
 
     if lines.is_empty() {
-        ToolCallResult::success("No skills installed.")
+        ToolCallResult::success(
+            "No skills installed.\n\n\
+             To get started:\n\
+             - Use skillclub_author to create a new skill from a prompt\n\
+             - Use skillclub_import to import an existing SKILL.md file",
+        )
     } else {
         ToolCallResult::success(format!("Installed skills:\n{}", lines.join("\n")))
     }

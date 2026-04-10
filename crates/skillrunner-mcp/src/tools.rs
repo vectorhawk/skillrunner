@@ -570,7 +570,7 @@ pub fn handle_tool_call(
     registry_url: &Option<String>,
 ) -> ToolCallResult {
     let result = match name {
-        "skillclub_list" => handle_list(state),
+        "skillclub_list" => handle_list(state, registry_url),
         "skillclub_search" => handle_search(arguments, registry_url),
         "skillclub_install" => handle_install(arguments, state, registry_url),
         "skillclub_uninstall" => handle_uninstall(arguments, state),
@@ -623,7 +623,7 @@ pub fn handle_tool_call(
 
 // ── Management tool handlers ─────────────────────────────────────────────────
 
-fn handle_list(state: &AppState) -> ToolCallResult {
+fn handle_list(state: &AppState, registry_url: &Option<String>) -> ToolCallResult {
     let conn = match Connection::open(&state.db_path) {
         Ok(c) => c,
         Err(e) => return ToolCallResult::error(format!("Failed to open state DB: {e}")),
@@ -656,7 +656,29 @@ fn handle_list(state: &AppState) -> ToolCallResult {
     };
 
     if skills.is_empty() {
-        ToolCallResult::success(format!("No skills installed.{footer}"))
+        // Check if user is logged in to give appropriate next steps
+        let logged_in = registry_url
+            .as_ref()
+            .and_then(|url| {
+                skillrunner_core::auth::load_tokens(state, url)
+                    .ok()
+                    .flatten()
+            })
+            .is_some();
+
+        let next_steps = if logged_in {
+            "\n\nTo get started, you can:\n\
+             - Use skillclub_search to browse the registry\n\
+             - Use skillclub_author to create a new skill from a prompt\n\
+             - Use skillclub_import to import an existing SKILL.md file"
+        } else {
+            "\n\nTo get started, you can:\n\
+             - Use skillclub_author to create a new skill from a prompt\n\
+             - Use skillclub_import to import an existing SKILL.md file\n\
+             - Use skillclub_login to sign in and access the skill registry"
+        };
+
+        ToolCallResult::success(format!("No skills installed.{next_steps}{footer}"))
     } else {
         match serde_json::to_string_pretty(&skills) {
             Ok(text) => ToolCallResult::success(format!("{text}{footer}")),
@@ -2320,7 +2342,7 @@ mod tests {
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
         install_unpacked_skill(&state, &pkg).unwrap();
 
-        let result = handle_list(&state);
+        let result = handle_list(&state, &None);
         assert!(result.is_error.is_none());
         let text = &result.content[0].text;
         assert!(
@@ -2337,7 +2359,7 @@ mod tests {
         let state_root = temp_root("handle-list-empty");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
 
-        let result = handle_list(&state);
+        let result = handle_list(&state, &None);
         assert!(result.is_error.is_none());
         assert!(result.content[0].text.contains("No skills installed"));
 
@@ -2391,7 +2413,7 @@ mod tests {
         assert!(result.content[0].text.contains("0.1.0"));
 
         // Verify the skill appears in the list
-        let list_result = handle_list(&state);
+        let list_result = handle_list(&state, &None);
         assert!(list_result.content[0].text.contains("test-skill"));
 
         let _ = fs::remove_dir_all(&state_root);
