@@ -627,31 +627,25 @@ fn main() -> Result<()> {
                 let clients = detect_ai_clients(&skillrunner_path);
                 run_migration_step(&app.state, &clients, true, false)?;
             }
-            McpCommands::Restore { backup } => {
-                match backup {
-                    Some(path) => {
-                        restore_backup(std::path::Path::new(&path))
-                            .with_context(|| format!("failed to restore backup {path}"))?;
-                        println!("Restored backup: {path}");
-                    }
-                    None => {
-                        let backups = list_backups(&app.state)?;
-                        if backups.is_empty() {
-                            println!("No backups found in {}/backups/", app.state.root_dir);
-                        } else {
-                            println!("Available backups:");
-                            for b in &backups {
-                                println!(
-                                    "  {} ({})",
-                                    b.path.display(),
-                                    b.original_path.display()
-                                );
-                            }
-                            println!("\nTo restore: skillrunner mcp restore --backup <path>");
+            McpCommands::Restore { backup } => match backup {
+                Some(path) => {
+                    restore_backup(std::path::Path::new(&path))
+                        .with_context(|| format!("failed to restore backup {path}"))?;
+                    println!("Restored backup: {path}");
+                }
+                None => {
+                    let backups = list_backups(&app.state)?;
+                    if backups.is_empty() {
+                        println!("No backups found in {}/backups/", app.state.root_dir);
+                    } else {
+                        println!("Available backups:");
+                        for b in &backups {
+                            println!("  {} ({})", b.path.display(), b.original_path.display());
                         }
+                        println!("\nTo restore: skillrunner mcp restore --backup <path>");
                     }
                 }
-            }
+            },
             McpCommands::Backends { registry_url } => {
                 let url = resolve_registry_url(registry_url, managed_registry_url.as_deref());
                 match url {
@@ -1367,7 +1361,10 @@ fn run_migration_step(
         false
     } else {
         // Interactive path: prompt the user.
-        println!("\nFound {} existing MCP server(s) in your AI client configs:", unmanaged.len());
+        println!(
+            "\nFound {} existing MCP server(s) in your AI client configs:",
+            unmanaged.len()
+        );
         for s in &unmanaged {
             println!("  {} ({})", s.server_name, s.client_name);
         }
@@ -1397,7 +1394,10 @@ fn run_migration_step(
                 if report.migrated.is_empty() {
                     println!("  No new servers to migrate (already in backends.yaml).");
                 } else {
-                    println!("\n  Migrated {} server(s) to backends.yaml:", report.migrated.len());
+                    println!(
+                        "\n  Migrated {} server(s) to backends.yaml:",
+                        report.migrated.len()
+                    );
                     for m in &report.migrated {
                         println!("    {} ({})", m.server_name, m.transport);
                     }

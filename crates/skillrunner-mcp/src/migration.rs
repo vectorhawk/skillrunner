@@ -130,7 +130,11 @@ pub fn migrate_existing_servers(
                 continue;
             }
             // Skip disabled entries — leave them in the client config.
-            if value.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if value
+                .get("disabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 report.skipped.push(SkippedServer {
                     server_name: key.clone(),
                     client_name: client.name.clone(),
@@ -138,10 +142,11 @@ pub fn migrate_existing_servers(
                 });
                 continue;
             }
-            client_map
-                .entry(key.clone())
-                .or_default()
-                .push((client.name.clone(), client.config_path.clone(), value.clone()));
+            client_map.entry(key.clone()).or_default().push((
+                client.name.clone(),
+                client.config_path.clone(),
+                value.clone(),
+            ));
         }
     }
 
@@ -206,8 +211,11 @@ pub fn migrate_existing_servers(
     append_backends(state, entries_to_add).context("failed to append entries to backends.yaml")?;
 
     // Back up and strip migrated entries from each affected client config.
-    let migrated_names: HashSet<String> =
-        report.migrated.iter().map(|m| m.server_name.clone()).collect();
+    let migrated_names: HashSet<String> = report
+        .migrated
+        .iter()
+        .map(|m| m.server_name.clone())
+        .collect();
 
     // Collect unique config paths that need updating.
     let mut paths_to_update: Vec<(String, PathBuf, String)> = Vec::new();
@@ -242,9 +250,13 @@ pub fn migrate_existing_servers(
     let timestamp = current_timestamp();
 
     for (client_name, config_path, mcp_key) in &paths_to_update {
-        let backup_info =
-            backup_config(config_path, backups_dir.as_std_path(), client_name, &timestamp)
-                .with_context(|| format!("failed to back up config for {client_name}"))?;
+        let backup_info = backup_config(
+            config_path,
+            backups_dir.as_std_path(),
+            client_name,
+            &timestamp,
+        )
+        .with_context(|| format!("failed to back up config for {client_name}"))?;
         report.backups.push(backup_info);
 
         strip_migrated_servers(config_path, mcp_key, &migrated_names)
@@ -269,9 +281,8 @@ pub fn migrate_existing_servers(
 /// `{client_name}-{timestamp}.origin` file containing the original path.
 pub fn restore_backup(backup_path: &Path) -> Result<()> {
     let origin_path = backup_path.with_extension("origin");
-    let original_dest = fs::read_to_string(&origin_path).with_context(|| {
-        format!("failed to read origin sidecar {}", origin_path.display())
-    })?;
+    let original_dest = fs::read_to_string(&origin_path)
+        .with_context(|| format!("failed to read origin sidecar {}", origin_path.display()))?;
     let original_dest = original_dest.trim();
 
     // Ensure parent directories of the destination exist.
@@ -313,8 +324,7 @@ pub fn list_backups(state: &AppState) -> Result<Vec<BackupInfo>> {
 
         let origin_path = path.with_extension("origin");
         let original_path = if origin_path.exists() {
-            let dest = fs::read_to_string(&origin_path)
-                .unwrap_or_default();
+            let dest = fs::read_to_string(&origin_path).unwrap_or_default();
             PathBuf::from(dest.trim())
         } else {
             PathBuf::new()
@@ -410,8 +420,13 @@ fn backup_config(
     let backup_path = backups_dir.join(&filename);
     let origin_path = backups_dir.join(format!("{safe_client}-{timestamp}.origin"));
 
-    fs::copy(config_path, &backup_path)
-        .with_context(|| format!("failed to copy {} to {}", config_path.display(), backup_path.display()))?;
+    fs::copy(config_path, &backup_path).with_context(|| {
+        format!(
+            "failed to copy {} to {}",
+            config_path.display(),
+            backup_path.display()
+        )
+    })?;
 
     fs::write(&origin_path, config_path.display().to_string())
         .with_context(|| format!("failed to write origin sidecar {}", origin_path.display()))?;
@@ -574,8 +589,14 @@ mod tests {
         assert_eq!(entry.name, "github");
         assert_eq!(entry.transport, "stdio");
         assert_eq!(entry.command.as_deref(), Some("npx"));
-        assert_eq!(entry.args, vec!["-y", "@modelcontextprotocol/server-github"]);
-        assert_eq!(entry.env.get("GITHUB_TOKEN").map(String::as_str), Some("ghp_xxx"));
+        assert_eq!(
+            entry.args,
+            vec!["-y", "@modelcontextprotocol/server-github"]
+        );
+        assert_eq!(
+            entry.env.get("GITHUB_TOKEN").map(String::as_str),
+            Some("ghp_xxx")
+        );
         assert!(entry.url.is_none());
     }
 
@@ -617,7 +638,11 @@ mod tests {
         let clients = vec![make_client("Claude Code", config_path.clone())];
         let report = migrate_existing_servers(&state, &clients).unwrap();
 
-        assert_eq!(report.migrated.len(), 3, "should migrate github, sentry, files");
+        assert_eq!(
+            report.migrated.len(),
+            3,
+            "should migrate github, sentry, files"
+        );
         assert_eq!(report.skipped.len(), 0);
         assert_eq!(report.backups.len(), 1);
 
@@ -633,7 +658,10 @@ mod tests {
         let updated = fs::read_to_string(&config_path).unwrap();
         let updated_json: serde_json::Value = serde_json::from_str(&updated).unwrap();
         let servers = updated_json["mcpServers"].as_object().unwrap();
-        assert!(servers.contains_key("skillrunner"), "skillrunner must remain");
+        assert!(
+            servers.contains_key("skillrunner"),
+            "skillrunner must remain"
+        );
         assert!(!servers.contains_key("github"), "github should be removed");
         assert!(!servers.contains_key("sentry"), "sentry should be removed");
         assert!(!servers.contains_key("files"), "files should be removed");
@@ -660,7 +688,11 @@ mod tests {
         let report = migrate_existing_servers(&state, &clients).unwrap();
 
         assert_eq!(report.migrated.len(), 1, "only sentry should be migrated");
-        assert_eq!(report.skipped.len(), 1, "github should be skipped as disabled");
+        assert_eq!(
+            report.skipped.len(),
+            1,
+            "github should be skipped as disabled"
+        );
         assert!(matches!(report.skipped[0].reason, SkipReason::Disabled));
         assert_eq!(report.skipped[0].server_name, "github");
 
@@ -694,7 +726,10 @@ mod tests {
             .iter()
             .filter(|s| matches!(s.reason, SkipReason::Duplicate))
             .count();
-        assert_eq!(dup_skipped, 1, "github from Cursor should be marked as duplicate");
+        assert_eq!(
+            dup_skipped, 1,
+            "github from Cursor should be marked as duplicate"
+        );
 
         // Only one backends.yaml entry.
         let contents = fs::read_to_string(state.root_dir.join("backends.yaml")).unwrap();
@@ -797,14 +832,23 @@ mod tests {
         let backups_dir = state.root_dir.join("backups");
         fs::create_dir_all(&backups_dir).unwrap();
 
-        let info = backup_config(config_path.as_std_path(), backups_dir.as_std_path(), "Claude Code", "20260407-120000").unwrap();
+        let info = backup_config(
+            config_path.as_std_path(),
+            backups_dir.as_std_path(),
+            "Claude Code",
+            "20260407-120000",
+        )
+        .unwrap();
 
         assert!(info.path.exists(), "backup file should exist");
         let origin = info.path.with_extension("origin");
         assert!(origin.exists(), "origin sidecar should exist");
 
         let origin_content = fs::read_to_string(&origin).unwrap();
-        assert_eq!(origin_content.trim(), config_path.as_std_path().display().to_string());
+        assert_eq!(
+            origin_content.trim(),
+            config_path.as_std_path().display().to_string()
+        );
 
         cleanup(&state);
     }
@@ -817,7 +861,13 @@ mod tests {
 
         let backups_dir = state.root_dir.join("backups");
         fs::create_dir_all(&backups_dir).unwrap();
-        let info = backup_config(original_path.as_std_path(), backups_dir.as_std_path(), "Test Client", "20260407-130000").unwrap();
+        let info = backup_config(
+            original_path.as_std_path(),
+            backups_dir.as_std_path(),
+            "Test Client",
+            "20260407-130000",
+        )
+        .unwrap();
 
         // Overwrite the original to simulate it being modified.
         fs::write(original_path.as_std_path(), r#"{"modified":true}"#).unwrap();
@@ -825,7 +875,10 @@ mod tests {
         restore_backup(&info.path).unwrap();
 
         let restored = fs::read_to_string(&original_path).unwrap();
-        assert!(restored.contains("\"original\":true"), "restored content should match backup");
+        assert!(
+            restored.contains("\"original\":true"),
+            "restored content should match backup"
+        );
 
         cleanup(&state);
     }
@@ -846,7 +899,10 @@ mod tests {
 
         let backups = list_backups(&state).unwrap();
         assert_eq!(backups.len(), 2);
-        assert!(backups[0].timestamp < backups[1].timestamp, "should be sorted chronologically");
+        assert!(
+            backups[0].timestamp < backups[1].timestamp,
+            "should be sorted chronologically"
+        );
 
         cleanup(&state);
     }

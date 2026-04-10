@@ -197,11 +197,8 @@ pub fn append_backends(state: &AppState, new_entries: Vec<BackendEntry>) -> Resu
     };
 
     // Collect existing names to avoid duplicates.
-    let existing_names: std::collections::HashSet<String> = config
-        .backends
-        .iter()
-        .map(|e| e.name.clone())
-        .collect();
+    let existing_names: std::collections::HashSet<String> =
+        config.backends.iter().map(|e| e.name.clone()).collect();
 
     let mut added = 0usize;
     for entry in new_entries {

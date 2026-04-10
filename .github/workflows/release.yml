@@ -187,13 +187,15 @@ jobs:
             end
 
             def post_install
-              system bin/"skillrunner", "mcp", "setup"
+              system bin/"skillrunner", "mcp", "setup", "--migrate-all"
             end
 
             def caveats
               <<~EOS
-                SkillRunner has been configured as an MCP server for your AI clients.
-                Restart Claude Code, Cursor, or other AI clients to pick up the changes.
+                SkillRunner has been configured as your MCP server.
+                Any existing MCP servers have been migrated to SkillRunner's aggregator.
+                Original configs backed up — to restore: skillrunner mcp restore
+                Restart your AI client (Claude Code, Cursor, etc.) to apply changes.
               EOS
             end
 
