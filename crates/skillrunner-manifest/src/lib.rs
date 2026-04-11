@@ -1,6 +1,6 @@
 use camino::{Utf8Path, Utf8PathBuf};
 use semver::Version;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fs;
 
 pub mod skill_md;
@@ -141,6 +141,88 @@ pub struct UpdateConfig {
     pub auto_update: Option<bool>,
 }
 
+/// Where the system prompt for an LLM step comes from.
+///
+/// Deserializes from either a plain string (legacy path — treated as a
+/// relative file path) or an explicit tagged object:
+///   - `{kind: "file", path: "prompts/foo.txt"}`
+///   - `{kind: "inline", body: "You are a helpful assistant..."}`
+///
+/// Serializes to the tagged-object form so round-trips are unambiguous.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PromptSource {
+    /// Relative path from the skill bundle root to a prompt text file.
+    File(String),
+    /// Prompt body embedded directly in the workflow (no disk read needed).
+    Inline(String),
+}
+
+impl<'de> Deserialize<'de> for PromptSource {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{self, MapAccess, Visitor};
+        use std::fmt;
+
+        struct PromptSourceVisitor;
+
+        impl<'de> Visitor<'de> for PromptSourceVisitor {
+            type Value = PromptSource;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a prompt path string or a {kind, ...} object")
+            }
+
+            // Legacy plain-string form: `prompt: prompts/system.txt`
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(PromptSource::File(value.to_string()))
+            }
+
+            // Tagged-object form: `prompt: {kind: inline, body: "..."}`
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut kind: Option<String> = None;
+                let mut path: Option<String> = None;
+                let mut body: Option<String> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "kind" => {
+                            kind = Some(map.next_value()?);
+                        }
+                        "path" => {
+                            path = Some(map.next_value()?);
+                        }
+                        "body" => {
+                            body = Some(map.next_value()?);
+                        }
+                        other => {
+                            return Err(de::Error::unknown_field(other, &["kind", "path", "body"]));
+                        }
+                    }
+                }
+
+                match kind.as_deref() {
+                    Some("file") => {
+                        let p = path.ok_or_else(|| {
+                            de::Error::missing_field("path")
+                        })?;
+                        Ok(PromptSource::File(p))
+                    }
+                    Some("inline") => {
+                        let b = body.ok_or_else(|| {
+                            de::Error::missing_field("body")
+                        })?;
+                        Ok(PromptSource::Inline(b))
+                    }
+                    Some(other) => Err(de::Error::unknown_variant(other, &["file", "inline"])),
+                    None => Err(de::Error::missing_field("kind")),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(PromptSourceVisitor)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workflow {
     pub name: String,
@@ -159,7 +241,7 @@ pub enum WorkflowStep {
     #[serde(rename = "llm")]
     Llm {
         id: String,
-        prompt: String,
+        prompt: PromptSource,
         inputs: Option<serde_yaml::Value>,
         output_schema: Option<String>,
     },

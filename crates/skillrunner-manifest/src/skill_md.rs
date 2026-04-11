@@ -7,8 +7,8 @@
 
 use crate::{
     to_skill_id, ClipboardAccess, Execution, FilesystemAccess, Manifest, ManifestError,
-    ModelFallback, ModelRequirements, Permissions, SandboxProfile, SkillPackage, UpdateConfig,
-    Workflow, WorkflowStep,
+    ModelFallback, ModelRequirements, Permissions, PromptSource, SandboxProfile, SkillPackage,
+    UpdateConfig, Workflow, WorkflowStep,
 };
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
@@ -327,27 +327,15 @@ fn build_workflow(
     }
 
     // No workflow defined — synthesize a single LLM step from the SKILL.md body.
-    // The body becomes an inline system prompt stored in the struct as a
-    // special "inline:" prefix (executor will recognise it in AUTH1d). For now,
-    // write the body to a `prompts/system.txt` file alongside SKILL.md so
-    // the existing executor path works.
-    let prompts_dir = root.join("prompts");
-    if !prompts_dir.exists() {
-        // Create the prompts directory if it doesn't exist (SKILL.md-rooted
-        // directories may not have it pre-created for minimal skills).
-        fs::create_dir_all(&prompts_dir)?;
-    }
-    let system_txt = prompts_dir.join("system.txt");
-    if !system_txt.exists() {
-        fs::write(&system_txt, body.trim())?;
-    }
-
+    // The body is stored as an inline prompt so no disk write is needed.
+    // AUTH1d: eliminated the prompts/system.txt workaround; executor now matches
+    // on PromptSource::Inline directly.
     let workflow_name = to_skill_id(skill_name);
     Ok(Workflow {
         name: workflow_name.clone(),
         steps: vec![WorkflowStep::Llm {
             id: "generate".to_string(),
-            prompt: "prompts/system.txt".to_string(),
+            prompt: PromptSource::Inline(body.trim().to_string()),
             inputs: None,
             output_schema: None,
         }],
@@ -357,14 +345,26 @@ fn build_workflow(
 fn validate_workflow_prompt_refs(root: &Utf8Path, workflow: &Workflow) -> Result<(), ManifestError> {
     for step in &workflow.steps {
         if let WorkflowStep::Llm { prompt, .. } = step {
-            if prompt.trim().is_empty() {
-                return Err(ManifestError::Invalid(
-                    "llm step prompt path must be non-empty".to_string(),
-                ));
-            }
-            let p = root.join(prompt.as_str());
-            if !p.exists() {
-                return Err(ManifestError::MissingFile(prompt.clone()));
+            match prompt {
+                PromptSource::Inline(body) => {
+                    // Inline prompts have no file to validate; just check non-empty.
+                    if body.trim().is_empty() {
+                        return Err(ManifestError::Invalid(
+                            "llm step inline prompt body must be non-empty".to_string(),
+                        ));
+                    }
+                }
+                PromptSource::File(path) => {
+                    if path.trim().is_empty() {
+                        return Err(ManifestError::Invalid(
+                            "llm step prompt path must be non-empty".to_string(),
+                        ));
+                    }
+                    let p = root.join(path.as_str());
+                    if !p.exists() {
+                        return Err(ManifestError::MissingFile(path.clone()));
+                    }
+                }
             }
         }
     }

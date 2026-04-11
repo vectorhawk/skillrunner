@@ -14,7 +14,7 @@ pub struct RegistryClient;
 use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use rusqlite::Connection;
-use skillrunner_manifest::{SkillPackage, WorkflowStep};
+use skillrunner_manifest::{PromptSource, SkillPackage, WorkflowStep};
 use std::collections::HashMap;
 use std::fs;
 
@@ -158,7 +158,7 @@ fn execute_step(
                 pkg,
                 LlmStepParams {
                     id,
-                    prompt_rel: prompt,
+                    prompt_source: prompt,
                     step_inputs: inputs,
                     output_schema_rel: output_schema.as_deref(),
                     run_input,
@@ -285,7 +285,7 @@ fn execute_validate_step(
 
 struct LlmStepParams<'a> {
     id: &'a str,
-    prompt_rel: &'a str,
+    prompt_source: &'a PromptSource,
     step_inputs: &'a Option<serde_yaml::Value>,
     output_schema_rel: Option<&'a str>,
     run_input: &'a serde_json::Value,
@@ -296,17 +296,22 @@ struct LlmStepParams<'a> {
 fn execute_llm_step(pkg: &SkillPackage, p: LlmStepParams<'_>) -> Result<StepResult> {
     let LlmStepParams {
         id,
-        prompt_rel,
+        prompt_source,
         step_inputs,
         output_schema_rel,
         run_input,
         step_outputs,
         client,
     } = p;
-    // Read system prompt from file.
-    let prompt_path = pkg.root.join(prompt_rel);
-    let system_prompt = fs::read_to_string(&prompt_path)
-        .with_context(|| format!("failed to read prompt file {prompt_path}"))?;
+    // Resolve the system prompt: inline body used directly, file path read from disk.
+    let system_prompt = match prompt_source {
+        PromptSource::Inline(body) => body.clone(),
+        PromptSource::File(rel_path) => {
+            let prompt_path = pkg.root.join(rel_path.as_str());
+            fs::read_to_string(&prompt_path)
+                .with_context(|| format!("failed to read prompt file {prompt_path}"))?
+        }
+    };
 
     // Resolve step inputs → user message string.
     let user_message = resolve_inputs(step_inputs, run_input, step_outputs);
@@ -411,11 +416,17 @@ fn stub_step(step: &WorkflowStep) -> StepResult {
     // Only Llm steps reach this path (when model_client is None).
     // Tool, Transform, and Validate are always dispatched to real implementations.
     let (id, step_type, note) = match step {
-        WorkflowStep::Llm { id, prompt, .. } => (
-            id.clone(),
-            "llm",
-            format!("LLM call with prompt '{prompt}' — stub, no model invoked"),
-        ),
+        WorkflowStep::Llm { id, prompt, .. } => {
+            let prompt_desc = match prompt {
+                PromptSource::File(path) => format!("file '{path}'"),
+                PromptSource::Inline(_) => "inline body".to_string(),
+            };
+            (
+                id.clone(),
+                "llm",
+                format!("LLM call with prompt {prompt_desc} — stub, no model invoked"),
+            )
+        }
         WorkflowStep::Tool { id, tool, .. } => {
             (id.clone(), "tool", format!("built-in tool '{tool}' — stub"))
         }
