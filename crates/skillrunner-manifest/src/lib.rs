@@ -3,6 +3,8 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::fs;
 
+pub mod skill_md;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
     #[error("missing required file: {0}")]
@@ -17,6 +19,113 @@ pub enum ManifestError {
     Yaml(#[from] serde_yaml::Error),
 }
 
+// ── Clipboard access enum ────────────────────────────────────────────────────
+
+/// Clipboard capability scope. New canonical form; legacy `bool` is
+/// accepted during migration (true → Full, false → None). Sunset in AUTH1f.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ClipboardAccess {
+    None,
+    Read,
+    Write,
+    Full,
+}
+
+impl<'de> Deserialize<'de> for ClipboardAccess {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ClipboardVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ClipboardVisitor {
+            type Value = ClipboardAccess;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("\"none\", \"read\", \"write\", \"full\", or a boolean")
+            }
+
+            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                // Legacy form: true → Full, false → None
+                if v {
+                    Ok(ClipboardAccess::Full)
+                } else {
+                    Ok(ClipboardAccess::None)
+                }
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match v {
+                    "none" => Ok(ClipboardAccess::None),
+                    "read" => Ok(ClipboardAccess::Read),
+                    "write" => Ok(ClipboardAccess::Write),
+                    "full" => Ok(ClipboardAccess::Full),
+                    other => Err(E::unknown_variant(
+                        other,
+                        &["none", "read", "write", "full"],
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(ClipboardVisitor)
+    }
+}
+
+// ── Filesystem access enum ───────────────────────────────────────────────────
+
+/// Filesystem capability scope (3-bucket simplification per AUTH1b decisions).
+/// Legacy underscore variants (`read_only`, `read_only_scoped`, `read_write`)
+/// and the new hyphen form (`read-only`) are all accepted. Sunset in AUTH1f.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum FilesystemAccess {
+    #[serde(rename = "none")]
+    None,
+    #[serde(rename = "read-only")]
+    ReadOnly,
+    #[serde(rename = "full")]
+    Full,
+}
+
+impl<'de> Deserialize<'de> for FilesystemAccess {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "none" => Ok(FilesystemAccess::None),
+            "read-only" | "read_only" | "read_only_scoped" => Ok(FilesystemAccess::ReadOnly),
+            "full" | "read_write" => Ok(FilesystemAccess::Full),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["none", "read-only", "full"],
+            )),
+        }
+    }
+}
+
+// ── Sandbox profile enum ─────────────────────────────────────────────────────
+
+/// Sandbox isolation level. Matches the JSON Schema enum and the AUTH1b
+/// consistency fix (sandbox_profile: String → sandbox: SandboxProfile).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxProfile {
+    Strict,
+    Relaxed,
+    Unrestricted,
+}
+
+// ── Manifest and sub-types ───────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub schema_version: String,
@@ -27,8 +136,8 @@ pub struct Manifest {
     pub description: Option<String>,
     pub license: Option<String>,
     pub entrypoint: String,
-    pub inputs_schema: String,
-    pub outputs_schema: String,
+    pub inputs_schema: Option<serde_json::Value>,
+    pub outputs_schema: Option<serde_json::Value>,
     pub permissions: Permissions,
     pub execution: Execution,
     pub model_requirements: Option<ModelRequirements>,
@@ -41,25 +150,122 @@ pub struct Manifest {
     pub offload_eligible: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Permissions {
-    pub filesystem: String,
-    pub network: String,
-    pub clipboard: bool,
+impl Manifest {
+    /// Returns the inputs JSON Schema, or a pass-through schema if none is declared.
+    pub fn inputs_schema_or_default(&self) -> serde_json::Value {
+        self.inputs_schema.clone().unwrap_or_else(|| {
+            serde_json::json!({"type": "object", "additionalProperties": true})
+        })
+    }
+
+    /// Returns the outputs JSON Schema, or a pass-through schema if none is declared.
+    pub fn outputs_schema_or_default(&self) -> serde_json::Value {
+        self.outputs_schema.clone().unwrap_or_else(|| {
+            serde_json::json!({"type": "object", "additionalProperties": true})
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Permissions {
+    pub filesystem: FilesystemAccess,
+    pub network: String,
+    pub clipboard: ClipboardAccess,
+}
+
+/// Public execution constraint struct. `timeout_ms` is the canonical field.
+/// During deserialization, the legacy `timeout_seconds` key is accepted and
+/// converted (×1000). Serialization always emits `timeout_ms`. Sunset legacy
+/// key in AUTH1f.
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Execution {
-    pub sandbox_profile: String,
-    pub timeout_seconds: u64,
+    pub sandbox: SandboxProfile,
+    pub timeout_ms: u64,
     pub memory_mb: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl<'de> Deserialize<'de> for Execution {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Intermediate struct that captures both the new and legacy timeout keys.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ExecutionRaw {
+            /// New canonical key (milliseconds).
+            timeout_ms: Option<u64>,
+            /// Legacy key (seconds). Accepted during migration, sunset in AUTH1f.
+            timeout_seconds: Option<u64>,
+            memory_mb: u64,
+            /// New canonical field (enum). Accepted as string.
+            sandbox: Option<SandboxProfile>,
+            /// Legacy field name used in old manifest.json files.
+            sandbox_profile: Option<SandboxProfile>,
+        }
+
+        let raw = ExecutionRaw::deserialize(deserializer)?;
+
+        let sandbox = match (raw.sandbox, raw.sandbox_profile) {
+            (Some(s), _) => s,
+            (None, Some(s)) => s,
+            (None, None) => {
+                return Err(serde::de::Error::missing_field("sandbox"));
+            }
+        };
+
+        let timeout_ms = match (raw.timeout_ms, raw.timeout_seconds) {
+            (Some(ms), _) => ms,
+            (None, Some(secs)) => secs * 1000,
+            (None, None) => {
+                return Err(serde::de::Error::missing_field("timeout_ms"));
+            }
+        };
+
+        Ok(Execution {
+            sandbox,
+            timeout_ms,
+            memory_mb: raw.memory_mb,
+        })
+    }
+}
+
+/// Fallback behavior when no recommended model is available locally.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelFallback {
+    McpSampling,
+    Error,
+}
+
+/// Model requirements and recommendations for this skill.
+///
+/// AUTH1 canonical fields: `min_params_b`, `recommended`, `fallback`.
+/// Legacy fields (sunset in AUTH1f) kept with `#[serde(default)]` so old
+/// bundles that use them continue to load without error.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ModelRequirements {
+    // ── AUTH1 canonical fields ───────────────────────────────────────────────
+    /// Minimum model size in billions of parameters (e.g. 7.0 for a 7B model).
+    pub min_params_b: Option<f64>,
+    /// Ordered list of recommended model identifiers.
+    #[serde(default)]
+    pub recommended: Vec<String>,
+    /// Behavior when no recommended model is available locally.
+    pub fallback: Option<ModelFallback>,
+
+    // ── Legacy fields — sunset in AUTH1f ─────────────────────────────────────
+    /// TODO(AUTH1f): remove. Use `min_params_b` instead.
+    #[serde(default)]
     pub min_context_tokens: Option<u64>,
+    /// TODO(AUTH1f): remove.
+    #[serde(default)]
     pub supports_structured_output: Option<bool>,
+    /// TODO(AUTH1f): remove.
+    #[serde(default)]
     pub supports_tool_calling: Option<bool>,
+    /// TODO(AUTH1f): remove. Use `recommended` + `fallback` instead.
+    #[serde(default)]
     pub preferred_execution: Option<String>,
 }
 
@@ -113,59 +319,133 @@ pub struct SkillPackage {
 }
 
 impl SkillPackage {
+    /// Load a skill from a directory. Dispatches to the SKILL.md loader if
+    /// `SKILL.md` is present at the root; otherwise falls back to the legacy
+    /// `manifest.json` bundle loader.
     pub fn load_from_dir(root: impl AsRef<Utf8Path>) -> Result<Self, ManifestError> {
         let root = root.as_ref().to_path_buf();
-        let manifest_path = root.join("manifest.json");
-        let manifest_text = fs::read_to_string(&manifest_path)?;
-        let manifest: Manifest = serde_json::from_str(&manifest_text)?;
-
-        validate_manifest_files(&root, &manifest)?;
-
-        let workflow_path = root.join(&manifest.entrypoint);
-        let workflow_text = fs::read_to_string(&workflow_path)?;
-        let workflow: Workflow = serde_yaml::from_str(&workflow_text)?;
-
-        validate_workflow_refs(&root, &workflow)?;
-
-        Ok(Self {
-            root,
-            manifest,
-            workflow,
-        })
+        if root.join("SKILL.md").exists() {
+            skill_md::load_from_skill_md_dir(root)
+        } else {
+            load_from_legacy_bundle_dir(root)
+        }
     }
 }
 
-fn validate_manifest_files(root: &Utf8Path, manifest: &Manifest) -> Result<(), ManifestError> {
-    if manifest.id.trim().is_empty()
-        || manifest.name.trim().is_empty()
-        || manifest.publisher.trim().is_empty()
-    {
+/// Intermediate struct used to deserialize legacy `manifest.json` files.
+/// `inputs_schema` and `outputs_schema` are file paths (strings) that the
+/// loader resolves to JSON values. This struct is crate-private.
+#[derive(Debug, Deserialize)]
+struct LegacyManifestJson {
+    pub schema_version: String,
+    pub id: String,
+    pub name: String,
+    pub version: Version,
+    pub publisher: String,
+    pub description: Option<String>,
+    pub license: Option<String>,
+    pub entrypoint: String,
+    /// Relative path to the input schema file (e.g. "schemas/input.schema.json").
+    pub inputs_schema: Option<String>,
+    /// Relative path to the output schema file (e.g. "schemas/output.schema.json").
+    pub outputs_schema: Option<String>,
+    pub permissions: Permissions,
+    pub execution: Execution,
+    #[serde(default)]
+    pub model_requirements: Option<ModelRequirements>,
+    pub update: Option<UpdateConfig>,
+    #[serde(default)]
+    pub triggers: Vec<String>,
+    #[serde(default)]
+    pub offload_eligible: Option<bool>,
+}
+
+fn load_from_legacy_bundle_dir(root: Utf8PathBuf) -> Result<SkillPackage, ManifestError> {
+    let manifest_path = root.join("manifest.json");
+    let manifest_text = fs::read_to_string(&manifest_path)?;
+    let raw: LegacyManifestJson = serde_json::from_str(&manifest_text)?;
+
+    validate_legacy_manifest_identity(&raw)?;
+
+    // Resolve schema file paths to in-memory JSON values.
+    let inputs_schema = read_optional_schema(&root, raw.inputs_schema.as_deref())?;
+    let outputs_schema = read_optional_schema(&root, raw.outputs_schema.as_deref())?;
+
+    // Validate entrypoint file exists.
+    let entrypoint_path = root.join(&raw.entrypoint);
+    if !entrypoint_path.exists() {
+        return Err(ManifestError::MissingFile(raw.entrypoint.clone()));
+    }
+
+    let manifest = Manifest {
+        schema_version: raw.schema_version,
+        id: raw.id,
+        name: raw.name,
+        version: raw.version,
+        publisher: raw.publisher,
+        description: raw.description,
+        license: raw.license,
+        entrypoint: raw.entrypoint,
+        inputs_schema,
+        outputs_schema,
+        permissions: raw.permissions,
+        execution: raw.execution,
+        model_requirements: raw.model_requirements,
+        update: raw.update,
+        triggers: raw.triggers,
+        offload_eligible: raw.offload_eligible,
+    };
+
+    let workflow_path = root.join(&manifest.entrypoint);
+    let workflow_text = fs::read_to_string(&workflow_path)?;
+    let workflow: Workflow = serde_yaml::from_str(&workflow_text)?;
+
+    validate_workflow_refs(&root, &workflow)?;
+
+    Ok(SkillPackage {
+        root,
+        manifest,
+        workflow,
+    })
+}
+
+/// Read a schema from a relative file path. Returns `None` if `rel` is `None`.
+/// Returns an error if the file does not exist or is not valid JSON.
+fn read_optional_schema(
+    root: &Utf8Path,
+    rel: Option<&str>,
+) -> Result<Option<serde_json::Value>, ManifestError> {
+    let rel = match rel {
+        Some(r) if !r.trim().is_empty() => r,
+        _ => return Ok(None),
+    };
+    let path = root.join(rel);
+    if !path.exists() {
+        return Err(ManifestError::MissingFile(rel.to_string()));
+    }
+    let text = fs::read_to_string(&path)?;
+    let value: serde_json::Value = serde_json::from_str(&text)?;
+    Ok(Some(value))
+}
+
+fn validate_legacy_manifest_identity(raw: &LegacyManifestJson) -> Result<(), ManifestError> {
+    if raw.id.trim().is_empty() || raw.name.trim().is_empty() || raw.publisher.trim().is_empty() {
         return Err(ManifestError::Invalid(
             "id, name, and publisher must be non-empty".to_string(),
         ));
     }
 
-    if manifest.schema_version != "1.0" {
+    if raw.schema_version != "1.0" {
         return Err(ManifestError::Invalid(format!(
             "unsupported schema_version {}",
-            manifest.schema_version
+            raw.schema_version
         )));
     }
 
-    for rel in [
-        manifest.entrypoint.as_str(),
-        manifest.inputs_schema.as_str(),
-        manifest.outputs_schema.as_str(),
-    ] {
-        if rel.trim().is_empty() {
-            return Err(ManifestError::Invalid(
-                "entrypoint, inputs_schema, and outputs_schema must be non-empty".to_string(),
-            ));
-        }
-        let p = root.join(rel);
-        if !p.exists() {
-            return Err(ManifestError::MissingFile(rel.to_string()));
-        }
+    if raw.entrypoint.trim().is_empty() {
+        return Err(ManifestError::Invalid(
+            "entrypoint must be non-empty".to_string(),
+        ));
     }
 
     Ok(())
@@ -343,6 +623,32 @@ fn validate_plugin_manifest(
     }
 
     Ok(())
+}
+
+// ── ID derivation ─────────────────────────────────────────────────────────────
+
+/// Derive a kebab-case skill ID from a human-readable name.
+///
+/// Rules:
+/// - Lowercase all characters.
+/// - Replace any character that is not alphanumeric or `-` with `-`.
+/// - Collapse consecutive `-` into one; strip leading/trailing `-`.
+///
+/// Examples: `"Contract Compare"` → `"contract-compare"`,
+///           `"my_skill"` → `"my-skill"`.
+///
+/// This function is the canonical source of truth for ID derivation. It is
+/// also re-exported from `skillrunner-core::import` for callers that already
+/// depend on that crate.
+pub fn to_skill_id(name: &str) -> String {
+    name.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 #[cfg(test)]
