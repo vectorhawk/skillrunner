@@ -507,23 +507,17 @@ fn check_model_requirements(
     reqs: &skillrunner_manifest::ModelRequirements,
     _client: &dyn ModelClient,
 ) {
-    // Warn about requirements that can't be verified locally.
-    // This is advisory — we don't block execution, just log warnings.
-    if let Some(min_ctx) = reqs.min_context_tokens {
-        tracing::warn!(
-            "skill requires min_context_tokens={min_ctx} — cannot verify locally, proceeding"
-        );
-    }
-    if reqs.supports_structured_output == Some(true) {
+    // Advisory checks — log relevant requirements, don't block execution.
+    if let Some(min_params) = reqs.min_params_b {
         tracing::info!(
-            "skill requires structured output support — requesting JSON format from model"
+            "skill requires min_params_b={min_params}B — cannot verify locally, proceeding"
         );
     }
-    if reqs.supports_tool_calling == Some(true) {
-        tracing::warn!("skill requires tool calling — not yet supported by local Ollama backend");
+    if !reqs.recommended.is_empty() {
+        tracing::info!("skill recommended models: {:?}", reqs.recommended);
     }
-    if let Some(pref) = &reqs.preferred_execution {
-        tracing::info!("skill preferred execution: {pref}");
+    if let Some(fallback) = reqs.fallback {
+        tracing::info!("skill model fallback: {fallback:?}");
     }
 }
 

@@ -836,10 +836,9 @@ fn handle_info(arguments: &serde_json::Value, state: &AppState) -> ToolCallResul
                     "clipboard": pkg.manifest.permissions.clipboard,
                 },
                 "model_requirements": pkg.manifest.model_requirements.as_ref().map(|r| serde_json::json!({
-                    "min_context_tokens": r.min_context_tokens,
-                    "supports_structured_output": r.supports_structured_output,
-                    "supports_tool_calling": r.supports_tool_calling,
-                    "preferred_execution": r.preferred_execution,
+                    "min_params_b": r.min_params_b,
+                    "recommended": r.recommended,
+                    "fallback": r.fallback,
                 })),
             });
             match serde_json::to_string_pretty(&info) {
