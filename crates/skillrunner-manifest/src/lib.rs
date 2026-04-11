@@ -1033,4 +1033,259 @@ steps:
 
         let _ = fs::remove_dir_all(root);
     }
+
+    // ── to_skill_id tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn to_skill_id_handles_spaces_and_mixed_case() {
+        assert_eq!(to_skill_id("Frontend Design"), "frontend-design");
+        assert_eq!(to_skill_id("Contract Compare"), "contract-compare");
+    }
+
+    #[test]
+    fn to_skill_id_replaces_underscores_with_hyphens() {
+        assert_eq!(to_skill_id("my_skill"), "my-skill");
+        assert_eq!(to_skill_id("already-kebab"), "already-kebab");
+    }
+
+    #[test]
+    fn to_skill_id_strips_leading_trailing_and_collapsed_hyphens() {
+        assert_eq!(to_skill_id("  hello world  "), "hello-world");
+        assert_eq!(to_skill_id("foo--bar"), "foo-bar");
+        assert_eq!(to_skill_id("---"), "");
+    }
+
+    #[test]
+    fn to_skill_id_handles_uppercase_and_special_chars() {
+        // ASCII special chars (!, @) → hyphens; uppercase → lowercase.
+        assert_eq!(to_skill_id("GPT-4 Summary!"), "gpt-4-summary");
+        assert_eq!(to_skill_id("skill@v2"), "skill-v2");
+        // Non-ASCII letters are alphanumeric in Unicode, so they pass through
+        // lowercased (is_alphanumeric() is Unicode-aware).
+        assert_eq!(to_skill_id("Résumé Checker"), "résumé-checker");
+    }
+
+    // ── SKILL.md loading tests ───────────────────────────────────────────────
+
+    fn write_minimal_skill_md(root: &Utf8Path) {
+        fs::create_dir_all(root).expect("root dir should be created");
+        fs::write(
+            root.join("SKILL.md"),
+            "---\nname: hello-world\ndescription: A greeter skill.\nlicense: MIT\nvh_version: 0.1.0\nvh_publisher: test\n---\n\nYou are a greeter.\n",
+        )
+        .expect("SKILL.md should be written");
+    }
+
+    fn write_full_skill_md(root: &Utf8Path) {
+        fs::create_dir_all(root.join("prompts")).expect("prompts dir should be created");
+        fs::write(root.join("prompts/analyze.md"), "Analyze the passage.").unwrap();
+        fs::write(
+            root.join("SKILL.md"),
+            r#"---
+name: passage-analyzer
+description: Analyzes a passage and summarizes it.
+license: Apache-2.0
+vh_version: 1.0.0
+vh_publisher: vectorhawk
+vh_permissions:
+  network: none
+  filesystem: read-only
+  clipboard: none
+vh_execution:
+  timeout_ms: 60000
+  memory_mb: 1024
+  sandbox: strict
+vh_model:
+  min_params_b: 7
+  recommended:
+    - llama3.1:8b
+    - claude-3-haiku
+  fallback: mcp_sampling
+vh_schemas:
+  inputs:
+    type: object
+    required: [passage]
+    properties:
+      passage: {type: string}
+  outputs:
+    type: object
+    properties:
+      summary: {type: string}
+vh_workflow:
+  - id: analyze
+    type: llm
+    prompt: prompts/analyze.md
+---
+
+You are an expert text analyst.
+"#,
+        )
+        .expect("SKILL.md should be written");
+    }
+
+    #[test]
+    fn skill_md_minimal_loads_and_derives_id() {
+        let root = temp_root("skill-md-minimal");
+        write_minimal_skill_md(&root);
+
+        let pkg = SkillPackage::load_from_dir(&root).expect("minimal SKILL.md should load");
+
+        assert_eq!(pkg.manifest.id, "hello-world");
+        assert_eq!(pkg.manifest.name, "hello-world");
+        assert_eq!(pkg.manifest.publisher, "test");
+        assert_eq!(
+            pkg.manifest.version,
+            semver::Version::parse("0.1.0").unwrap()
+        );
+        assert_eq!(pkg.manifest.description.as_deref(), Some("A greeter skill."));
+        assert_eq!(pkg.manifest.license.as_deref(), Some("MIT"));
+        // No schemas declared — both should be None.
+        assert!(pkg.manifest.inputs_schema.is_none());
+        assert!(pkg.manifest.outputs_schema.is_none());
+        // Synthesized single-step workflow.
+        assert_eq!(pkg.workflow.steps.len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_md_full_vh_frontmatter_loads_correctly() {
+        let root = temp_root("skill-md-full");
+        write_full_skill_md(&root);
+
+        let pkg = SkillPackage::load_from_dir(&root).expect("full SKILL.md should load");
+
+        assert_eq!(pkg.manifest.id, "passage-analyzer");
+        assert_eq!(pkg.manifest.version.to_string(), "1.0.0");
+        assert_eq!(pkg.manifest.permissions.filesystem, FilesystemAccess::ReadOnly);
+        assert_eq!(pkg.manifest.permissions.clipboard, ClipboardAccess::None);
+        assert_eq!(pkg.manifest.execution.timeout_ms, 60000);
+        assert_eq!(pkg.manifest.execution.memory_mb, 1024);
+        assert_eq!(pkg.manifest.execution.sandbox, SandboxProfile::Strict);
+
+        let model = pkg.manifest.model_requirements.as_ref().unwrap();
+        assert_eq!(model.min_params_b, Some(7.0));
+        assert_eq!(model.recommended, vec!["llama3.1:8b", "claude-3-haiku"]);
+        assert_eq!(model.fallback, Some(ModelFallback::McpSampling));
+
+        assert!(pkg.manifest.inputs_schema.is_some());
+        assert!(pkg.manifest.outputs_schema.is_some());
+
+        assert_eq!(pkg.workflow.steps.len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_md_rejects_unknown_vh_field() {
+        let root = temp_root("skill-md-unknown-vh");
+        fs::create_dir_all(&root).expect("root dir should be created");
+        fs::write(
+            root.join("SKILL.md"),
+            "---\nname: bad-skill\ndescription: Test.\nlicense: MIT\nvh_unknown_extension: oops\n---\n\nPrompt.\n",
+        )
+        .expect("SKILL.md should be written");
+
+        let err = SkillPackage::load_from_dir(&root).expect_err("unknown vh_ field should fail");
+
+        match err {
+            ManifestError::Invalid(msg) => {
+                assert!(
+                    msg.contains("vh_unknown_extension"),
+                    "error should name the unknown field, got: {msg}"
+                );
+            }
+            other => panic!("expected ManifestError::Invalid, got: {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_md_rejects_mutually_exclusive_vh_workflow_and_ref() {
+        let root = temp_root("skill-md-workflow-conflict");
+        fs::create_dir_all(&root).expect("root dir should be created");
+        fs::write(
+            root.join("SKILL.md"),
+            "---\nname: bad\ndescription: Test.\nlicense: MIT\nvh_workflow:\n  - {id: step1, type: llm, prompt: prompts/p.md}\nvh_workflow_ref: ./workflow.yaml\n---\n\nPrompt.\n",
+        )
+        .expect("SKILL.md should be written");
+
+        let err = SkillPackage::load_from_dir(&root)
+            .expect_err("mutually exclusive workflow fields should fail");
+
+        match err {
+            ManifestError::Invalid(msg) => {
+                assert!(
+                    msg.contains("mutually exclusive"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected ManifestError::Invalid, got: {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_md_real_minimal_example_loads() {
+        // Load the AUTH1a real example skill from the examples directory.
+        let root = Utf8PathBuf::from(
+            "/Users/shadowduck/code/skillclub/skillrunner/examples/skills/skill-md-minimal",
+        );
+        if !root.exists() {
+            return; // Skip if running in a context without the examples directory.
+        }
+        let pkg = SkillPackage::load_from_dir(&root).expect("real minimal SKILL.md should load");
+        assert_eq!(pkg.manifest.id, "skill-md-minimal");
+        assert_eq!(pkg.workflow.steps.len(), 1);
+    }
+
+    #[test]
+    fn skill_md_real_complex_example_loads() {
+        // Load the AUTH1a complex example (has vh_workflow_ref and vh_schemas).
+        let root = Utf8PathBuf::from(
+            "/Users/shadowduck/code/skillclub/skillrunner/examples/skills/skill-md-complex",
+        );
+        if !root.exists() {
+            return;
+        }
+        let pkg = SkillPackage::load_from_dir(&root).expect("real complex SKILL.md should load");
+        assert_eq!(pkg.manifest.id, "skill-md-complex");
+        assert!(
+            pkg.manifest.inputs_schema.is_some(),
+            "complex skill should have inputs schema"
+        );
+        assert!(
+            pkg.manifest.outputs_schema.is_some(),
+            "complex skill should have outputs schema"
+        );
+        let model = pkg.manifest.model_requirements.as_ref().unwrap();
+        assert_eq!(model.fallback, Some(ModelFallback::McpSampling));
+        assert!(pkg.workflow.steps.len() > 1, "complex skill has multiple steps");
+    }
+
+    #[test]
+    fn legacy_bundle_still_loads_after_auth1b() {
+        // Verify backwards compat: the existing contract-compare legacy bundle
+        // still loads with the new enum types and custom deserializers.
+        let root = temp_root("legacy-compat");
+        write_example_skill(&root);
+
+        let pkg = SkillPackage::load_from_dir(&root).expect("legacy bundle should load");
+
+        // filesystem: "read_only_scoped" → ReadOnly
+        assert_eq!(pkg.manifest.permissions.filesystem, FilesystemAccess::ReadOnly);
+        // clipboard: false → None
+        assert_eq!(pkg.manifest.permissions.clipboard, ClipboardAccess::None);
+        // sandbox_profile: "strict" → Strict
+        assert_eq!(pkg.manifest.execution.sandbox, SandboxProfile::Strict);
+        // timeout_seconds: 90 → timeout_ms: 90000
+        assert_eq!(pkg.manifest.execution.timeout_ms, 90_000);
+        // schemas loaded as in-memory values
+        assert!(pkg.manifest.inputs_schema.is_some());
+        assert!(pkg.manifest.outputs_schema.is_some());
+
+        let _ = fs::remove_dir_all(root);
+    }
 }
