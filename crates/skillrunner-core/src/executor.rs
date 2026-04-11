@@ -94,8 +94,8 @@ pub fn run_skill(
     let pkg = SkillPackage::load_from_dir(&pkg_path)
         .with_context(|| format!("failed to load skill package at {pkg_path}"))?;
 
-    // 3. Validate input against inputs_schema.
-    validate_input(&pkg_path, &pkg.manifest.inputs_schema, input)?;
+    // 3. Validate input against inputs_schema (uses default pass-through schema when absent).
+    validate_input_against_schema(&pkg.manifest.inputs_schema_or_default(), input)?;
 
     // 4. Warn if model requirements are specified but may not be met.
     if let (Some(client), Some(reqs)) = (model_client, &pkg.manifest.model_requirements) {
@@ -443,22 +443,17 @@ fn stub_step(step: &WorkflowStep) -> StepResult {
 
 // ── Schema validation helpers ─────────────────────────────────────────────────
 
-fn validate_input(
-    pkg_path: &Utf8PathBuf,
-    schema_rel: &str,
+/// Validate `input` against an already-parsed JSON Schema value.
+/// The schema comes from `Manifest::inputs_schema_or_default()`.
+fn validate_input_against_schema(
+    schema_json: &serde_json::Value,
     input: &serde_json::Value,
 ) -> Result<()> {
-    let schema_path = pkg_path.join(schema_rel);
-    let schema_text = fs::read_to_string(&schema_path)
-        .with_context(|| format!("failed to read input schema {schema_path}"))?;
-    let schema_json: serde_json::Value = serde_json::from_str(&schema_text)
-        .with_context(|| format!("{schema_rel} is not valid JSON"))?;
-
-    let validator = jsonschema::JSONSchema::compile(&schema_json)
-        .map_err(|e| anyhow::anyhow!("{schema_rel} is not a valid JSON Schema: {e}"))?;
+    let validator = jsonschema::JSONSchema::compile(schema_json)
+        .map_err(|e| anyhow::anyhow!("inputs_schema is not a valid JSON Schema: {e}"))?;
 
     if !validator.is_valid(input) {
-        anyhow::bail!("input failed validation against {schema_rel}");
+        anyhow::bail!("input failed validation against inputs_schema");
     }
 
     Ok(())

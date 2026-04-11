@@ -545,10 +545,8 @@ fn skill_to_tool(skill_id: &str, active_path: &str) -> Result<ToolDefinition> {
         )
     };
 
-    // Read the input schema file to use as the tool's inputSchema
-    let schema_path = pkg.root.join(&pkg.manifest.inputs_schema);
-    let schema_text = fs::read_to_string(&schema_path)?;
-    let input_schema: serde_json::Value = serde_json::from_str(&schema_text)?;
+    // Use the in-memory input schema (already parsed at load time).
+    let input_schema = pkg.manifest.inputs_schema_or_default();
 
     Ok(ToolDefinition {
         name: skill_id.to_string(),

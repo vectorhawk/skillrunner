@@ -1,6 +1,5 @@
 use camino::Utf8Path;
 use skillrunner_manifest::SkillPackage;
-use std::fs;
 
 #[derive(Debug)]
 pub struct CheckResult {
@@ -45,27 +44,30 @@ pub fn validate_bundle(path: &Utf8Path) -> ValidationReport {
     };
 
     if let Some(pkg) = pkg {
-        checks.push(check_json_schema(path, &pkg.manifest.inputs_schema));
-        checks.push(check_json_schema(path, &pkg.manifest.outputs_schema));
+        checks.push(check_json_schema_value(
+            "inputs_schema",
+            pkg.manifest.inputs_schema.as_ref(),
+        ));
+        checks.push(check_json_schema_value(
+            "outputs_schema",
+            pkg.manifest.outputs_schema.as_ref(),
+        ));
     }
 
     ValidationReport { checks }
 }
 
-fn check_json_schema(root: &Utf8Path, rel: &str) -> CheckResult {
-    let name = format!("{rel} is valid JSON Schema");
+/// Validate that an already-parsed JSON Schema value is a valid JSON Schema.
+/// When `schema` is `None` (omitted from manifest), the check is a no-op pass.
+fn check_json_schema_value(label: &str, schema: Option<&serde_json::Value>) -> CheckResult {
+    let name = format!("{label} is valid JSON Schema");
 
-    let text = match fs::read_to_string(root.join(rel)) {
-        Ok(t) => t,
-        Err(e) => return fail(&name, &format!("could not read file: {e}")),
+    let json = match schema {
+        Some(v) => v,
+        None => return ok(&name), // absent schema is valid (pass-through)
     };
 
-    let json: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(v) => v,
-        Err(e) => return fail(&name, &format!("not valid JSON: {e}")),
-    };
-
-    match jsonschema::JSONSchema::compile(&json) {
+    match jsonschema::JSONSchema::compile(json) {
         Ok(_) => ok(&name),
         Err(e) => fail(&name, &format!("not valid JSON Schema: {e}")),
     }
@@ -180,24 +182,23 @@ mod tests {
     }
 
     #[test]
-    fn validate_fails_schema_check_when_schema_is_not_valid_json() {
+    fn validate_fails_manifest_check_when_schema_file_is_not_valid_json() {
+        // Schema files are parsed at manifest-load time (AUTH1b: inputs_schema is
+        // Option<serde_json::Value>). Invalid JSON in a schema file causes the
+        // "manifest and workflow" check to fail, not a separate schema check.
         let dir = temp_dir("bad-schema");
         write_valid_bundle(&dir);
         fs::write(dir.join("schemas/input.schema.json"), "not json {{{").unwrap();
 
         let report = validate_bundle(&dir);
 
-        let schema_check = report
+        let manifest_check = report
             .checks
             .iter()
-            .find(|c| c.name.contains("input"))
+            .find(|c| c.name == "manifest and workflow")
             .unwrap();
-        assert!(!schema_check.passed);
-        assert!(schema_check
-            .detail
-            .as_deref()
-            .unwrap_or("")
-            .contains("JSON"));
+        assert!(!manifest_check.passed, "expected manifest check to fail");
+        assert!(!report.all_passed());
 
         let _ = fs::remove_dir_all(&dir);
     }
