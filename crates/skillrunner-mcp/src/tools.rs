@@ -12,7 +12,9 @@ use skillrunner_core::{
     policy::PolicyClient,
     registry::RegistryClient,
     state::AppState,
-    updater::{install_from_registry, install_plugin_from_registry, package_plugin, package_skill},
+    updater::{
+        install_from_registry, install_plugin_from_registry, package_plugin, tar_gz_skill_source,
+    },
     validator::validate_bundle,
 };
 use skillrunner_manifest::SkillPackage;
@@ -989,42 +991,30 @@ fn handle_publish(
         Err(e) => return ToolCallResult::error(format!("Failed to load auth tokens: {e}")),
     };
 
-    // Package the skill
+    // Archive the source tree for the compile endpoint (registry validates).
     let utf8_path = camino::Utf8Path::new(path);
-    let (archive_path, _sha) = match package_skill(utf8_path) {
-        Ok(r) => r,
-        Err(e) => return ToolCallResult::error(format!("Failed to package skill: {e}")),
+    let source_bytes = match tar_gz_skill_source(utf8_path) {
+        Ok(b) => b,
+        Err(e) => return ToolCallResult::error(format!("Failed to archive skill source: {e}")),
     };
 
-    // Publish to registry
+    // Publish via the registry compile endpoint.
     let registry = RegistryClient::new(url).with_auth(&tokens.access_token);
-    let result = match registry.publish_skill(&archive_path) {
+    let result = match registry.compile_and_publish(source_bytes) {
         Ok(resp) => {
-            // Clean up archive
-            let _ = fs::remove_file(&archive_path);
-
-            let skill_id = resp
-                .get("skill_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
+            let name = &resp.frontmatter.name;
             let version = resp
-                .get("version")
-                .and_then(|v| v.as_str())
+                .frontmatter
+                .vh_version
+                .as_deref()
                 .unwrap_or("unknown");
-            format!("Published {skill_id}@{version} to registry successfully.")
+            let mut msg = format!("Published '{name}' v{version} to registry successfully.");
+            for w in &resp.warnings {
+                msg.push_str(&format!("\nWarning: {w}"));
+            }
+            msg
         }
         Err(e) => {
-            let _ = fs::remove_file(&archive_path);
-            let err_msg = e.to_string();
-
-            // Detect "version already exists" and suggest bumping
-            if err_msg.contains("already exists") && err_msg.contains("ersion") {
-                return ToolCallResult::error(format!(
-                    "{err_msg}\n\nTo publish a new version, bump the version in manifest.json \
-                     (e.g., 0.1.0 → 0.2.0) and run skillclub_publish again."
-                ));
-            }
-
             return ToolCallResult::error(format!("Failed to publish: {e}"));
         }
     };

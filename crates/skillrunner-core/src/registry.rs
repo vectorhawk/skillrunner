@@ -69,6 +69,36 @@ pub struct SkillStatusResponse {
     pub unknown: Vec<String>,
 }
 
+/// Frontmatter summary returned by `POST /portal/skills/compile`.
+#[derive(Debug, Deserialize)]
+pub struct CompileFrontmatterSummary {
+    pub name: String,
+    pub description: String,
+    pub license: String,
+    pub vh_version: Option<String>,
+    pub vh_publisher: Option<String>,
+}
+
+/// A single field-level error from a 422 compile response.
+#[derive(Debug, Deserialize)]
+pub struct CompileErrorDetail {
+    pub path: String,
+    pub message: String,
+}
+
+/// Success response from `POST /portal/skills/compile?publish=true`.
+#[derive(Debug, Deserialize)]
+pub struct CompilePublishResponse {
+    pub content_hash: String,
+    pub size_bytes: u64,
+    pub frontmatter: CompileFrontmatterSummary,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    pub compiled_artifact_key: String,
+    pub source_artifact_key: String,
+    pub download_url: String,
+}
+
 /// Skill detail returned by `GET /portal/skills/{skill_id}`.
 #[derive(Debug, Deserialize)]
 pub struct SkillDetail {
@@ -368,74 +398,69 @@ impl RegistryClient {
             .context("failed to deserialize skill status response")
     }
 
-    /// Upload a `.cskill` archive to the registry.
+    /// Upload a SKILL.md tree to the registry compile endpoint and publish it.
+    ///
+    /// Posts a gzipped tar of `source_tar_gz_bytes` to
+    /// `POST /portal/skills/compile` with `publish=true`. The registry
+    /// validates, policy-injects, packages, scans, and registers the skill.
+    ///
+    /// On success returns the compile response. On 422 (validation or scan
+    /// rejection) the error message includes the structured errors list so
+    /// the publisher sees exactly what was rejected.
     ///
     /// Requires auth token to be set via [`with_auth`].
-    pub fn publish_skill(&self, archive_path: &Utf8Path) -> Result<serde_json::Value> {
+    pub fn compile_and_publish(
+        &self,
+        source_tar_gz_bytes: Vec<u8>,
+    ) -> Result<CompilePublishResponse> {
         let token = self.auth_token.as_ref().ok_or_else(|| {
             anyhow::anyhow!("not authenticated; run `skillrunner auth login` first")
         })?;
 
         let base = self.base_url.trim_end_matches('/');
-        let url = format!("{base}/portal/skills");
-        debug!(url, archive = %archive_path, "uploading skill");
+        let url = format!("{base}/portal/skills/compile");
+        debug!(url, size_bytes = source_tar_gz_bytes.len(), "uploading SKILL.md tree to compile endpoint");
 
-        let file_bytes = std::fs::read(archive_path)
-            .with_context(|| format!("failed to read archive {archive_path}"))?;
+        let file_part = reqwest::blocking::multipart::Part::bytes(source_tar_gz_bytes)
+            .file_name("skill-source.tar.gz")
+            .mime_str("application/gzip")
+            .context("invalid MIME type for source upload")?;
 
-        let file_name = archive_path
-            .file_name()
-            .unwrap_or("bundle.cskill")
-            .to_string();
+        let form = reqwest::blocking::multipart::Form::new()
+            .part("file", file_part)
+            .text("publish", "true");
 
         let resp = self
             .http
             .post(&url)
             .bearer_auth(token)
-            .multipart(Self::make_upload_form(
-                file_bytes.clone(),
-                file_name.clone(),
-            )?)
+            .multipart(form)
             .send()
             .with_context(|| format!("failed to reach registry at {url}"))?;
 
-        // If skill already exists (409), retry as a new version upload
-        if resp.status() == reqwest::StatusCode::CONFLICT {
-            let skill_id = Self::extract_skill_id_from_filename(&file_name).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "skill already exists but could not extract skill_id from archive filename"
-                )
-            })?;
-            debug!(skill_id, "skill exists, uploading as new version");
+        let status = resp.status();
 
-            let version_url = format!("{base}/portal/skills/{skill_id}/versions");
-            let resp2 = self
-                .http
-                .post(&version_url)
-                .bearer_auth(token)
-                .multipart(Self::make_upload_form(file_bytes, file_name)?)
-                .send()
-                .with_context(|| format!("failed to reach registry at {version_url}"))?;
-
-            if !resp2.status().is_success() {
-                let status = resp2.status();
-                let body = resp2.text().unwrap_or_default();
-                anyhow::bail!("publish version failed (HTTP {status}): {body}");
-            }
-
-            return resp2
-                .json()
-                .context("failed to deserialize publish response");
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            // 422: frontmatter/policy rejection or scan gate reject.
+            // Surface the structured errors list to the caller.
+            let body = resp.text().unwrap_or_default();
+            let errors_msg = parse_compile_errors(&body);
+            anyhow::bail!("publish rejected (422): {errors_msg}");
         }
 
-        if !resp.status().is_success() {
-            let status = resp.status();
+        if status == reqwest::StatusCode::ACCEPTED {
+            // 202: queued for admin review (scan gate queue-for-review).
+            // Parse as CompilePublishResponse — the payload shape is the same.
+            return resp.json().context("failed to deserialize 202 compile response");
+        }
+
+        if !status.is_success() {
             let body = resp.text().unwrap_or_default();
-            anyhow::bail!("publish failed (HTTP {status}): {body}");
+            anyhow::bail!("compile/publish failed (HTTP {status}): {body}");
         }
 
         resp.json()
-            .context("failed to deserialize publish response")
+            .context("failed to deserialize compile publish response")
     }
 
     fn make_upload_form(
@@ -449,31 +474,6 @@ impl RegistryClient {
                 .mime_str("application/octet-stream")
                 .context("invalid MIME type")?,
         ))
-    }
-
-    /// Extract skill_id from archive filename like "contract-compare-0.2.0.cskill"
-    fn extract_skill_id_from_filename(filename: &str) -> Option<String> {
-        let stem = filename.strip_suffix(".cskill")?;
-        // Find the last occurrence of "-<semver>" pattern
-        // e.g. "contract-compare-0.2.0" -> "contract-compare"
-        let last_dash = stem.rfind('-')?;
-        // Check if what follows the dash looks like a version number
-        let after = &stem[last_dash + 1..];
-        if after.chars().next().is_none_or(|c| !c.is_ascii_digit()) {
-            return None;
-        }
-        // Walk back past the minor version dash: "compare-0.2.0" -> need to find "compare-0"
-        // Actually the version is "0.2.0" so we just need the last segment starting with a digit
-        // But skill IDs can have dashes, so find where version starts
-        // Version format: X.Y.Z — find the rightmost "-" followed by digit.digit
-        // We already have last_dash pointing at "-0.2.0", which is correct
-        // But we need to handle "my-skill-1.0.0" vs "my-1-skill-1.0.0"
-        // Simple approach: check if after_dash contains dots (version-like)
-        if after.contains('.') {
-            Some(stem[..last_dash].to_string())
-        } else {
-            None
-        }
     }
 
     /// Search the registry for plugins matching `query`.
@@ -781,6 +781,43 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after Unix epoch")
         .as_secs()
+}
+
+/// Parse a 422 compile response body into a human-readable error string.
+///
+/// The registry returns `{ "detail": { "message": "...", "errors": [...] } }`.
+/// Each error has `path` and `message` fields. Falls back to the raw body if
+/// the JSON cannot be parsed.
+fn parse_compile_errors(body: &str) -> String {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.to_string();
+    };
+
+    let detail = &val["detail"];
+    let top_msg = detail["message"]
+        .as_str()
+        .unwrap_or("validation failed");
+
+    let errors = detail["errors"].as_array();
+    let Some(errors) = errors else {
+        // No structured errors list — surface the raw detail string.
+        return detail
+            .as_str()
+            .unwrap_or(body)
+            .to_string();
+    };
+
+    if errors.is_empty() {
+        return top_msg.to_string();
+    }
+
+    let mut lines = vec![top_msg.to_string()];
+    for e in errors {
+        let path = e["path"].as_str().unwrap_or("<root>");
+        let msg = e["message"].as_str().unwrap_or("unknown error");
+        lines.push(format!("  {path}: {msg}"));
+    }
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -1210,5 +1247,152 @@ mod tests {
         assert!(err.to_string().contains("failed to fetch policy"));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── RegistryClient: compile_and_publish ────────────────────────────────
+
+    /// Build a minimal valid tar.gz in memory for test payloads.
+    fn minimal_skill_tar_gz() -> Vec<u8> {
+        use flate2::{write::GzEncoder, Compression};
+
+        let mut out = Vec::new();
+        let enc = GzEncoder::new(&mut out, Compression::default());
+        let mut tar = tar::Builder::new(enc);
+
+        let skill_md = b"---\nname: test-skill\ndescription: A test.\nlicense: MIT\n---\n\nHello.\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(skill_md.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "SKILL.md", skill_md.as_slice())
+            .unwrap();
+
+        let gz = tar.into_inner().unwrap();
+        gz.finish().unwrap();
+        out
+    }
+
+    fn compile_success_body() -> &'static str {
+        r#"{
+            "content_hash": "sha256:abc123",
+            "size_bytes": 1024,
+            "frontmatter": {
+                "name": "test-skill",
+                "description": "A test.",
+                "license": "MIT",
+                "vh_version": "0.1.0",
+                "vh_publisher": "acme"
+            },
+            "warnings": [],
+            "compiled_artifact_key": "compile/test-skill.cskill",
+            "source_artifact_key": "source/test-skill.tar.gz",
+            "download_url": "https://cdn.example.com/test-skill.cskill"
+        }"#
+    }
+
+    #[test]
+    fn compile_and_publish_posts_to_correct_endpoint_and_parses_response() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/portal/skills/compile")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(compile_success_body())
+            .create();
+
+        let client = RegistryClient::new(server.url()).with_auth("tok");
+        let resp = client
+            .compile_and_publish(minimal_skill_tar_gz())
+            .unwrap();
+
+        assert_eq!(resp.content_hash, "sha256:abc123");
+        assert_eq!(resp.frontmatter.name, "test-skill");
+        assert_eq!(resp.frontmatter.vh_version.as_deref(), Some("0.1.0"));
+        assert_eq!(resp.frontmatter.vh_publisher.as_deref(), Some("acme"));
+        assert!(resp.warnings.is_empty());
+        mock.assert();
+    }
+
+    #[test]
+    fn compile_and_publish_returns_error_on_missing_auth() {
+        let server = Server::new();
+        // No mock needed — the client should bail before making a request.
+        let client = RegistryClient::new(server.url()); // no .with_auth(...)
+        let err = client
+            .compile_and_publish(minimal_skill_tar_gz())
+            .unwrap_err();
+        assert!(err.to_string().contains("not authenticated"));
+    }
+
+    #[test]
+    fn compile_and_publish_surfaces_422_errors_list() {
+        let body_422 = r#"{
+            "detail": {
+                "message": "frontmatter validation failed",
+                "errors": [
+                    {"path": "name", "message": "must not be empty"},
+                    {"path": "vh_version", "message": "invalid semver"}
+                ]
+            }
+        }"#;
+
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/portal/skills/compile")
+            .with_status(422)
+            .with_header("content-type", "application/json")
+            .with_body(body_422)
+            .create();
+
+        let client = RegistryClient::new(server.url()).with_auth("tok");
+        let err = client
+            .compile_and_publish(minimal_skill_tar_gz())
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("422"), "error should mention 422: {msg}");
+        assert!(msg.contains("frontmatter validation failed"), "{msg}");
+        assert!(msg.contains("name: must not be empty"), "{msg}");
+        assert!(msg.contains("vh_version: invalid semver"), "{msg}");
+        mock.assert();
+    }
+
+    #[test]
+    fn compile_and_publish_returns_error_on_bad_tar_400() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/portal/skills/compile")
+            .with_status(400)
+            .with_body("Malformed tarball or missing SKILL.md")
+            .create();
+
+        let client = RegistryClient::new(server.url()).with_auth("tok");
+        let err = client
+            .compile_and_publish(minimal_skill_tar_gz())
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("400"), "{msg}");
+        mock.assert();
+    }
+
+    #[test]
+    fn compile_and_publish_handles_202_queued_for_review() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/portal/skills/compile")
+            .with_status(202)
+            .with_header("content-type", "application/json")
+            .with_body(compile_success_body())
+            .create();
+
+        let client = RegistryClient::new(server.url()).with_auth("tok");
+        // 202 should succeed and parse the response body normally.
+        let resp = client
+            .compile_and_publish(minimal_skill_tar_gz())
+            .unwrap();
+
+        assert_eq!(resp.frontmatter.name, "test-skill");
+        mock.assert();
     }
 }

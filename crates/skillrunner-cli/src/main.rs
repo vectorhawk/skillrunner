@@ -14,7 +14,9 @@ use skillrunner_core::{
     policy::MockPolicyClient,
     registry::{HttpPolicyClient, RegistryClient},
     resolver::{resolve_skill, ResolveOutcome},
-    updater::{check_skill_updates, install_from_registry, package_plugin, package_skill},
+    updater::{
+        check_skill_updates, install_from_registry, package_plugin, tar_gz_skill_source,
+    },
     validator::validate_bundle,
 };
 use skillrunner_manifest::SkillPackage;
@@ -816,47 +818,50 @@ fn main() -> Result<()> {
                     )
                 })?;
 
-                let (archive_path, _sha) = package_skill(&path)?;
-                println!("Packaged {}", archive_path);
+                // Package the source tree for the compile endpoint (no local
+                // validation — the registry does all validation server-side).
+                let source_bytes = tar_gz_skill_source(&path)
+                    .with_context(|| format!("failed to archive skill source at {path}"))?;
+                println!(
+                    "Archived {} ({} bytes) — uploading to registry compile endpoint",
+                    path,
+                    source_bytes.len()
+                );
 
-                let registry = RegistryClient::new(&url).with_auth(&tokens.access_token);
-                match registry.publish_skill(&archive_path) {
-                    Ok(resp) => {
-                        println!("Published successfully!");
-                        if let Some(id) = resp.get("skill_id").and_then(|v| v.as_str()) {
-                            println!("  skill_id: {id}");
-                        }
-                        if let Some(ver) = resp.get("version").and_then(|v| v.as_str()) {
-                            println!("  version:  {ver}");
-                        }
-                    }
+                let do_publish = |token: &str| -> Result<_> {
+                    let registry = RegistryClient::new(&url).with_auth(token);
+                    registry.compile_and_publish(source_bytes.clone())
+                };
+
+                let resp = match do_publish(&tokens.access_token) {
+                    Ok(r) => r,
                     Err(e) => {
-                        // Try token refresh before giving up
+                        // Try token refresh once before surfacing the error.
                         let auth_client = AuthClient::new(&url);
-                        if let Ok(new_tokens) = auth_client.refresh(&tokens.refresh_token) {
-                            auth::save_tokens(
-                                &app.state,
-                                &url,
-                                &new_tokens.access_token,
-                                &new_tokens.refresh_token,
-                            )?;
-                            let registry =
-                                RegistryClient::new(&url).with_auth(&new_tokens.access_token);
-                            let resp = registry.publish_skill(&archive_path)?;
-                            println!("Published successfully!");
-                            if let Some(id) = resp.get("skill_id").and_then(|v| v.as_str()) {
-                                println!("  skill_id: {id}");
+                        match auth_client.refresh(&tokens.refresh_token) {
+                            Ok(new_tokens) => {
+                                auth::save_tokens(
+                                    &app.state,
+                                    &url,
+                                    &new_tokens.access_token,
+                                    &new_tokens.refresh_token,
+                                )?;
+                                do_publish(&new_tokens.access_token)?
                             }
-                            if let Some(ver) = resp.get("version").and_then(|v| v.as_str()) {
-                                println!("  version:  {ver}");
-                            }
-                        } else {
-                            return Err(e);
+                            Err(_) => return Err(e),
                         }
                     }
-                }
+                };
 
-                let _ = std::fs::remove_file(&archive_path);
+                println!("Published successfully!");
+                println!("  name:    {}", resp.frontmatter.name);
+                if let Some(ver) = &resp.frontmatter.vh_version {
+                    println!("  version: {ver}");
+                }
+                println!("  hash:    {}", resp.content_hash);
+                for w in &resp.warnings {
+                    println!("  warning: {w}");
+                }
             }
             SkillCommands::List => {
                 let conn = Connection::open(&app.state.db_path)?;

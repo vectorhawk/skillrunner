@@ -84,6 +84,29 @@ pub fn install_from_registry(
     Ok(version)
 }
 
+/// Archive a skill source directory into an in-memory gzipped tar.
+///
+/// Unlike [`package_skill`] this does **not** validate the bundle — the
+/// registry compile endpoint does all validation server-side. This is the
+/// upload payload for `POST /portal/skills/compile`.
+pub fn tar_gz_skill_source(skill_dir: &Utf8Path) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    {
+        let enc = GzEncoder::new(&mut out, Compression::default());
+        let mut tar = tar::Builder::new(enc);
+        tar.append_dir_all(".", skill_dir.as_std_path())
+            .with_context(|| format!("failed to archive {skill_dir}"))?;
+        let gz = tar.into_inner().context("failed to finalize tar")?;
+        gz.finish().context("failed to finalize gzip stream")?;
+    }
+    info!(
+        path = %skill_dir,
+        size_bytes = out.len(),
+        "archived SKILL.md source tree"
+    );
+    Ok(out)
+}
+
 /// Package a skill directory into a `.cskill` tar.gz archive.
 ///
 /// Validates the bundle first, then creates the archive in a temp directory.
