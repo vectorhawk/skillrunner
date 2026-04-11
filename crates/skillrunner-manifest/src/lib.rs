@@ -21,9 +21,9 @@ pub enum ManifestError {
 
 // ── Clipboard access enum ────────────────────────────────────────────────────
 
-/// Clipboard capability scope. New canonical form; legacy `bool` is
-/// accepted during migration (true → Full, false → None). Sunset in AUTH1f.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+/// Clipboard capability scope. Canonical string-enum form only.
+/// Valid values: `"none"`, `"read"`, `"write"`, `"full"`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ClipboardAccess {
     None,
@@ -32,59 +32,10 @@ pub enum ClipboardAccess {
     Full,
 }
 
-impl<'de> Deserialize<'de> for ClipboardAccess {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct ClipboardVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for ClipboardVisitor {
-            type Value = ClipboardAccess;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("\"none\", \"read\", \"write\", \"full\", or a boolean")
-            }
-
-            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                // Legacy form: true → Full, false → None
-                if v {
-                    Ok(ClipboardAccess::Full)
-                } else {
-                    Ok(ClipboardAccess::None)
-                }
-            }
-
-            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                match v {
-                    "none" => Ok(ClipboardAccess::None),
-                    "read" => Ok(ClipboardAccess::Read),
-                    "write" => Ok(ClipboardAccess::Write),
-                    "full" => Ok(ClipboardAccess::Full),
-                    other => Err(E::unknown_variant(
-                        other,
-                        &["none", "read", "write", "full"],
-                    )),
-                }
-            }
-        }
-
-        deserializer.deserialize_any(ClipboardVisitor)
-    }
-}
-
 // ── Filesystem access enum ───────────────────────────────────────────────────
 
-/// Filesystem capability scope (3-bucket simplification per AUTH1b decisions).
-/// Legacy underscore variants (`read_only`, `read_only_scoped`, `read_write`)
-/// and the new hyphen form (`read-only`) are all accepted. Sunset in AUTH1f.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+/// Filesystem capability scope. Canonical values only: `"none"`, `"read-only"`, `"full"`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FilesystemAccess {
     #[serde(rename = "none")]
     None,
@@ -92,24 +43,6 @@ pub enum FilesystemAccess {
     ReadOnly,
     #[serde(rename = "full")]
     Full,
-}
-
-impl<'de> Deserialize<'de> for FilesystemAccess {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        match s.as_str() {
-            "none" => Ok(FilesystemAccess::None),
-            "read-only" | "read_only" | "read_only_scoped" => Ok(FilesystemAccess::ReadOnly),
-            "full" | "read_write" => Ok(FilesystemAccess::Full),
-            other => Err(serde::de::Error::unknown_variant(
-                other,
-                &["none", "read-only", "full"],
-            )),
-        }
-    }
 }
 
 // ── Sandbox profile enum ─────────────────────────────────────────────────────
@@ -173,61 +106,13 @@ pub struct Permissions {
     pub clipboard: ClipboardAccess,
 }
 
-/// Public execution constraint struct. `timeout_ms` is the canonical field.
-/// During deserialization, the legacy `timeout_seconds` key is accepted and
-/// converted (×1000). Serialization always emits `timeout_ms`. Sunset legacy
-/// key in AUTH1f.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+/// Execution constraints for a skill. Canonical fields only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Execution {
     pub sandbox: SandboxProfile,
     pub timeout_ms: u64,
     pub memory_mb: u64,
-}
-
-impl<'de> Deserialize<'de> for Execution {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        // Intermediate struct that captures both the new and legacy timeout keys.
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct ExecutionRaw {
-            /// New canonical key (milliseconds).
-            timeout_ms: Option<u64>,
-            /// Legacy key (seconds). Accepted during migration, sunset in AUTH1f.
-            timeout_seconds: Option<u64>,
-            memory_mb: u64,
-            /// New canonical field (enum). Accepted as string.
-            sandbox: Option<SandboxProfile>,
-            /// Legacy field name used in old manifest.json files.
-            sandbox_profile: Option<SandboxProfile>,
-        }
-
-        let raw = ExecutionRaw::deserialize(deserializer)?;
-
-        let sandbox = match (raw.sandbox, raw.sandbox_profile) {
-            (Some(s), _) => s,
-            (None, Some(s)) => s,
-            (None, None) => {
-                return Err(serde::de::Error::missing_field("sandbox"));
-            }
-        };
-
-        let timeout_ms = match (raw.timeout_ms, raw.timeout_seconds) {
-            (Some(ms), _) => ms,
-            (None, Some(secs)) => secs * 1000,
-            (None, None) => {
-                return Err(serde::de::Error::missing_field("timeout_ms"));
-            }
-        };
-
-        Ok(Execution {
-            sandbox,
-            timeout_ms,
-            memory_mb: raw.memory_mb,
-        })
-    }
 }
 
 /// Fallback behavior when no recommended model is available locally.
@@ -239,13 +124,8 @@ pub enum ModelFallback {
 }
 
 /// Model requirements and recommendations for this skill.
-///
-/// AUTH1 canonical fields: `min_params_b`, `recommended`, `fallback`.
-/// Legacy fields (sunset in AUTH1f) kept with `#[serde(default)]` so old
-/// bundles that use them continue to load without error.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ModelRequirements {
-    // ── AUTH1 canonical fields ───────────────────────────────────────────────
     /// Minimum model size in billions of parameters (e.g. 7.0 for a 7B model).
     pub min_params_b: Option<f64>,
     /// Ordered list of recommended model identifiers.
@@ -253,20 +133,6 @@ pub struct ModelRequirements {
     pub recommended: Vec<String>,
     /// Behavior when no recommended model is available locally.
     pub fallback: Option<ModelFallback>,
-
-    // ── Legacy fields — sunset in AUTH1f ─────────────────────────────────────
-    /// TODO(AUTH1f): remove. Use `min_params_b` instead.
-    #[serde(default)]
-    pub min_context_tokens: Option<u64>,
-    /// TODO(AUTH1f): remove.
-    #[serde(default)]
-    pub supports_structured_output: Option<bool>,
-    /// TODO(AUTH1f): remove.
-    #[serde(default)]
-    pub supports_tool_calling: Option<bool>,
-    /// TODO(AUTH1f): remove. Use `recommended` + `fallback` instead.
-    #[serde(default)]
-    pub preferred_execution: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -670,30 +536,21 @@ mod tests {
         fs::create_dir_all(root.join("prompts")).expect("prompts dir should be created");
 
         fs::write(
-            root.join("manifest.json"),
-            r#"{
-  "schema_version": "1.0",
-  "id": "contract-compare",
-  "name": "Contract Compare",
-  "version": "0.1.0",
-  "publisher": "forge",
-  "description": "Compare two contracts and summarize changes.",
-  "entrypoint": "workflow.yaml",
-  "inputs_schema": "schemas/input.schema.json",
-  "outputs_schema": "schemas/output.schema.json",
-  "permissions": {
-    "filesystem": "read_only_scoped",
-    "network": "none",
-    "clipboard": false
-  },
-  "execution": {
-    "sandbox_profile": "strict",
-    "timeout_seconds": 90,
-    "memory_mb": 1024
-  }
-}"#,
+            root.join("SKILL.md"),
+            "---\nname: Contract Compare\ndescription: Compare two contracts and summarize changes.\nlicense: MIT\nvh_version: 0.1.0\nvh_publisher: forge\nvh_permissions:\n  filesystem: read-only\n  network: none\n  clipboard: none\nvh_execution:\n  sandbox: strict\n  timeout_ms: 90000\n  memory_mb: 1024\nvh_workflow_ref: ./workflow.yaml\nvh_schemas:\n  inputs:\n    type: object\n  outputs:\n    type: object\n---\n\nCompare the contracts.\n",
         )
-        .expect("manifest should be written");
+        .expect("SKILL.md should be written");
+        fs::write(
+            root.join("workflow.yaml"),
+            "name: contract_compare\nsteps:\n  - id: compare\n    type: llm\n    prompt: prompts/compare.txt\n    inputs:\n      text_a: input.doc_a\n      text_b: input.doc_b\n    output_schema: schemas/output.schema.json\n",
+        )
+        .expect("workflow.yaml should be written");
+        fs::write(root.join("schemas/input.schema.json"), "{}")
+            .expect("input schema should be written");
+        fs::write(root.join("schemas/output.schema.json"), "{}")
+            .expect("output schema should be written");
+        fs::write(root.join("prompts/compare.txt"), "Compare the contracts.")
+            .expect("prompt should be written");
         fs::write(
             root.join("workflow.yaml"),
             r#"name: contract_compare
@@ -734,16 +591,22 @@ steps:
     }
 
     #[test]
-    fn load_from_dir_rejects_missing_required_manifest_files() {
-        let root = temp_root("manifest-missing-file");
+    fn load_from_dir_rejects_missing_workflow_ref_file() {
+        // SKILL.md references workflow.yaml via vh_workflow_ref — if that file
+        // is absent, load_from_dir must return MissingFile.
+        let root = temp_root("manifest-missing-workflow");
         write_example_skill(&root);
-        fs::remove_file(root.join("schemas/output.schema.json"))
-            .expect("output schema should be removable for the test");
+        fs::remove_file(root.join("workflow.yaml"))
+            .expect("workflow file should be removable for the test");
 
-        let error = SkillPackage::load_from_dir(&root).expect_err("missing schema should fail");
+        let error =
+            SkillPackage::load_from_dir(&root).expect_err("missing workflow_ref should fail");
 
         match error {
-            ManifestError::MissingFile(path) => assert_eq!(path, "schemas/output.schema.json"),
+            ManifestError::MissingFile(path) => assert!(
+                path.contains("workflow.yaml"),
+                "expected workflow.yaml in error, got: {path}"
+            ),
             other => panic!("expected missing file error, got {other:?}"),
         }
 
@@ -751,35 +614,18 @@ steps:
     }
 
     #[test]
-    fn load_from_dir_rejects_empty_id() {
-        let root = temp_root("manifest-empty-id");
-        write_example_skill(&root);
+    fn load_from_dir_rejects_empty_name() {
+        // In the SKILL.md world the id is derived from name — an empty name
+        // must be rejected as an invalid frontmatter field.
+        let root = temp_root("manifest-empty-name");
+        fs::create_dir_all(&root).expect("root should be created");
         fs::write(
-            root.join("manifest.json"),
-            r#"{
-  "schema_version": "1.0",
-  "id": "   ",
-  "name": "Contract Compare",
-  "version": "0.1.0",
-  "publisher": "forge",
-  "entrypoint": "workflow.yaml",
-  "inputs_schema": "schemas/input.schema.json",
-  "outputs_schema": "schemas/output.schema.json",
-  "permissions": {
-    "filesystem": "read_only_scoped",
-    "network": "none",
-    "clipboard": false
-  },
-  "execution": {
-    "sandbox_profile": "strict",
-    "timeout_seconds": 90,
-    "memory_mb": 1024
-  }
-}"#,
+            root.join("SKILL.md"),
+            "---\nname:   \ndescription: Test.\nlicense: MIT\n---\n\nPrompt.\n",
         )
-        .expect("manifest should be rewritten");
+        .expect("SKILL.md should be written");
 
-        let error = SkillPackage::load_from_dir(&root).expect_err("blank id should fail");
+        let error = SkillPackage::load_from_dir(&root).expect_err("blank name should fail");
 
         match error {
             ManifestError::Invalid(message) => {
@@ -806,48 +652,6 @@ steps:
                 assert_eq!(path, "prompts/compare.txt")
             }
             other => panic!("expected missing file error, got {other:?}"),
-        }
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn load_from_dir_rejects_unsupported_schema_version() {
-        let root = temp_root("manifest-schema-version");
-        write_example_skill(&root);
-        fs::write(
-            root.join("manifest.json"),
-            r#"{
-  "schema_version": "2.0",
-  "id": "contract-compare",
-  "name": "Contract Compare",
-  "version": "0.1.0",
-  "publisher": "forge",
-  "entrypoint": "workflow.yaml",
-  "inputs_schema": "schemas/input.schema.json",
-  "outputs_schema": "schemas/output.schema.json",
-  "permissions": {
-    "filesystem": "read_only_scoped",
-    "network": "none",
-    "clipboard": false
-  },
-  "execution": {
-    "sandbox_profile": "strict",
-    "timeout_seconds": 90,
-    "memory_mb": 1024
-  }
-}"#,
-        )
-        .expect("manifest should be rewritten");
-
-        let error =
-            SkillPackage::load_from_dir(&root).expect_err("unsupported schema version should fail");
-
-        match error {
-            ManifestError::Invalid(message) => {
-                assert!(message.contains("unsupported schema_version 2.0"))
-            }
-            other => panic!("expected invalid manifest error, got {other:?}"),
         }
 
         let _ = fs::remove_dir_all(root);
@@ -1265,27 +1069,4 @@ You are an expert text analyst.
         assert!(pkg.workflow.steps.len() > 1, "complex skill has multiple steps");
     }
 
-    #[test]
-    fn legacy_bundle_still_loads_after_auth1b() {
-        // Verify backwards compat: the existing contract-compare legacy bundle
-        // still loads with the new enum types and custom deserializers.
-        let root = temp_root("legacy-compat");
-        write_example_skill(&root);
-
-        let pkg = SkillPackage::load_from_dir(&root).expect("legacy bundle should load");
-
-        // filesystem: "read_only_scoped" → ReadOnly
-        assert_eq!(pkg.manifest.permissions.filesystem, FilesystemAccess::ReadOnly);
-        // clipboard: false → None
-        assert_eq!(pkg.manifest.permissions.clipboard, ClipboardAccess::None);
-        // sandbox_profile: "strict" → Strict
-        assert_eq!(pkg.manifest.execution.sandbox, SandboxProfile::Strict);
-        // timeout_seconds: 90 → timeout_ms: 90000
-        assert_eq!(pkg.manifest.execution.timeout_ms, 90_000);
-        // schemas loaded as in-memory values
-        assert!(pkg.manifest.inputs_schema.is_some());
-        assert!(pkg.manifest.outputs_schema.is_some());
-
-        let _ = fs::remove_dir_all(root);
-    }
 }
