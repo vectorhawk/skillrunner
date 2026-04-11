@@ -525,15 +525,11 @@ fn skill_to_tool(skill_id: &str, active_path: &str) -> Result<ToolDefinition> {
     // Append version to description so updates are visible in the tool listing.
     let versioned_desc = format!("{} (v{})", base_desc, pkg.manifest.version);
 
-    // Enrich description with trigger phrases — auto-generate from description if empty
-    let triggers = if pkg.manifest.triggers.is_empty() {
-        skillrunner_core::import::generate_triggers_from_description(
-            pkg.manifest.description.as_deref().unwrap_or(""),
-            &pkg.manifest.name,
-        )
-    } else {
-        pkg.manifest.triggers.clone()
-    };
+    // Enrich description with trigger phrases when the author declared any.
+    // AUTH1f: the legacy auto-generate-from-description path is gone; the
+    // canonical SKILL.md frontmatter doesn't have a triggers field today, so
+    // this list is usually empty and the description falls through unmodified.
+    let triggers = pkg.manifest.triggers.clone();
 
     let description = if triggers.is_empty() {
         versioned_desc
@@ -2213,23 +2209,40 @@ mod tests {
     }
 
     fn write_test_skill(root: &Utf8PathBuf) {
-        fs::create_dir_all(root.join("schemas")).unwrap();
+        // AUTH1f: SKILL.md-rooted test bundle (manifest.json is no longer
+        // accepted by SkillPackage::load_from_dir). Inline schemas via
+        // vh_schemas so the loader captures them as serde_json::Value.
         fs::create_dir_all(root.join("prompts")).unwrap();
         fs::write(
-            root.join("manifest.json"),
-            r#"{
-  "schema_version": "1.0",
-  "id": "test-skill",
-  "name": "Test Skill",
-  "version": "0.1.0",
-  "publisher": "skillclub",
-  "description": "A test skill for MCP testing",
-  "entrypoint": "workflow.yaml",
-  "inputs_schema": "schemas/input.schema.json",
-  "outputs_schema": "schemas/output.schema.json",
-  "permissions": { "filesystem": "none", "network": "none", "clipboard": false },
-  "execution": { "sandbox_profile": "strict", "timeout_seconds": 30, "memory_mb": 256 }
-}"#,
+            root.join("SKILL.md"),
+            "---\n\
+             name: Test Skill\n\
+             description: A test skill for MCP testing\n\
+             license: Apache-2.0\n\
+             vh_version: 0.1.0\n\
+             vh_publisher: skillclub\n\
+             vh_permissions:\n  \
+               network: none\n  \
+               filesystem: none\n  \
+               clipboard: none\n\
+             vh_execution:\n  \
+               sandbox: strict\n  \
+               timeout_ms: 30000\n  \
+               memory_mb: 256\n\
+             vh_schemas:\n  \
+               inputs:\n    \
+                 type: object\n    \
+                 properties:\n      \
+                   query:\n        \
+                     type: string\n    \
+                 required:\n      \
+                   - query\n  \
+               outputs:\n    \
+                 type: object\n\
+             vh_workflow_ref: workflow.yaml\n\
+             ---\n\
+             \n\
+             Do the thing.\n",
         )
         .unwrap();
         fs::write(
@@ -2238,12 +2251,6 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("prompts/system.txt"), "Do the thing.").unwrap();
-        fs::write(
-            root.join("schemas/input.schema.json"),
-            r#"{"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}"#,
-        )
-        .unwrap();
-        fs::write(root.join("schemas/output.schema.json"), "{}").unwrap();
     }
 
     /// Store fake auth tokens so build_tool_list sees the user as logged in.
@@ -2308,20 +2315,16 @@ mod tests {
             "installed skill should appear as tool"
         );
         let tool = skill_tool.unwrap();
-        // Description includes auto-generated triggers from the description
+        // AUTH1f: description is the versioned manifest description; the old
+        // auto-generated trigger suffix was tied to the legacy import path
+        // and is no longer emitted when the skill's `triggers` list is empty.
         assert!(
             tool.description
                 .starts_with("A test skill for MCP testing (v0.1.0)"),
             "description should start with versioned desc, got: {}",
             tool.description
         );
-        assert!(
-            tool.description
-                .contains("Use this tool when the user asks to:"),
-            "description should contain auto-generated trigger phrases, got: {}",
-            tool.description
-        );
-        // The input schema should match the skill's input.schema.json
+        // The input schema should match the vh_schemas.inputs block.
         assert_eq!(tool.input_schema["type"], "object");
         assert!(tool.input_schema["properties"]["query"].is_object());
 
@@ -2487,9 +2490,9 @@ mod tests {
         let text = &result.content[0].text;
         assert!(text.contains("my-test-skill"), "got: {text}");
 
-        // Verify bundle files were created
+        // Verify bundle files were created (AUTH1f: SKILL.md, not manifest.json)
         let skill_dir = out_dir.join("my-test-skill");
-        assert!(skill_dir.join("manifest.json").exists());
+        assert!(skill_dir.join("SKILL.md").exists());
         assert!(skill_dir.join("workflow.yaml").exists());
         assert!(skill_dir.join("prompts/system.txt").exists());
         assert!(skill_dir.join("schemas/input.schema.json").exists());

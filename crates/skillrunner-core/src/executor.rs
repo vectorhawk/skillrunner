@@ -547,33 +547,24 @@ mod tests {
         .unwrap()
     }
 
-    fn write_skill_bundle(root: &Utf8PathBuf, input_schema: &str) {
-        fs::create_dir_all(root.join("schemas")).unwrap();
+    fn write_skill_bundle(root: &Utf8PathBuf, input_schema_json: &str) {
         fs::create_dir_all(root.join("prompts")).unwrap();
-        fs::write(
-            root.join("manifest.json"),
-            r#"{
-  "schema_version": "1.0",
-  "id": "test-skill",
-  "name": "Test Skill",
-  "version": "0.1.0",
-  "publisher": "skillclub",
-  "entrypoint": "workflow.yaml",
-  "inputs_schema": "schemas/input.schema.json",
-  "outputs_schema": "schemas/output.schema.json",
-  "permissions": { "filesystem": "none", "network": "none", "clipboard": false },
-  "execution": { "sandbox_profile": "strict", "timeout_seconds": 30, "memory_mb": 256 }
-}"#,
-        )
-        .unwrap();
+        // Embed the input schema inline in the SKILL.md frontmatter as a JSON
+        // string that serde_yaml will parse. For the simple cases the tests use
+        // this is always a valid JSON object literal.
+        let input_schema_yaml = format!(
+            "  inputs: {input_schema_json}\n  outputs: {{\"type\": \"object\"}}"
+        );
+        let skill_md = format!(
+            "---\nname: Test Skill\ndescription: A test skill.\nlicense: MIT\nvh_version: 0.1.0\nvh_publisher: skillclub\nvh_permissions:\n  filesystem: none\n  network: none\n  clipboard: none\nvh_execution:\n  sandbox: strict\n  timeout_ms: 30000\n  memory_mb: 256\nvh_schemas:\n{input_schema_yaml}\nvh_workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n"
+        );
+        fs::write(root.join("SKILL.md"), skill_md).unwrap();
         fs::write(
             root.join("workflow.yaml"),
             "name: test_skill\nsteps:\n  - id: run\n    type: llm\n    prompt: prompts/system.txt\n    inputs: {}\n",
         )
         .unwrap();
         fs::write(root.join("prompts/system.txt"), "Do the thing.").unwrap();
-        fs::write(root.join("schemas/input.schema.json"), input_schema).unwrap();
-        fs::write(root.join("schemas/output.schema.json"), "{}").unwrap();
     }
 
     #[test]
@@ -633,22 +624,10 @@ mod tests {
         let skill_root = temp_root("tool-chain-skill");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
 
-        fs::create_dir_all(skill_root.join("schemas")).unwrap();
         fs::create_dir_all(skill_root.join("prompts")).unwrap();
         fs::write(
-            skill_root.join("manifest.json"),
-            r#"{
-  "schema_version": "1.0",
-  "id": "test-skill",
-  "name": "Test Skill",
-  "version": "0.1.0",
-  "publisher": "skillclub",
-  "entrypoint": "workflow.yaml",
-  "inputs_schema": "schemas/input.schema.json",
-  "outputs_schema": "schemas/output.schema.json",
-  "permissions": { "filesystem": "none", "network": "none", "clipboard": false },
-  "execution": { "sandbox_profile": "strict", "timeout_seconds": 30, "memory_mb": 256 }
-}"#,
+            skill_root.join("SKILL.md"),
+            "---\nname: Test Skill\ndescription: A test skill.\nlicense: MIT\nvh_execution:\n  sandbox: strict\n  timeout_ms: 30000\n  memory_mb: 256\nvh_workflow_ref: ./workflow.yaml\n---\n\nSummarise.\n",
         )
         .unwrap();
         // workflow: extract doc → stub llm that references extracted output
@@ -658,8 +637,6 @@ mod tests {
         )
         .unwrap();
         fs::write(skill_root.join("prompts/system.txt"), "Summarise.").unwrap();
-        fs::write(skill_root.join("schemas/input.schema.json"), "{}").unwrap();
-        fs::write(skill_root.join("schemas/output.schema.json"), "{}").unwrap();
 
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
         install_unpacked_skill(&state, &pkg).unwrap();
@@ -769,19 +746,8 @@ mod tests {
         fs::create_dir_all(skill_root.join("schemas")).unwrap();
         fs::create_dir_all(skill_root.join("prompts")).unwrap();
         fs::write(
-            skill_root.join("manifest.json"),
-            r#"{
-  "schema_version": "1.0",
-  "id": "test-skill",
-  "name": "Test Skill",
-  "version": "0.1.0",
-  "publisher": "skillclub",
-  "entrypoint": "workflow.yaml",
-  "inputs_schema": "schemas/input.schema.json",
-  "outputs_schema": "schemas/output.schema.json",
-  "permissions": { "filesystem": "none", "network": "none", "clipboard": false },
-  "execution": { "sandbox_profile": "strict", "timeout_seconds": 30, "memory_mb": 256 }
-}"#,
+            skill_root.join("SKILL.md"),
+            "---\nname: Test Skill\ndescription: A test skill.\nlicense: MIT\nvh_execution:\n  sandbox: strict\n  timeout_ms: 30000\n  memory_mb: 256\nvh_workflow_ref: ./workflow.yaml\n---\n\nReturn JSON.\n",
         )
         .unwrap();
         fs::write(
@@ -790,7 +756,6 @@ mod tests {
         )
         .unwrap();
         fs::write(skill_root.join("prompts/system.txt"), "Return JSON.").unwrap();
-        fs::write(skill_root.join("schemas/input.schema.json"), "{}").unwrap();
         fs::write(
             skill_root.join("schemas/output.schema.json"),
             r#"{"type":"object","required":["summary"],"properties":{"summary":{"type":"string"}}}"#,
@@ -840,22 +805,10 @@ mod tests {
         let skill_root = temp_root("multi-step-mock-skill");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
 
-        fs::create_dir_all(skill_root.join("schemas")).unwrap();
         fs::create_dir_all(skill_root.join("prompts")).unwrap();
         fs::write(
-            skill_root.join("manifest.json"),
-            r#"{
-  "schema_version": "1.0",
-  "id": "test-skill",
-  "name": "Test Skill",
-  "version": "0.1.0",
-  "publisher": "skillclub",
-  "entrypoint": "workflow.yaml",
-  "inputs_schema": "schemas/input.schema.json",
-  "outputs_schema": "schemas/output.schema.json",
-  "permissions": { "filesystem": "none", "network": "none", "clipboard": false },
-  "execution": { "sandbox_profile": "strict", "timeout_seconds": 30, "memory_mb": 256 }
-}"#,
+            skill_root.join("SKILL.md"),
+            "---\nname: Test Skill\ndescription: A test skill.\nlicense: MIT\nvh_execution:\n  sandbox: strict\n  timeout_ms: 30000\n  memory_mb: 256\nvh_workflow_ref: ./workflow.yaml\n---\n\nAnalyze the text.\n",
         )
         .unwrap();
         fs::write(
@@ -864,8 +817,6 @@ mod tests {
         )
         .unwrap();
         fs::write(skill_root.join("prompts/system.txt"), "Analyze the text.").unwrap();
-        fs::write(skill_root.join("schemas/input.schema.json"), "{}").unwrap();
-        fs::write(skill_root.join("schemas/output.schema.json"), "{}").unwrap();
 
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
         install_unpacked_skill(&state, &pkg).unwrap();

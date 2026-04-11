@@ -110,22 +110,10 @@ mod tests {
     }
 
     fn write_valid_bundle(root: &Utf8PathBuf) {
-        fs::create_dir_all(root.join("schemas")).unwrap();
         fs::create_dir_all(root.join("prompts")).unwrap();
         fs::write(
-            root.join("manifest.json"),
-            r#"{
-  "schema_version": "1.0",
-  "id": "test-skill",
-  "name": "Test Skill",
-  "version": "0.1.0",
-  "publisher": "skillclub",
-  "entrypoint": "workflow.yaml",
-  "inputs_schema": "schemas/input.schema.json",
-  "outputs_schema": "schemas/output.schema.json",
-  "permissions": { "filesystem": "none", "network": "none", "clipboard": false },
-  "execution": { "sandbox_profile": "strict", "timeout_seconds": 30, "memory_mb": 256 }
-}"#,
+            root.join("SKILL.md"),
+            "---\nname: Test Skill\ndescription: A test skill.\nlicense: MIT\nvh_version: 0.1.0\nvh_publisher: skillclub\nvh_permissions:\n  filesystem: none\n  network: none\n  clipboard: none\nvh_execution:\n  sandbox: strict\n  timeout_ms: 30000\n  memory_mb: 256\nvh_workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n",
         )
         .unwrap();
         fs::write(
@@ -134,16 +122,6 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("prompts/system.txt"), "Do the thing.").unwrap();
-        fs::write(
-            root.join("schemas/input.schema.json"),
-            r#"{"type":"object"}"#,
-        )
-        .unwrap();
-        fs::write(
-            root.join("schemas/output.schema.json"),
-            r#"{"type":"object"}"#,
-        )
-        .unwrap();
     }
 
     #[test]
@@ -166,7 +144,7 @@ mod tests {
     fn validate_fails_manifest_check_when_manifest_is_missing() {
         let dir = temp_dir("no-manifest");
         write_valid_bundle(&dir);
-        fs::remove_file(dir.join("manifest.json")).unwrap();
+        fs::remove_file(dir.join("SKILL.md")).unwrap();
 
         let report = validate_bundle(&dir);
 
@@ -182,13 +160,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_fails_manifest_check_when_schema_file_is_not_valid_json() {
-        // Schema files are parsed at manifest-load time (AUTH1b: inputs_schema is
-        // Option<serde_json::Value>). Invalid JSON in a schema file causes the
-        // "manifest and workflow" check to fail, not a separate schema check.
-        let dir = temp_dir("bad-schema");
-        write_valid_bundle(&dir);
-        fs::write(dir.join("schemas/input.schema.json"), "not json {{{").unwrap();
+    fn validate_fails_manifest_check_when_skill_md_is_missing() {
+        // Without SKILL.md, load_from_dir must fail with MissingFile.
+        let dir = temp_dir("no-skill-md");
+        fs::create_dir_all(&dir).unwrap();
 
         let report = validate_bundle(&dir);
 
@@ -205,10 +180,22 @@ mod tests {
 
     #[test]
     fn validate_reports_all_checks_even_when_some_fail() {
+        // A SKILL.md with an invalid inline output schema (type must be a string,
+        // not an integer). The manifest check passes (SKILL.md is parseable) but
+        // the output_schema JSON Schema check fails.
         let dir = temp_dir("partial-fail");
-        write_valid_bundle(&dir);
-        // Valid JSON but not valid JSON Schema syntax.
-        fs::write(dir.join("schemas/output.schema.json"), r#"{"type": 42}"#).unwrap();
+        fs::create_dir_all(dir.join("prompts")).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: Test Skill\ndescription: Test.\nlicense: MIT\nvh_execution:\n  sandbox: strict\n  timeout_ms: 30000\n  memory_mb: 256\nvh_schemas:\n  outputs:\n    type: 42\nvh_workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("workflow.yaml"),
+            "name: test_skill\nsteps:\n  - id: run\n    type: llm\n    prompt: prompts/system.txt\n    inputs: {}\n",
+        )
+        .unwrap();
+        fs::write(dir.join("prompts/system.txt"), "Do the thing.").unwrap();
 
         let report = validate_bundle(&dir);
 
@@ -219,7 +206,7 @@ mod tests {
             .find(|c| c.name == "manifest and workflow")
             .unwrap();
         assert!(manifest_check.passed);
-        // Output schema check fails.
+        // Output schema check fails because {"type": 42} is not valid JSON Schema.
         let output_check = report
             .checks
             .iter()

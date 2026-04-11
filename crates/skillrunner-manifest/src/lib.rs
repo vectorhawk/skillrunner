@@ -185,153 +185,15 @@ pub struct SkillPackage {
 }
 
 impl SkillPackage {
-    /// Load a skill from a directory. Dispatches to the SKILL.md loader if
-    /// `SKILL.md` is present at the root; otherwise falls back to the legacy
-    /// `manifest.json` bundle loader.
+    /// Load a skill from a directory containing a `SKILL.md` at its root.
+    /// Returns an error if `SKILL.md` is absent or unparseable.
     pub fn load_from_dir(root: impl AsRef<Utf8Path>) -> Result<Self, ManifestError> {
         let root = root.as_ref().to_path_buf();
-        if root.join("SKILL.md").exists() {
-            skill_md::load_from_skill_md_dir(root)
-        } else {
-            load_from_legacy_bundle_dir(root)
+        if !root.join("SKILL.md").exists() {
+            return Err(ManifestError::MissingFile("SKILL.md".to_string()));
         }
+        skill_md::load_from_skill_md_dir(root)
     }
-}
-
-/// Intermediate struct used to deserialize legacy `manifest.json` files.
-/// `inputs_schema` and `outputs_schema` are file paths (strings) that the
-/// loader resolves to JSON values. This struct is crate-private.
-#[derive(Debug, Deserialize)]
-struct LegacyManifestJson {
-    pub schema_version: String,
-    pub id: String,
-    pub name: String,
-    pub version: Version,
-    pub publisher: String,
-    pub description: Option<String>,
-    pub license: Option<String>,
-    pub entrypoint: String,
-    /// Relative path to the input schema file (e.g. "schemas/input.schema.json").
-    pub inputs_schema: Option<String>,
-    /// Relative path to the output schema file (e.g. "schemas/output.schema.json").
-    pub outputs_schema: Option<String>,
-    pub permissions: Permissions,
-    pub execution: Execution,
-    #[serde(default)]
-    pub model_requirements: Option<ModelRequirements>,
-    pub update: Option<UpdateConfig>,
-    #[serde(default)]
-    pub triggers: Vec<String>,
-    #[serde(default)]
-    pub offload_eligible: Option<bool>,
-}
-
-fn load_from_legacy_bundle_dir(root: Utf8PathBuf) -> Result<SkillPackage, ManifestError> {
-    let manifest_path = root.join("manifest.json");
-    let manifest_text = fs::read_to_string(&manifest_path)?;
-    let raw: LegacyManifestJson = serde_json::from_str(&manifest_text)?;
-
-    validate_legacy_manifest_identity(&raw)?;
-
-    // Resolve schema file paths to in-memory JSON values.
-    let inputs_schema = read_optional_schema(&root, raw.inputs_schema.as_deref())?;
-    let outputs_schema = read_optional_schema(&root, raw.outputs_schema.as_deref())?;
-
-    // Validate entrypoint file exists.
-    let entrypoint_path = root.join(&raw.entrypoint);
-    if !entrypoint_path.exists() {
-        return Err(ManifestError::MissingFile(raw.entrypoint.clone()));
-    }
-
-    let manifest = Manifest {
-        schema_version: raw.schema_version,
-        id: raw.id,
-        name: raw.name,
-        version: raw.version,
-        publisher: raw.publisher,
-        description: raw.description,
-        license: raw.license,
-        entrypoint: raw.entrypoint,
-        inputs_schema,
-        outputs_schema,
-        permissions: raw.permissions,
-        execution: raw.execution,
-        model_requirements: raw.model_requirements,
-        update: raw.update,
-        triggers: raw.triggers,
-        offload_eligible: raw.offload_eligible,
-    };
-
-    let workflow_path = root.join(&manifest.entrypoint);
-    let workflow_text = fs::read_to_string(&workflow_path)?;
-    let workflow: Workflow = serde_yaml::from_str(&workflow_text)?;
-
-    validate_workflow_refs(&root, &workflow)?;
-
-    Ok(SkillPackage {
-        root,
-        manifest,
-        workflow,
-    })
-}
-
-/// Read a schema from a relative file path. Returns `None` if `rel` is `None`.
-/// Returns an error if the file does not exist or is not valid JSON.
-fn read_optional_schema(
-    root: &Utf8Path,
-    rel: Option<&str>,
-) -> Result<Option<serde_json::Value>, ManifestError> {
-    let rel = match rel {
-        Some(r) if !r.trim().is_empty() => r,
-        _ => return Ok(None),
-    };
-    let path = root.join(rel);
-    if !path.exists() {
-        return Err(ManifestError::MissingFile(rel.to_string()));
-    }
-    let text = fs::read_to_string(&path)?;
-    let value: serde_json::Value = serde_json::from_str(&text)?;
-    Ok(Some(value))
-}
-
-fn validate_legacy_manifest_identity(raw: &LegacyManifestJson) -> Result<(), ManifestError> {
-    if raw.id.trim().is_empty() || raw.name.trim().is_empty() || raw.publisher.trim().is_empty() {
-        return Err(ManifestError::Invalid(
-            "id, name, and publisher must be non-empty".to_string(),
-        ));
-    }
-
-    if raw.schema_version != "1.0" {
-        return Err(ManifestError::Invalid(format!(
-            "unsupported schema_version {}",
-            raw.schema_version
-        )));
-    }
-
-    if raw.entrypoint.trim().is_empty() {
-        return Err(ManifestError::Invalid(
-            "entrypoint must be non-empty".to_string(),
-        ));
-    }
-
-    Ok(())
-}
-
-fn validate_workflow_refs(root: &Utf8Path, workflow: &Workflow) -> Result<(), ManifestError> {
-    for step in &workflow.steps {
-        if let WorkflowStep::Llm { prompt, .. } = step {
-            if prompt.trim().is_empty() {
-                return Err(ManifestError::Invalid(
-                    "llm step prompt path must be non-empty".to_string(),
-                ));
-            }
-            let p = root.join(prompt.as_str());
-            if !p.exists() {
-                return Err(ManifestError::MissingFile(prompt.clone()));
-            }
-        }
-    }
-    Ok(())
 }
 
 // ── Plugin Manifest ─────────────────────────────────────────────────────────
@@ -459,8 +321,8 @@ fn validate_plugin_manifest(
     for skill_ref in &manifest.skills {
         if let Some(path) = &skill_ref.path {
             let skill_dir = root.join(path);
-            if !skill_dir.join("manifest.json").exists() {
-                return Err(ManifestError::MissingFile(format!("{path}/manifest.json")));
+            if !skill_dir.join("SKILL.md").exists() {
+                return Err(ManifestError::MissingFile(format!("{path}/SKILL.md")));
             }
         }
         // registry_id refs are validated at install time, not load time
@@ -660,27 +522,14 @@ steps:
     // ── Plugin manifest tests ───────────────────────────────────────────────
 
     fn write_example_plugin(root: &Utf8Path) {
-        // Create embedded skill
+        // Create embedded skill (SKILL.md format)
         let skill_dir = root.join("skills").join("my-skill");
-        fs::create_dir_all(skill_dir.join("schemas")).unwrap();
-        fs::create_dir_all(skill_dir.join("prompts")).unwrap();
+        fs::create_dir_all(&skill_dir).unwrap();
         fs::write(
-            skill_dir.join("manifest.json"),
-            r#"{
-            "schema_version": "1.0", "id": "my-skill", "name": "My Skill",
-            "version": "0.1.0", "publisher": "test",
-            "entrypoint": "workflow.yaml",
-            "inputs_schema": "schemas/input.schema.json",
-            "outputs_schema": "schemas/output.schema.json",
-            "permissions": {"filesystem": "none", "network": "none", "clipboard": false},
-            "execution": {"sandbox_profile": "strict", "timeout_seconds": 30, "memory_mb": 512}
-        }"#,
+            skill_dir.join("SKILL.md"),
+            "---\nname: My Skill\ndescription: A test skill.\nlicense: MIT\n---\n\nDo the thing.\n",
         )
         .unwrap();
-        fs::write(skill_dir.join("workflow.yaml"), "name: test\nsteps: []").unwrap();
-        fs::write(skill_dir.join("schemas/input.schema.json"), "{}").unwrap();
-        fs::write(skill_dir.join("schemas/output.schema.json"), "{}").unwrap();
-        fs::write(skill_dir.join("prompts/system.txt"), "test prompt").unwrap();
 
         // Create command
         let cmd_dir = root.join("commands");
@@ -780,7 +629,7 @@ steps:
 
         let err =
             PluginPackage::load_from_dir(&root).expect_err("missing skill manifest should fail");
-        assert!(matches!(err, ManifestError::MissingFile(f) if f.contains("manifest.json")));
+        assert!(matches!(err, ManifestError::MissingFile(f) if f.contains("SKILL.md")));
 
         let _ = fs::remove_dir_all(root);
     }

@@ -22,8 +22,6 @@ struct SkillMdFrontmatter {
     description: Option<String>,
     publisher: Option<String>,
     license: Option<String>,
-    #[serde(default)]
-    triggers: Vec<String>,
 }
 
 /// Read a SKILL.md, parse its frontmatter and body, and scaffold a complete
@@ -101,7 +99,7 @@ fn parse_frontmatter(content: &str) -> Result<(SkillMdFrontmatter, &str)> {
 
 fn scaffold_bundle(
     dir: &Utf8Path,
-    id: &str,
+    _id: &str,
     display_name: &str,
     frontmatter: &SkillMdFrontmatter,
     system_prompt: &str,
@@ -126,21 +124,20 @@ fn scaffold_bundle(
     )?;
 
     // Workflow: single llm step driven by the system prompt
-    let workflow_name = id.replace('-', "_");
-    let workflow = format!(
-        "name: {workflow_name}\nsteps:\n\
+    let workflow = "name: imported_skill\nsteps:\n\
          \x20 - id: generate\n\
          \x20   type: llm\n\
          \x20   prompt: prompts/system.txt\n\
          \x20   inputs:\n\
          \x20     input: input.input\n\
-         \x20   output_schema: schemas/output.schema.json\n"
-    );
-    write_file(dir, "workflow.yaml", &workflow, &mut written)?;
+         \x20   output_schema: schemas/output.schema.json\n";
+    write_file(dir, "workflow.yaml", workflow, &mut written)?;
 
-    // Manifest
-    let manifest = build_manifest_json(id, display_name, frontmatter);
-    write_file(dir, "manifest.json", &manifest, &mut written)?;
+    // SKILL.md — the canonical authoring format (AUTH1f: manifest.json
+    // is no longer written). References workflow.yaml via vh_workflow_ref
+    // and inlines the body of the imported SKILL.md file.
+    let skill_md = build_skill_md(display_name, frontmatter, system_prompt);
+    write_file(dir, "SKILL.md", &skill_md, &mut written)?;
 
     Ok(written)
 }
@@ -152,132 +149,36 @@ fn write_file(dir: &Utf8Path, rel: &str, content: &str, log: &mut Vec<String>) -
     Ok(())
 }
 
-fn build_manifest_json(id: &str, display_name: &str, fm: &SkillMdFrontmatter) -> String {
+fn build_skill_md(display_name: &str, fm: &SkillMdFrontmatter, body: &str) -> String {
     let description = fm.description.as_deref().unwrap_or("");
     let description = if description.is_empty() {
         format!("A skill that helps with {}", display_name.to_lowercase())
     } else {
         description.to_string()
     };
-    let license_line = fm
-        .license
-        .as_deref()
-        .map(|l| {
-            format!(
-                "\n  \"license\": {},",
-                serde_json::to_string(l).expect("license is valid JSON string")
-            )
-        })
-        .unwrap_or_default();
-
-    // Auto-generate triggers from description when none are provided
-    let triggers = if fm.triggers.is_empty() {
-        generate_triggers_from_description(fm.description.as_deref().unwrap_or(""), display_name)
-    } else {
-        fm.triggers.clone()
-    };
-
-    let triggers_line = if triggers.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n  \"triggers\": {},",
-            serde_json::to_string(&triggers).expect("triggers are valid JSON")
-        )
-    };
-
-    // Prompt-only skills (single LLM step, no network) are offload-eligible
-    let offload_line = "\n  \"offload_eligible\": true,";
+    let license = fm.license.as_deref().unwrap_or("Apache-2.0");
+    let publisher = fm.publisher.as_deref().unwrap_or("local");
 
     format!(
-        r#"{{
-  "schema_version": "1.0",
-  "id": "{id}",
-  "name": {name},
-  "version": "0.1.0",
-  "publisher": {publisher},
-  "description": {description},{license_line}{triggers_line}{offload_line}
-  "entrypoint": "workflow.yaml",
-  "inputs_schema": "schemas/input.schema.json",
-  "outputs_schema": "schemas/output.schema.json",
-  "permissions": {{
-    "filesystem": "none",
-    "network": "none",
-    "clipboard": false
-  }},
-  "execution": {{
-    "sandbox_profile": "strict",
-    "timeout_seconds": 120,
-    "memory_mb": 512
-  }},
-  "update": {{
-    "channel": "stable",
-    "auto_update": true
-  }}
-}}"#,
-        name = serde_json::to_string(display_name).expect("name is valid JSON string"),
-        publisher = serde_json::to_string(fm.publisher.as_deref().unwrap_or("local"))
-            .expect("publisher is valid JSON string"),
-        description =
-            serde_json::to_string(&description).expect("description is valid JSON string"),
+        "---\n\
+         name: {display_name}\n\
+         description: {description}\n\
+         license: {license}\n\
+         vh_version: 0.1.0\n\
+         vh_publisher: {publisher}\n\
+         vh_permissions:\n  \
+           network: none\n  \
+           filesystem: none\n  \
+           clipboard: none\n\
+         vh_execution:\n  \
+           sandbox: strict\n  \
+           timeout_ms: 120000\n  \
+           memory_mb: 512\n\
+         vh_workflow_ref: workflow.yaml\n\
+         ---\n\
+         \n\
+         {body}\n"
     )
-}
-
-// ---------------------------------------------------------------------------
-// Trigger auto-generation
-// ---------------------------------------------------------------------------
-
-/// Generate trigger phrases from a skill's description and name.
-///
-/// This is a simple keyword-extraction approach: split the description on
-/// commas/conjunctions into clauses, lowercase them, strip leading articles
-/// and filler, and use each clause as a trigger phrase. The skill name
-/// (kebab-cased to spaces) is always included as a fallback trigger.
-pub fn generate_triggers_from_description(description: &str, name: &str) -> Vec<String> {
-    let mut triggers = Vec::new();
-
-    // Add the skill name as a natural-language trigger
-    let name_trigger = name.to_lowercase().replace('-', " ");
-    if !name_trigger.is_empty() {
-        triggers.push(name_trigger);
-    }
-
-    if description.is_empty() {
-        return triggers;
-    }
-
-    // Split description on commas and "and" to extract clause-level phrases
-    let clauses: Vec<&str> = description
-        .split([',', '.'])
-        .flat_map(|s| s.split(" and "))
-        .collect();
-
-    for clause in clauses {
-        let trimmed = clause.trim().to_lowercase();
-        if trimmed.is_empty() || trimmed.len() < 5 {
-            continue;
-        }
-
-        // Strip leading articles and filler words
-        let cleaned = trimmed
-            .trim_start_matches("a ")
-            .trim_start_matches("an ")
-            .trim_start_matches("the ")
-            .trim_start_matches("this skill ")
-            .trim_start_matches("will ")
-            .trim_start_matches("can ")
-            .trim_start_matches("helps ")
-            .trim_start_matches("that ")
-            .trim();
-
-        if cleaned.len() >= 5 && !triggers.contains(&cleaned.to_string()) {
-            triggers.push(cleaned.to_string());
-        }
-    }
-
-    // Cap at 5 triggers to avoid noise
-    triggers.truncate(5);
-    triggers
 }
 
 // ---------------------------------------------------------------------------
@@ -361,7 +262,7 @@ It can span multiple lines.
 
         assert_eq!(result.id, "my-skill");
         let out = &result.output_dir;
-        assert!(out.join("manifest.json").exists());
+        assert!(out.join("SKILL.md").exists());
         assert!(out.join("workflow.yaml").exists());
         assert!(out.join("prompts/system.txt").exists());
         assert!(out.join("schemas/input.schema.json").exists());
@@ -384,16 +285,16 @@ It can span multiple lines.
     }
 
     #[test]
-    fn import_manifest_contains_correct_id_and_metadata() {
-        let dir = temp_dir("manifest");
+    fn import_skill_md_contains_correct_metadata() {
+        let dir = temp_dir("metadata");
         let path = write_skill_md(&dir, SAMPLE_SKILL_MD);
 
         let result = import_skill_md(&path).unwrap();
 
-        let manifest_text = fs::read_to_string(result.output_dir.join("manifest.json")).unwrap();
-        assert!(manifest_text.contains("\"id\": \"my-skill\""));
-        assert!(manifest_text.contains("\"description\": \"Does something cool.\""));
-        assert!(manifest_text.contains("\"license\": \"MIT\""));
+        let skill_md_text = fs::read_to_string(result.output_dir.join("SKILL.md")).unwrap();
+        assert!(skill_md_text.contains("name: my-skill"));
+        assert!(skill_md_text.contains("description: Does something cool."));
+        assert!(skill_md_text.contains("license: MIT"));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -421,100 +322,6 @@ It can span multiple lines.
         assert_eq!(to_skill_id("Frontend Design"), "frontend-design");
         assert_eq!(to_skill_id("my_skill"), "my-skill");
         assert_eq!(to_skill_id("already-kebab"), "already-kebab");
-    }
-
-    #[test]
-    fn generate_triggers_from_description_extracts_clauses() {
-        let triggers = generate_triggers_from_description(
-            "Compare two contracts, summarize changes, and assess risk level.",
-            "contract-compare",
-        );
-        assert!(triggers.contains(&"contract compare".to_string()));
-        assert!(
-            triggers.len() >= 2,
-            "should have at least name + one clause, got: {triggers:?}"
-        );
-    }
-
-    #[test]
-    fn generate_triggers_uses_name_as_fallback() {
-        let triggers = generate_triggers_from_description("", "my-skill");
-        assert_eq!(triggers, vec!["my skill"]);
-    }
-
-    #[test]
-    fn generate_triggers_strips_filler() {
-        let triggers = generate_triggers_from_description(
-            "This skill will help with code review and find bugs",
-            "code-review",
-        );
-        assert!(triggers.contains(&"code review".to_string()));
-        // "This skill will help with code review" should be cleaned
-        let has_help = triggers.iter().any(|t| t.contains("help with"));
-        assert!(
-            has_help,
-            "should extract 'help with code review', got: {triggers:?}"
-        );
-    }
-
-    #[test]
-    fn generate_triggers_caps_at_five() {
-        let triggers = generate_triggers_from_description(
-            "one thing, two thing, three thing, four thing, five thing, six thing, seven thing",
-            "many-triggers",
-        );
-        assert!(
-            triggers.len() <= 5,
-            "should cap at 5, got: {}",
-            triggers.len()
-        );
-    }
-
-    #[test]
-    fn import_auto_generates_triggers_when_missing() {
-        let dir = temp_dir("auto-triggers");
-        let skill_md = "\
----
-name: Contract Compare
-description: Compare two contracts and summarize changes.
----
-
-You are a contract analysis expert.
-";
-        let path = write_skill_md(&dir, skill_md);
-        let result = import_skill_md(&path).unwrap();
-
-        let manifest_text = fs::read_to_string(result.output_dir.join("manifest.json")).unwrap();
-        assert!(
-            manifest_text.contains("\"triggers\""),
-            "manifest should contain auto-generated triggers, got:\n{manifest_text}"
-        );
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn import_preserves_explicit_triggers() {
-        let dir = temp_dir("explicit-triggers");
-        let skill_md = "\
----
-name: My Skill
-description: Does things.
-triggers:
-  - do the thing
-  - make it happen
----
-
-System prompt here.
-";
-        let path = write_skill_md(&dir, skill_md);
-        let result = import_skill_md(&path).unwrap();
-
-        let manifest_text = fs::read_to_string(result.output_dir.join("manifest.json")).unwrap();
-        assert!(manifest_text.contains("do the thing"));
-        assert!(manifest_text.contains("make it happen"));
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

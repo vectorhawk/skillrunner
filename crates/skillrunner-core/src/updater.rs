@@ -561,23 +561,11 @@ mod tests {
     }
 
     fn write_skill_bundle(root: &Utf8PathBuf, version: &str) {
-        fs::create_dir_all(root.join("schemas")).unwrap();
         fs::create_dir_all(root.join("prompts")).unwrap();
         fs::write(
-            root.join("manifest.json"),
+            root.join("SKILL.md"),
             format!(
-                r#"{{
-  "schema_version": "1.0",
-  "id": "test-skill",
-  "name": "Test Skill",
-  "version": "{version}",
-  "publisher": "skillclub",
-  "entrypoint": "workflow.yaml",
-  "inputs_schema": "schemas/input.schema.json",
-  "outputs_schema": "schemas/output.schema.json",
-  "permissions": {{ "filesystem": "none", "network": "none", "clipboard": false }},
-  "execution": {{ "sandbox_profile": "strict", "timeout_seconds": 30, "memory_mb": 256 }}
-}}"#
+                "---\nname: Test Skill\ndescription: A test skill.\nlicense: MIT\nvh_version: {version}\nvh_publisher: skillclub\nvh_permissions:\n  filesystem: none\n  network: none\n  clipboard: none\nvh_execution:\n  sandbox: strict\n  timeout_ms: 30000\n  memory_mb: 256\nvh_workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n"
             ),
         )
         .unwrap();
@@ -587,8 +575,6 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("prompts/system.txt"), "Do the thing.").unwrap();
-        fs::write(root.join("schemas/input.schema.json"), "{}").unwrap();
-        fs::write(root.join("schemas/output.schema.json"), "{}").unwrap();
     }
 
     /// Create a tar.gz archive of a skill bundle and return (archive_path, sha256_hex).
@@ -764,10 +750,10 @@ mod tests {
         // Verify files on disk
         let install_path = state
             .root_dir
-            .join("skills/test-skill/versions/2.0.0/manifest.json");
+            .join("skills/test-skill/versions/2.0.0/SKILL.md");
         assert!(
             install_path.exists(),
-            "manifest.json should exist for v2.0.0"
+            "SKILL.md should exist for v2.0.0"
         );
 
         meta_mock.assert();
@@ -777,39 +763,6 @@ mod tests {
     }
 
     // ── check_skill_updates tests ─────────────────────────────────────────────
-
-    /// Write a skill bundle with auto_update explicitly set to the given value.
-    fn write_skill_bundle_with_auto_update(root: &Utf8PathBuf, version: &str, auto_update: bool) {
-        fs::create_dir_all(root.join("schemas")).unwrap();
-        fs::create_dir_all(root.join("prompts")).unwrap();
-        fs::write(
-            root.join("manifest.json"),
-            format!(
-                r#"{{
-  "schema_version": "1.0",
-  "id": "test-skill",
-  "name": "Test Skill",
-  "version": "{version}",
-  "publisher": "skillclub",
-  "entrypoint": "workflow.yaml",
-  "inputs_schema": "schemas/input.schema.json",
-  "outputs_schema": "schemas/output.schema.json",
-  "permissions": {{ "filesystem": "none", "network": "none", "clipboard": false }},
-  "execution": {{ "sandbox_profile": "strict", "timeout_seconds": 30, "memory_mb": 256 }},
-  "update": {{ "auto_update": {auto_update} }}
-}}"#
-            ),
-        )
-        .unwrap();
-        fs::write(
-            root.join("workflow.yaml"),
-            "name: test_skill\nsteps:\n  - id: run\n    type: llm\n    prompt: prompts/system.txt\n    inputs: {}\n",
-        )
-        .unwrap();
-        fs::write(root.join("prompts/system.txt"), "Do the thing.").unwrap();
-        fs::write(root.join("schemas/input.schema.json"), "{}").unwrap();
-        fs::write(root.join("schemas/output.schema.json"), "{}").unwrap();
-    }
 
     #[test]
     fn check_skill_updates_updates_stale_skill() {
@@ -921,28 +874,6 @@ mod tests {
         let _ = fs::remove_dir_all(&skill_root);
     }
 
-    #[test]
-    fn check_skill_updates_skips_auto_update_false() {
-        let state_root = temp_root("csu-no-auto");
-        let skill_root = temp_root("csu-no-auto-skill");
-        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
-
-        // Install v0.1.0 with auto_update: false
-        write_skill_bundle_with_auto_update(&skill_root, "0.1.0", false);
-        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
-
-        // Point registry at a server that should NOT be contacted
-        let registry = RegistryClient::new("http://localhost:0");
-        let policy_client = crate::policy::MockPolicyClient::new();
-
-        let count = check_skill_updates(&state, &registry, &policy_client).unwrap();
-        assert_eq!(count, 0, "should skip skill with auto_update=false");
-
-        let _ = fs::remove_dir_all(&state_root);
-        let _ = fs::remove_dir_all(&skill_root);
-    }
-
     // ── lifecycle sync tests ──────────────────────────────────────────────────
 
     #[test]
@@ -996,7 +927,7 @@ mod tests {
         );
 
         // Versioned files should still be present
-        assert!(install_root.join("versions/0.1.0/manifest.json").exists());
+        assert!(install_root.join("versions/0.1.0/SKILL.md").exists());
 
         status_mock.assert();
         let _ = fs::remove_dir_all(&state_root);

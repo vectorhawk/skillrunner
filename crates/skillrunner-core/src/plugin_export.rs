@@ -99,7 +99,10 @@ pub fn export_claude_code(plugin_dir: &Utf8Path, output_dir: &Utf8Path) -> Resul
             .with_context(|| format!("failed to copy command file {src} to {dst}"))?;
     }
 
-    // Export embedded skills as SKILL.md files under skills/{skill-id}/SKILL.md
+    // Export embedded skills as SKILL.md files under skills/{skill-id}/SKILL.md.
+    // Load each skill through the canonical SKILL.md loader so we don't
+    // hand-parse the frontmatter — AUTH1f: manifest.json is no longer the
+    // source of truth.
     for skill_ref in &pkg.manifest.skills {
         let skill_path = match &skill_ref.path {
             Some(p) => p,
@@ -107,17 +110,12 @@ pub fn export_claude_code(plugin_dir: &Utf8Path, output_dir: &Utf8Path) -> Resul
         };
 
         let skill_dir = plugin_dir.join(skill_path);
-        let manifest_path = skill_dir.join("manifest.json");
-        let manifest_text = fs::read_to_string(&manifest_path)
-            .with_context(|| format!("failed to read {manifest_path}"))?;
-        let manifest: serde_json::Value = serde_json::from_str(&manifest_text)
-            .with_context(|| format!("failed to parse {manifest_path}"))?;
+        let skill_pkg = skillrunner_manifest::SkillPackage::load_from_dir(&skill_dir)
+            .with_context(|| format!("failed to load skill from {skill_dir}"))?;
 
-        let skill_id = manifest["id"]
-            .as_str()
-            .with_context(|| format!("manifest at {manifest_path} is missing 'id' field"))?;
-        let skill_name = manifest["name"].as_str().unwrap_or(skill_id);
-        let skill_description = manifest["description"].as_str().unwrap_or("");
+        let skill_id = skill_pkg.manifest.id.as_str();
+        let skill_name = skill_pkg.manifest.name.as_str();
+        let skill_description = skill_pkg.manifest.description.as_deref().unwrap_or("");
 
         let prompt_path = skill_dir.join("prompts").join("system.txt");
         let system_prompt = if prompt_path.exists() {
@@ -231,27 +229,38 @@ mod tests {
     /// Build a minimal but valid plugin directory for tests.
     #[allow(clippy::unwrap_used)]
     fn write_test_plugin(root: &Utf8Path) {
-        // Embedded skill
+        // Embedded skill — SKILL.md-rooted (AUTH1f: the legacy manifest.json
+        // bundle format is no longer accepted by SkillPackage::load_from_dir).
         let skill_dir = root.join("skills").join("my-skill");
-        fs::create_dir_all(skill_dir.join("schemas")).unwrap();
-        fs::create_dir_all(skill_dir.join("prompts")).unwrap();
+        fs::create_dir_all(&skill_dir).unwrap();
         fs::write(
-            skill_dir.join("manifest.json"),
-            r#"{
-                "schema_version": "1.0", "id": "my-skill", "name": "My Skill",
-                "version": "0.1.0", "publisher": "test",
-                "description": "Does the thing",
-                "entrypoint": "workflow.yaml",
-                "inputs_schema": "schemas/input.schema.json",
-                "outputs_schema": "schemas/output.schema.json",
-                "permissions": {"filesystem": "none", "network": "none", "clipboard": false},
-                "execution": {"sandbox_profile": "strict", "timeout_seconds": 30, "memory_mb": 512}
-            }"#,
+            skill_dir.join("SKILL.md"),
+            "---\n\
+             name: My Skill\n\
+             description: Does the thing\n\
+             license: Apache-2.0\n\
+             vh_version: 0.1.0\n\
+             vh_publisher: test\n\
+             vh_permissions:\n\
+               filesystem: none\n\
+               network: none\n\
+               clipboard: none\n\
+             vh_execution:\n\
+               sandbox: strict\n\
+               timeout_ms: 30000\n\
+               memory_mb: 512\n\
+             vh_workflow_ref: workflow.yaml\n\
+             ---\n\
+             \n\
+             # My Skill\n\
+             \n\
+             You are a helpful assistant.\n",
         )
         .unwrap();
         fs::write(skill_dir.join("workflow.yaml"), "name: test\nsteps: []").unwrap();
-        fs::write(skill_dir.join("schemas/input.schema.json"), "{}").unwrap();
-        fs::write(skill_dir.join("schemas/output.schema.json"), "{}").unwrap();
+        // export_claude_code reads prompts/system.txt directly as the body of
+        // the exported Claude-native SKILL.md — keep it around for the test.
+        fs::create_dir_all(skill_dir.join("prompts")).unwrap();
         fs::write(
             skill_dir.join("prompts/system.txt"),
             "You are a helpful assistant.",

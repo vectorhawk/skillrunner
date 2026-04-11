@@ -268,27 +268,35 @@ mod tests {
     }
 
     fn write_test_plugin(root: &camino::Utf8Path) {
-        // Embedded skill
+        // Embedded skill — SKILL.md-rooted (AUTH1f: the legacy manifest.json
+        // bundle format is no longer accepted by SkillPackage::load_from_dir).
         let skill_dir = root.join("skills").join("test-skill");
-        fs::create_dir_all(skill_dir.join("schemas")).unwrap();
-        fs::create_dir_all(skill_dir.join("prompts")).unwrap();
+        fs::create_dir_all(&skill_dir).unwrap();
         fs::write(
-            skill_dir.join("manifest.json"),
-            r#"{
-            "schema_version": "1.0", "id": "test-skill", "name": "Test Skill",
-            "version": "0.1.0", "publisher": "test",
-            "entrypoint": "workflow.yaml",
-            "inputs_schema": "schemas/input.schema.json",
-            "outputs_schema": "schemas/output.schema.json",
-            "permissions": {"filesystem": "none", "network": "none", "clipboard": false},
-            "execution": {"sandbox_profile": "strict", "timeout_seconds": 30, "memory_mb": 512}
-        }"#,
+            skill_dir.join("SKILL.md"),
+            "---\n\
+             name: Test Skill\n\
+             description: A test skill for plugin install tests.\n\
+             license: Apache-2.0\n\
+             vh_version: 0.1.0\n\
+             vh_publisher: test\n\
+             vh_permissions:\n\
+               filesystem: none\n\
+               network: none\n\
+               clipboard: none\n\
+             vh_execution:\n\
+               sandbox: strict\n\
+               timeout_ms: 30000\n\
+               memory_mb: 512\n\
+             vh_workflow_ref: workflow.yaml\n\
+             ---\n\
+             \n\
+             # Test Skill\n\
+             \n\
+             Body body body.\n",
         )
         .unwrap();
         fs::write(skill_dir.join("workflow.yaml"), "name: test\nsteps: []").unwrap();
-        fs::write(skill_dir.join("schemas/input.schema.json"), "{}").unwrap();
-        fs::write(skill_dir.join("schemas/output.schema.json"), "{}").unwrap();
-        fs::write(skill_dir.join("prompts/system.txt"), "test").unwrap();
 
         // Command
         let cmd_dir = root.join("commands");
