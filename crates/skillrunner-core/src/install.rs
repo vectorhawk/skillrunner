@@ -256,7 +256,7 @@ mod tests {
 
         let install_root = state.root_dir.join("skills").join("contract-compare");
         let version_dir = install_root.join("versions").join(&version);
-        assert!(version_dir.join("manifest.json").exists());
+        assert!(version_dir.join("SKILL.md").exists());
         assert!(version_dir.join("workflow.yaml").exists());
 
         #[cfg(target_family = "unix")]
