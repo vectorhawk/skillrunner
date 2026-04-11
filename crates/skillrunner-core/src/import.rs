@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::Deserialize;
+use skillrunner_manifest::to_skill_id;
 use std::fs;
 
 /// Files written when scaffolding a bundle from a SKILL.md.
@@ -91,25 +92,8 @@ fn parse_frontmatter(content: &str) -> Result<(SkillMdFrontmatter, &str)> {
 }
 
 // ---------------------------------------------------------------------------
-// ID derivation
+// ID derivation (canonical implementation in skillrunner_manifest::to_skill_id)
 // ---------------------------------------------------------------------------
-
-fn to_skill_id(name: &str) -> String {
-    name.to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .split('-')
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
-}
 
 // ---------------------------------------------------------------------------
 // Bundle scaffolding
@@ -433,6 +417,7 @@ It can span multiple lines.
 
     #[test]
     fn to_skill_id_handles_spaces_and_mixed_case() {
+        // Delegates to skillrunner_manifest::to_skill_id (canonical impl).
         assert_eq!(to_skill_id("Frontend Design"), "frontend-design");
         assert_eq!(to_skill_id("my_skill"), "my-skill");
         assert_eq!(to_skill_id("already-kebab"), "already-kebab");
