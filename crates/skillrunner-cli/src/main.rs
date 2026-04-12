@@ -151,8 +151,33 @@ enum AuthCommands {
 
 #[derive(Subcommand)]
 enum SkillCommands {
+    /// Import a SKILL.md file and scaffold a skill bundle
     Import {
         path: Utf8PathBuf,
+        /// Auto-accept metadata recommendations for missing fields
+        #[arg(long)]
+        accept_suggestions: bool,
+        /// Skip metadata enrichment
+        #[arg(long)]
+        skip_metadata: bool,
+    },
+    /// Create a new skill with smart metadata recommendations
+    Author {
+        /// Skill name
+        #[arg(long)]
+        name: Option<String>,
+        /// Path to a file containing the system prompt
+        #[arg(long)]
+        prompt_file: Option<Utf8PathBuf>,
+        /// Auto-accept all metadata recommendations without prompting
+        #[arg(long)]
+        accept_suggestions: bool,
+        /// Skip metadata analysis, use bare defaults
+        #[arg(long)]
+        skip_metadata: bool,
+        /// Output directory (default: current directory)
+        #[arg(long, default_value = ".")]
+        output_dir: Utf8PathBuf,
     },
     Search {
         query: String,
@@ -737,12 +762,145 @@ fn main() -> Result<()> {
             }
         },
         Commands::Skill { command } => match command {
-            SkillCommands::Import { path } => {
+            SkillCommands::Import {
+                path,
+                accept_suggestions,
+                skip_metadata,
+            } => {
                 let bundle = import_skill_md(&path)?;
                 println!("Imported skill: {}", bundle.id);
                 println!("Output:         {}", bundle.output_dir);
                 for f in &bundle.files {
                     println!("  wrote {f}");
+                }
+
+                if !skip_metadata {
+                    let pkg = SkillPackage::load_from_dir(&bundle.output_dir)?;
+                    let missing = detect_missing_metadata(&pkg);
+                    if !missing.is_empty() {
+                        println!("\nMissing recommended metadata: {}", missing.join(", "));
+
+                        let should_enrich = if accept_suggestions {
+                            true
+                        } else {
+                            print!("Run recommendation engine to fill these? [Y/n]: ");
+                            std::io::Write::flush(&mut std::io::stdout())?;
+                            let mut input = String::new();
+                            std::io::stdin().read_line(&mut input)?;
+                            let answer = input.trim().to_lowercase();
+                            answer.is_empty() || answer == "y" || answer == "yes"
+                        };
+
+                        if should_enrich {
+                            let description =
+                                pkg.manifest.description.as_deref().unwrap_or("").to_string();
+                            let skill_md_path = bundle.output_dir.join("SKILL.md");
+                            let skill_md_content =
+                                std::fs::read_to_string(&skill_md_path).with_context(|| {
+                                    format!("failed to read {skill_md_path}")
+                                })?;
+                            let body = extract_skill_md_body(&skill_md_content);
+
+                            let rec = skillrunner_core::recommend::recommend_from_prompt(
+                                &pkg.manifest.name,
+                                &description,
+                                &body,
+                            );
+
+                            let rec = if accept_suggestions {
+                                println!("Applying recommended metadata...");
+                                rec
+                            } else {
+                                prompt_for_recommendations(rec)?
+                            };
+
+                            let enriched = build_enriched_skill_md(
+                                &pkg.manifest.name,
+                                &description,
+                                &body,
+                                &rec,
+                            );
+                            std::fs::write(&skill_md_path, enriched).with_context(|| {
+                                format!("failed to write {skill_md_path}")
+                            })?;
+                            println!("\nUpdated SKILL.md with metadata recommendations.");
+                        }
+                    }
+                }
+            }
+            SkillCommands::Author {
+                name,
+                prompt_file,
+                accept_suggestions,
+                skip_metadata,
+                output_dir,
+            } => {
+                let skill_name = match name {
+                    Some(n) => n,
+                    None => {
+                        print!("Skill name: ");
+                        std::io::Write::flush(&mut std::io::stdout())?;
+                        let mut input = String::new();
+                        std::io::stdin().read_line(&mut input)?;
+                        let trimmed = input.trim().to_string();
+                        if trimmed.is_empty() {
+                            anyhow::bail!("Skill name cannot be empty");
+                        }
+                        trimmed
+                    }
+                };
+
+                let system_prompt = match prompt_file {
+                    Some(ref path) => std::fs::read_to_string(path)
+                        .with_context(|| format!("Failed to read prompt file: {path}"))?,
+                    None => {
+                        println!("Enter system prompt (end with Ctrl-D on a new line):");
+                        let mut input = String::new();
+                        std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+                        if input.trim().is_empty() {
+                            anyhow::bail!("System prompt cannot be empty");
+                        }
+                        input
+                    }
+                };
+
+                let description = format!("A skill that helps with {}", skill_name.to_lowercase());
+
+                if skip_metadata {
+                    let skill_md =
+                        build_bare_skill_md(&skill_name, &description, system_prompt.trim());
+                    let bundle = write_and_import_skill_md(&output_dir, &skill_md)?;
+                    print_bundle_result(&bundle);
+                } else {
+                    let rec = skillrunner_core::recommend::recommend_from_prompt(
+                        &skill_name,
+                        &description,
+                        system_prompt.trim(),
+                    );
+
+                    if accept_suggestions {
+                        println!("\nUsing recommended metadata...");
+                        let skill_md = build_enriched_skill_md(
+                            &skill_name,
+                            &description,
+                            system_prompt.trim(),
+                            &rec,
+                        );
+                        let bundle = write_and_import_skill_md(&output_dir, &skill_md)?;
+                        print_bundle_result(&bundle);
+                        print_recommendations_summary(&rec);
+                    } else {
+                        println!("\nAnalyzing prompt...\n");
+                        let rec = prompt_for_recommendations(rec)?;
+                        let skill_md = build_enriched_skill_md(
+                            &skill_name,
+                            &description,
+                            system_prompt.trim(),
+                            &rec,
+                        );
+                        let bundle = write_and_import_skill_md(&output_dir, &skill_md)?;
+                        print_bundle_result(&bundle);
+                    }
                 }
             }
             SkillCommands::Search {
@@ -1301,6 +1459,187 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Build a SKILL.md with bare defaults (no vh_* metadata beyond minimum).
+fn build_bare_skill_md(name: &str, description: &str, body: &str) -> String {
+    format!("---\nname: {name}\ndescription: {description}\nlicense: Apache-2.0\n---\n\n{body}\n")
+}
+
+/// Build a SKILL.md with full vh_* metadata from recommendations.
+fn build_enriched_skill_md(
+    name: &str,
+    description: &str,
+    body: &str,
+    rec: &skillrunner_core::recommend::Recommendations,
+) -> String {
+    let mut fm = format!("---\nname: {name}\ndescription: {description}\nlicense: Apache-2.0\n");
+
+    if !rec.triggers.is_empty() {
+        fm.push_str("vh_triggers:\n");
+        for t in &rec.triggers {
+            fm.push_str(&format!("  - \"{t}\"\n"));
+        }
+    }
+
+    fm.push_str(&format!(
+        "vh_permissions:\n  network: {}\n  filesystem: {}\n  clipboard: {}\n",
+        rec.permissions.network, rec.permissions.filesystem, rec.permissions.clipboard
+    ));
+
+    fm.push_str(&format!(
+        "vh_model:\n  min_params_b: {}\n  recommended:\n",
+        rec.model.min_params_b
+    ));
+    for m in &rec.model.recommended {
+        fm.push_str(&format!("    - \"{m}\"\n"));
+    }
+    fm.push_str(&format!("  fallback: {}\n", rec.model.fallback));
+
+    fm.push_str(&format!(
+        "vh_execution:\n  timeout_ms: {}\n  memory_mb: {}\n  sandbox: {}\n",
+        rec.execution.timeout_ms, rec.execution.memory_mb, rec.execution.sandbox
+    ));
+
+    fm.push_str("---\n\n");
+    fm.push_str(body);
+    fm.push('\n');
+    fm
+}
+
+/// Write a SKILL.md to the output directory and run import_skill_md.
+fn write_and_import_skill_md(
+    output_dir: &Utf8PathBuf,
+    skill_md_content: &str,
+) -> Result<skillrunner_core::import::ScaffoldedBundle> {
+    std::fs::create_dir_all(output_dir)
+        .with_context(|| format!("failed to create directory {output_dir}"))?;
+    let skill_md_path = output_dir.join("SKILL.md");
+    std::fs::write(&skill_md_path, skill_md_content)
+        .with_context(|| format!("failed to write {skill_md_path}"))?;
+    import_skill_md(&skill_md_path).context("Failed to scaffold skill bundle")
+}
+
+fn print_bundle_result(bundle: &skillrunner_core::import::ScaffoldedBundle) {
+    println!("\nCreated skill: {}", bundle.id);
+    println!("Output:        {}", bundle.output_dir);
+    for f in &bundle.files {
+        println!("  wrote {f}");
+    }
+}
+
+fn print_recommendations_summary(rec: &skillrunner_core::recommend::Recommendations) {
+    println!("\nApplied metadata:");
+    if !rec.triggers.is_empty() {
+        println!("  triggers: {}", rec.triggers.join(", "));
+    }
+    println!(
+        "  network: {}, filesystem: {}, clipboard: {}",
+        rec.permissions.network, rec.permissions.filesystem, rec.permissions.clipboard
+    );
+    println!(
+        "  model: {}B min, recommended: {}, fallback: {}",
+        rec.model.min_params_b,
+        rec.model.recommended.join("/"),
+        rec.model.fallback
+    );
+    println!(
+        "  timeout: {}ms, memory: {}MB, sandbox: {}",
+        rec.execution.timeout_ms, rec.execution.memory_mb, rec.execution.sandbox
+    );
+}
+
+/// Detect which vh_* metadata fields are missing/empty.
+fn detect_missing_metadata(pkg: &SkillPackage) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if pkg.manifest.triggers.is_empty() {
+        missing.push("vh_triggers");
+    }
+    if pkg.manifest.model_requirements.is_none() {
+        missing.push("vh_model");
+    }
+    missing
+}
+
+/// Extract the body (after YAML frontmatter) from a SKILL.md string.
+fn extract_skill_md_body(content: &str) -> String {
+    if let Some(after_open) = content.strip_prefix("---\n") {
+        if let Some(close_pos) = after_open.find("\n---\n") {
+            return after_open[close_pos + 5..].trim().to_string();
+        }
+    }
+    content.to_string()
+}
+
+/// Interactive prompt loop: show each recommendation group and ask Y/n.
+fn prompt_for_recommendations(
+    mut rec: skillrunner_core::recommend::Recommendations,
+) -> Result<skillrunner_core::recommend::Recommendations> {
+    use std::io::Write;
+
+    // Triggers
+    println!("Recommended triggers:");
+    for (i, t) in rec.triggers.iter().enumerate() {
+        println!("  {}. {}", i + 1, t);
+    }
+    print!("Accept triggers? [Y/n]: ");
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    if input.trim().eq_ignore_ascii_case("n") {
+        rec.triggers.clear();
+        println!("  (triggers skipped)");
+    }
+
+    // Permissions
+    println!("\nRecommended permissions:");
+    println!("  network: {}", rec.permissions.network);
+    println!("  filesystem: {}", rec.permissions.filesystem);
+    println!("  clipboard: {}", rec.permissions.clipboard);
+    print!("Accept permissions? [Y/n]: ");
+    std::io::stdout().flush()?;
+    input.clear();
+    std::io::stdin().read_line(&mut input)?;
+    if input.trim().eq_ignore_ascii_case("n") {
+        rec.permissions.network = "none".to_string();
+        rec.permissions.filesystem = "none".to_string();
+        rec.permissions.clipboard = "none".to_string();
+        println!("  (reset to none/none/none)");
+    }
+
+    // Model
+    println!("\nRecommended model:");
+    println!("  min_params_b: {}", rec.model.min_params_b);
+    println!("  recommended: {}", rec.model.recommended.join(", "));
+    println!("  fallback: {}", rec.model.fallback);
+    print!("Accept model settings? [Y/n]: ");
+    std::io::stdout().flush()?;
+    input.clear();
+    std::io::stdin().read_line(&mut input)?;
+    if input.trim().eq_ignore_ascii_case("n") {
+        rec.model.min_params_b = 1.0;
+        rec.model.recommended = vec!["gemma3:4b".to_string()];
+        rec.model.fallback = "error".to_string();
+        println!("  (reset to defaults)");
+    }
+
+    // Execution
+    println!("\nRecommended execution:");
+    println!("  timeout_ms: {}", rec.execution.timeout_ms);
+    println!("  memory_mb: {}", rec.execution.memory_mb);
+    println!("  sandbox: {}", rec.execution.sandbox);
+    print!("Accept execution settings? [Y/n]: ");
+    std::io::stdout().flush()?;
+    input.clear();
+    std::io::stdin().read_line(&mut input)?;
+    if input.trim().eq_ignore_ascii_case("n") {
+        rec.execution.timeout_ms = 30_000;
+        rec.execution.memory_mb = 256;
+        rec.execution.sandbox = "strict".to_string();
+        println!("  (reset to defaults)");
+    }
+
+    Ok(rec)
 }
 
 /// Default registry URL for release builds.
