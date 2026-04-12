@@ -12,6 +12,10 @@ vh_execution:
   sandbox: strict
   timeout_ms: 60000
   memory_mb: 512
+vh_triggers:
+  - rewrite in regency english
+  - make text sound old fashioned
+  - transform to period prose
 vh_workflow_ref: workflow.yaml
 ---
 

@@ -49,6 +49,8 @@ struct SkillMdFrontmatter {
     vh_workflow: Option<Vec<WorkflowStep>>,
     #[serde(default)]
     vh_workflow_ref: Option<String>,
+    #[serde(default)]
+    vh_triggers: Vec<String>,
 }
 
 /// `vh_permissions` sub-object.
@@ -179,7 +181,7 @@ pub(crate) fn load_from_skill_md_dir(root: Utf8PathBuf) -> Result<SkillPackage, 
             channel: Some("stable".to_string()),
             auto_update: Some(true),
         }),
-        triggers: Vec::new(),
+        triggers: validate_and_normalize_triggers(frontmatter.vh_triggers.clone())?,
         offload_eligible: None,
     };
 
@@ -217,6 +219,7 @@ fn reject_unknown_vh_keys(yaml_str: &str) -> Result<(), ManifestError> {
         "vh_schemas",
         "vh_workflow",
         "vh_workflow_ref",
+        "vh_triggers",
     ];
 
     let value: serde_yaml::Value =
@@ -260,6 +263,53 @@ fn validate_frontmatter_basics(fm: &SkillMdFrontmatter) -> Result<(), ManifestEr
         ));
     }
     Ok(())
+}
+
+/// Validate and normalize a raw `vh_triggers` list from the frontmatter.
+///
+/// Rules applied in order:
+/// 1. Strip empty strings.
+/// 2. Lowercase-normalize each item.
+/// 3. Deduplicate (post-normalize, so "Compare" and "compare" collapse).
+/// 4. Reject if more than 10 items remain.
+/// 5. Reject any item shorter than 3 characters or longer than 200 characters.
+fn validate_and_normalize_triggers(raw: Vec<String>) -> Result<Vec<String>, ManifestError> {
+    // Step 1 + 2: strip empties and lowercase.
+    let mut normalized: Vec<String> = raw
+        .into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_lowercase())
+        .collect();
+
+    // Step 3: dedup while preserving first-seen order.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    normalized.retain(|s| seen.insert(s.clone()));
+
+    // Step 4: max 10 triggers.
+    if normalized.len() > 10 {
+        return Err(ManifestError::Invalid(format!(
+            "vh_triggers may contain at most 10 items, got {}",
+            normalized.len()
+        )));
+    }
+
+    // Step 5: per-item length constraints.
+    for trigger in &normalized {
+        if trigger.len() < 3 {
+            return Err(ManifestError::Invalid(format!(
+                "vh_triggers item '{}' is too short (minimum 3 characters)",
+                trigger
+            )));
+        }
+        if trigger.len() > 200 {
+            return Err(ManifestError::Invalid(format!(
+                "vh_triggers item is too long ({} characters, maximum 200)",
+                trigger.len()
+            )));
+        }
+    }
+
+    Ok(normalized)
 }
 
 // ── Sub-struct builders ───────────────────────────────────────────────────────
@@ -369,4 +419,118 @@ fn validate_workflow_prompt_refs(root: &Utf8Path, workflow: &Workflow) -> Result
         }
     }
     Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use camino::Utf8PathBuf;
+    use std::fs;
+
+    /// Write a minimal SKILL.md to a tempdir and load it, returning the package.
+    fn load_skill_md(skill_md_content: &str) -> Result<SkillPackage, ManifestError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        fs::write(path.join("SKILL.md"), skill_md_content).unwrap();
+        let utf8_path = Utf8PathBuf::from_path_buf(path).unwrap();
+        load_from_skill_md_dir(utf8_path)
+    }
+
+    /// Minimal valid SKILL.md body (no triggers).
+    fn minimal_skill_md(extra_frontmatter: &str) -> String {
+        format!(
+            "---\nname: test-skill\ndescription: A test skill.\nlicense: MIT\n{extra_frontmatter}---\n\nDo the thing.\n"
+        )
+    }
+
+    // ── validate_and_normalize_triggers unit tests ────────────────────────────
+
+    #[test]
+    fn test_vh_triggers_parsed_into_manifest() {
+        let content = minimal_skill_md(
+            "vh_triggers:\n  - compare contracts\n  - diff legal documents\n  - review contract changes\n",
+        );
+        let pkg = load_skill_md(&content).unwrap();
+        assert_eq!(pkg.manifest.triggers.len(), 3);
+        assert!(pkg.manifest.triggers.contains(&"compare contracts".to_string()));
+        assert!(pkg.manifest.triggers.contains(&"diff legal documents".to_string()));
+        assert!(pkg.manifest.triggers.contains(&"review contract changes".to_string()));
+    }
+
+    #[test]
+    fn test_vh_triggers_empty_is_ok() {
+        let content = minimal_skill_md("");
+        let pkg = load_skill_md(&content).unwrap();
+        assert!(pkg.manifest.triggers.is_empty());
+    }
+
+    #[test]
+    fn test_vh_triggers_max_10_rejects_11() {
+        let triggers = (1..=11)
+            .map(|i| format!("  - trigger phrase {i}\n"))
+            .collect::<String>();
+        let content = minimal_skill_md(&format!("vh_triggers:\n{triggers}"));
+        let err = load_skill_md(&content).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("at most 10"),
+            "expected 'at most 10' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_vh_triggers_too_short_rejected() {
+        // Two-character trigger is below the 3-char minimum.
+        let content = minimal_skill_md("vh_triggers:\n  - ok\n  - ab\n");
+        let err = load_skill_md(&content).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too short"),
+            "expected 'too short' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_vh_triggers_too_long_rejected() {
+        // 201-character trigger exceeds the 200-char limit.
+        let long = "a".repeat(201);
+        let content = minimal_skill_md(&format!("vh_triggers:\n  - {long}\n"));
+        let err = load_skill_md(&content).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("too long"),
+            "expected 'too long' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_vh_triggers_deduplication() {
+        // "compare", "COMPARE", and "compare" should collapse to a single entry.
+        let content = minimal_skill_md("vh_triggers:\n  - compare\n  - COMPARE\n  - compare\n");
+        let pkg = load_skill_md(&content).unwrap();
+        assert_eq!(
+            pkg.manifest.triggers.len(),
+            1,
+            "expected 1 item after dedup, got: {:?}",
+            pkg.manifest.triggers
+        );
+        assert_eq!(pkg.manifest.triggers[0], "compare");
+    }
+
+    #[test]
+    fn test_vh_triggers_empty_strings_stripped() {
+        // Empty strings in the list must be silently dropped.
+        let content = minimal_skill_md("vh_triggers:\n  - \"\"\n  - valid trigger\n  - \"\"\n");
+        let pkg = load_skill_md(&content).unwrap();
+        assert_eq!(
+            pkg.manifest.triggers.len(),
+            1,
+            "expected 1 item after stripping empties, got: {:?}",
+            pkg.manifest.triggers
+        );
+        assert_eq!(pkg.manifest.triggers[0], "valid trigger");
+    }
 }

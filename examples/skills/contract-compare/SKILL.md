@@ -12,6 +12,10 @@ vh_execution:
   sandbox: strict
   timeout_ms: 90000
   memory_mb: 1024
+vh_triggers:
+  - compare contracts
+  - diff legal documents
+  - review contract changes
 vh_workflow_ref: workflow.yaml
 ---
 

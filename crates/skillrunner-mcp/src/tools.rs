@@ -528,9 +528,9 @@ fn skill_to_tool(skill_id: &str, active_path: &str) -> Result<ToolDefinition> {
     let versioned_desc = format!("{} (v{})", base_desc, pkg.manifest.version);
 
     // Enrich description with trigger phrases when the author declared any.
-    // AUTH1f: the legacy auto-generate-from-description path is gone; the
-    // canonical SKILL.md frontmatter doesn't have a triggers field today, so
-    // this list is usually empty and the description falls through unmodified.
+    // AUTH2a: trigger phrases are now declared via vh_triggers in SKILL.md
+    // frontmatter. They are lowercased and deduplicated at load time.
+    // Skills without vh_triggers have an empty list and fall through unmodified.
     let triggers = pkg.manifest.triggers.clone();
 
     let description = if triggers.is_empty() {

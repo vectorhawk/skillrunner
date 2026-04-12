@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [dependencies]
 anyhow.workspace = true
 camino.workspace = true

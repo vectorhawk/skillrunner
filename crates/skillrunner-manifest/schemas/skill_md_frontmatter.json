@@ -148,11 +148,18 @@
       "minLength": 1,
       "pattern": "\\.ya?ml$",
       "description": "VectorHawk: relative path to a sibling workflow.yaml file. Escape hatch for workflows too large or complex to inline. Mutually exclusive with vh_workflow. The referenced file is parsed as existing workflow.yaml format (reuses Workflow type verbatim)."
+    },
+
+    "vh_triggers": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 3, "maxLength": 200 },
+      "maxItems": 10,
+      "description": "Trigger phrases that help AI clients decide when to invoke this skill. Lowercased and deduplicated at load time. Examples: ['compare contracts', 'diff legal documents']. AUTH2a."
     }
   },
 
   "patternProperties": {
-    "^vh_(?!version$|publisher$|permissions$|execution$|model$|schemas$|workflow$|workflow_ref$).*$": {
+    "^vh_(?!version$|publisher$|permissions$|execution$|model$|schemas$|workflow$|workflow_ref$|triggers$).*$": {
       "not": {},
       "description": "Reject any vh_*-prefixed field not in the explicit allowlist above. This is the namespace guard: unknown vh_* fields are rejected at compile time so typos and outdated authoring guides surface as hard errors, not silent drops."
     }
