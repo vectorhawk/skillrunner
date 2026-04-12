@@ -78,7 +78,7 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
     // Authoring tools (always available)
     tools.push(ToolDefinition {
         name: "skillclub_author".to_string(),
-        description: "Create a new SkillClub skill from a name and system prompt. Scaffolds a complete skill bundle directory ready for validation and publishing.".to_string(),
+        description: "Create a new SkillClub skill from a name and system prompt. Analyzes the prompt and returns smart recommendations for triggers, permissions, model, and execution settings. Use skillclub_author_confirm to finalize.".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -94,10 +94,69 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
                     "type": "string",
                     "description": "The system prompt that defines the skill's behavior"
                 },
-                "triggers": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["interactive", "accept_suggestions", "skip_metadata"],
+                    "description": "Authoring mode. 'interactive' (default): returns recommendations for review. 'accept_suggestions': auto-accepts all recommendations and scaffolds immediately. 'skip_metadata': scaffolds with bare defaults, no analysis."
+                },
+                "output_dir": {
+                    "type": "string",
+                    "description": "Directory to create the skill bundle in (default: current directory)"
+                }
+            },
+            "required": ["name", "system_prompt"]
+        }),
+    });
+
+    tools.push(ToolDefinition {
+        name: "skillclub_author_confirm".to_string(),
+        description: "Finalize skill creation after reviewing recommendations from skillclub_author. Scaffolds the skill bundle with the confirmed metadata values.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Skill name (same as passed to skillclub_author)"
+                },
+                "system_prompt": {
+                    "type": "string",
+                    "description": "System prompt (same as passed to skillclub_author)"
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Skill description"
+                },
+                "vh_triggers": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Trigger phrases that help AI clients decide when to invoke this skill (e.g., ['compare contracts', 'diff legal docs'])"
+                    "description": "Confirmed trigger phrases"
+                },
+                "vh_permissions": {
+                    "type": "object",
+                    "properties": {
+                        "network": { "type": "string" },
+                        "filesystem": { "type": "string" },
+                        "clipboard": { "type": "string" }
+                    },
+                    "description": "Confirmed permission settings"
+                },
+                "vh_model": {
+                    "type": "object",
+                    "properties": {
+                        "min_params_b": { "type": "number" },
+                        "recommended": { "type": "array", "items": { "type": "string" } },
+                        "fallback": { "type": "string" }
+                    },
+                    "description": "Confirmed model settings"
+                },
+                "vh_execution": {
+                    "type": "object",
+                    "properties": {
+                        "timeout_ms": { "type": "integer" },
+                        "memory_mb": { "type": "integer" },
+                        "sandbox": { "type": "string" }
+                    },
+                    "description": "Confirmed execution settings"
                 },
                 "output_dir": {
                     "type": "string",
@@ -572,6 +631,7 @@ pub fn handle_tool_call(
         "skillclub_uninstall" => handle_uninstall(arguments, state),
         "skillclub_info" => handle_info(arguments, state),
         "skillclub_author" => handle_author(arguments),
+        "skillclub_author_confirm" => handle_author_confirm(arguments),
         "skillclub_validate" => handle_validate(arguments),
         "skillclub_publish" => handle_publish(arguments, state, registry_url),
         "skillclub_login" => handle_login(arguments, state, registry_url),
@@ -856,7 +916,91 @@ fn handle_author(arguments: &serde_json::Value) -> ToolCallResult {
         None => return ToolCallResult::error("Missing required parameter: name"),
     };
 
-    // Description is now optional — auto-generate from name if omitted
+    let description = arguments
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("A skill that helps with {}", name.to_lowercase()));
+
+    let system_prompt = match arguments.get("system_prompt").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return ToolCallResult::error("Missing required parameter: system_prompt"),
+    };
+
+    let mode = arguments
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("interactive");
+
+    let output_dir = arguments
+        .get("output_dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or(".");
+
+    match mode {
+        "skip_metadata" => {
+            // Scaffold immediately with bare defaults, no analysis
+            scaffold_skill_bundle(name, &description, system_prompt, output_dir, None)
+        }
+        "accept_suggestions" => {
+            // Run recommendation engine, scaffold immediately with recommendations
+            let rec = skillrunner_core::recommend::recommend_from_prompt(
+                name,
+                &description,
+                system_prompt,
+            );
+            scaffold_skill_bundle(name, &description, system_prompt, output_dir, Some(&rec))
+        }
+        _ => {
+            // "interactive" (default): run recommendation engine, return for review
+            let rec = skillrunner_core::recommend::recommend_from_prompt(
+                name,
+                &description,
+                system_prompt,
+            );
+            let result = serde_json::json!({
+                "status": "recommendations_ready",
+                "skill_id": skillrunner_manifest::to_skill_id(name),
+                "recommendations": {
+                    "vh_triggers": rec.triggers,
+                    "vh_permissions": {
+                        "network": rec.permissions.network,
+                        "filesystem": rec.permissions.filesystem,
+                        "clipboard": rec.permissions.clipboard,
+                    },
+                    "vh_model": {
+                        "min_params_b": rec.model.min_params_b,
+                        "recommended": rec.model.recommended,
+                        "fallback": rec.model.fallback,
+                    },
+                    "vh_execution": {
+                        "timeout_ms": rec.execution.timeout_ms,
+                        "memory_mb": rec.execution.memory_mb,
+                        "sandbox": rec.execution.sandbox,
+                    },
+                },
+                "confidence": format!("{:?}", rec.confidence).to_lowercase(),
+                "message": format!(
+                    "I've analyzed your skill '{}' and generated metadata recommendations. \
+                     Review the suggestions above and tell me what to change, or say 'looks good' \
+                     to finalize. Call skillclub_author_confirm with the final values to create the skill.",
+                    name
+                ),
+            });
+            match serde_json::to_string_pretty(&result) {
+                Ok(text) => ToolCallResult::success(text),
+                Err(e) => ToolCallResult::error(format!("Failed to serialize: {e}")),
+            }
+        }
+    }
+}
+
+fn handle_author_confirm(arguments: &serde_json::Value) -> ToolCallResult {
+    let name = match arguments.get("name").and_then(|v| v.as_str()) {
+        Some(n) => n,
+        None => return ToolCallResult::error("Missing required parameter: name"),
+    };
+
     let description = arguments
         .get("description")
         .and_then(|v| v.as_str())
@@ -873,9 +1017,21 @@ fn handle_author(arguments: &serde_json::Value) -> ToolCallResult {
         .and_then(|v| v.as_str())
         .unwrap_or(".");
 
-    // Optional triggers for tool registration
-    let triggers: Vec<String> = arguments
-        .get("triggers")
+    let rec = build_recommendations_from_args(arguments);
+
+    scaffold_skill_bundle(name, &description, system_prompt, output_dir, Some(&rec))
+}
+
+fn build_recommendations_from_args(
+    args: &serde_json::Value,
+) -> skillrunner_core::recommend::Recommendations {
+    use skillrunner_core::recommend::{
+        RecommendationConfidence, RecommendedExecution, RecommendedModel, RecommendedPermissions,
+        Recommendations,
+    };
+
+    let triggers = args
+        .get("vh_triggers")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
@@ -884,54 +1040,155 @@ fn handle_author(arguments: &serde_json::Value) -> ToolCallResult {
         })
         .unwrap_or_default();
 
-    // Build SKILL.md content with optional fields
-    let mut frontmatter = format!("---\nname: {name}\ndescription: {description}\n");
-    if !triggers.is_empty() {
-        frontmatter.push_str(&format!(
-            "triggers:\n{}\n",
-            triggers
-                .iter()
-                .map(|t| format!("  - {t}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
+    let perms_obj = args.get("vh_permissions");
+    let permissions = RecommendedPermissions {
+        network: perms_obj
+            .and_then(|o| o.get("network"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("none")
+            .to_string(),
+        filesystem: perms_obj
+            .and_then(|o| o.get("filesystem"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("none")
+            .to_string(),
+        clipboard: perms_obj
+            .and_then(|o| o.get("clipboard"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("none")
+            .to_string(),
+    };
+
+    let model_obj = args.get("vh_model");
+    let model = RecommendedModel {
+        min_params_b: model_obj
+            .and_then(|o| o.get("min_params_b"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0),
+        recommended: model_obj
+            .and_then(|o| o.get("recommended"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec!["gemma3:4b".to_string()]),
+        fallback: model_obj
+            .and_then(|o| o.get("fallback"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("error")
+            .to_string(),
+    };
+
+    let exec_obj = args.get("vh_execution");
+    let execution = RecommendedExecution {
+        timeout_ms: exec_obj
+            .and_then(|o| o.get("timeout_ms"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(30000),
+        memory_mb: exec_obj
+            .and_then(|o| o.get("memory_mb"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(256),
+        sandbox: exec_obj
+            .and_then(|o| o.get("sandbox"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("strict")
+            .to_string(),
+    };
+
+    Recommendations {
+        triggers,
+        permissions,
+        model,
+        execution,
+        // Confidence is irrelevant for confirmed values
+        confidence: RecommendationConfidence::High,
     }
-    frontmatter.push_str("---\n");
+}
 
-    let skill_md = format!("{frontmatter}\n{system_prompt}\n");
-
+fn scaffold_skill_bundle(
+    name: &str,
+    description: &str,
+    system_prompt: &str,
+    output_dir: &str,
+    recommendations: Option<&skillrunner_core::recommend::Recommendations>,
+) -> ToolCallResult {
     let out = Utf8PathBuf::from(output_dir);
-
-    // Create output directory and write SKILL.md there.
-    // import_skill_md will create the skill-id subdirectory.
     if let Err(e) = fs::create_dir_all(&out) {
         return ToolCallResult::error(format!("Failed to create directory {out}: {e}"));
     }
 
+    // Write a minimal SKILL.md so import_skill_md can derive the skill ID
+    // and scaffold the bundle directory structure (workflow, schemas, prompts).
+    let minimal_md = format!(
+        "---\nname: {name}\ndescription: {description}\nlicense: Apache-2.0\n---\n\n{system_prompt}\n"
+    );
     let skill_md_path = out.join("SKILL.md");
-    if let Err(e) = fs::write(&skill_md_path, &skill_md) {
+    if let Err(e) = fs::write(&skill_md_path, &minimal_md) {
         return ToolCallResult::error(format!("Failed to write SKILL.md: {e}"));
     }
 
-    // Import SKILL.md to scaffold the full bundle
-    match import_skill_md(&skill_md_path) {
-        Ok(bundle) => {
-            let files: Vec<&str> = bundle.files.iter().map(|f| f.as_str()).collect();
-            let result = serde_json::json!({
-                "skill_id": bundle.id,
-                "output_dir": bundle.output_dir.to_string(),
-                "files": files,
-                "message": format!(
-                    "Created skill '{}' at {}. You can test it with: skillrunner skill validate {}",
-                    bundle.id, bundle.output_dir, bundle.output_dir
-                ),
-            });
-            match serde_json::to_string_pretty(&result) {
-                Ok(text) => ToolCallResult::success(text),
-                Err(e) => ToolCallResult::error(format!("Failed to serialize result: {e}")),
+    let bundle = match import_skill_md(&skill_md_path) {
+        Ok(b) => b,
+        Err(e) => return ToolCallResult::error(format!("Failed to scaffold skill bundle: {e}")),
+    };
+
+    // When recommendations are provided, overwrite the bundle's SKILL.md with
+    // the full-metadata version (import_skill_md generates defaults; we need
+    // to inject the vh_* fields the user confirmed or we inferred).
+    if let Some(rec) = recommendations {
+        let mut fm = format!(
+            "---\nname: {name}\ndescription: {description}\nlicense: Apache-2.0\n"
+        );
+
+        if !rec.triggers.is_empty() {
+            fm.push_str("vh_triggers:\n");
+            for t in &rec.triggers {
+                fm.push_str(&format!("  - \"{t}\"\n"));
             }
         }
-        Err(e) => ToolCallResult::error(format!("Failed to scaffold skill bundle: {e}")),
+        fm.push_str(&format!(
+            "vh_permissions:\n  network: {}\n  filesystem: {}\n  clipboard: {}\n",
+            rec.permissions.network, rec.permissions.filesystem, rec.permissions.clipboard
+        ));
+        fm.push_str(&format!(
+            "vh_model:\n  min_params_b: {}\n  recommended:\n",
+            rec.model.min_params_b
+        ));
+        for m in &rec.model.recommended {
+            fm.push_str(&format!("    - \"{m}\"\n"));
+        }
+        fm.push_str(&format!("  fallback: {}\n", rec.model.fallback));
+        fm.push_str(&format!(
+            "vh_execution:\n  timeout_ms: {}\n  memory_mb: {}\n  sandbox: {}\n",
+            rec.execution.timeout_ms, rec.execution.memory_mb, rec.execution.sandbox
+        ));
+        fm.push_str("vh_workflow_ref: workflow.yaml\n---\n");
+        let full_md = format!("{fm}\n{system_prompt}\n");
+
+        let bundle_skill_md = bundle.output_dir.join("SKILL.md");
+        if let Err(e) = fs::write(&bundle_skill_md, &full_md) {
+            return ToolCallResult::error(format!(
+                "Failed to write metadata SKILL.md to bundle: {e}"
+            ));
+        }
+    }
+
+    let files: Vec<&str> = bundle.files.iter().map(|f| f.as_str()).collect();
+    let result = serde_json::json!({
+        "skill_id": bundle.id,
+        "output_dir": bundle.output_dir.to_string(),
+        "files": files,
+        "message": format!(
+            "Created skill '{}' at {}. You can test it with: skillrunner skill validate {}",
+            bundle.id, bundle.output_dir, bundle.output_dir
+        ),
+    });
+    match serde_json::to_string_pretty(&result) {
+        Ok(text) => ToolCallResult::success(text),
+        Err(e) => ToolCallResult::error(format!("Failed to serialize: {e}")),
     }
 }
 
@@ -2263,6 +2520,7 @@ mod tests {
         assert!(names.contains(&"skillclub_install"));
         assert!(names.contains(&"skillclub_info"));
         assert!(names.contains(&"skillclub_author"));
+        assert!(names.contains(&"skillclub_author_confirm"));
         assert!(names.contains(&"skillclub_validate"));
         assert!(names.contains(&"skillclub_publish"));
 
@@ -2469,6 +2727,7 @@ mod tests {
             "name": "My Test Skill",
             "description": "Does something useful",
             "system_prompt": "You are a helpful assistant.",
+            "mode": "skip_metadata",
             "output_dir": out_dir.as_str(),
         }));
 
@@ -2512,6 +2771,157 @@ mod tests {
         }));
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("system_prompt"));
+    }
+
+    #[test]
+    fn handle_author_interactive_returns_recommendations() {
+        let result = handle_author(&serde_json::json!({
+            "name": "Contract Compare",
+            "system_prompt": "You compare two legal contracts and highlight differences.",
+        }));
+        assert!(result.is_error.is_none());
+        let text = &result.content[0].text;
+        assert!(
+            text.contains("recommendations_ready"),
+            "expected recommendations, got: {text}"
+        );
+        assert!(text.contains("vh_triggers"), "should include triggers");
+        assert!(text.contains("vh_permissions"), "should include permissions");
+        assert!(text.contains("vh_model"), "should include model");
+        assert!(text.contains("vh_execution"), "should include execution");
+    }
+
+    #[test]
+    fn handle_author_accept_suggestions_scaffolds_with_metadata() {
+        let out_dir = temp_root("author-accept");
+        fs::create_dir_all(&out_dir).unwrap();
+
+        let result = handle_author(&serde_json::json!({
+            "name": "API Fetcher",
+            "description": "Fetches data from REST APIs",
+            "system_prompt": "You fetch data from API endpoints and format the JSON response.",
+            "mode": "accept_suggestions",
+            "output_dir": out_dir.as_str(),
+        }));
+
+        assert!(
+            result.is_error.is_none(),
+            "got: {:?}",
+            result.content[0].text
+        );
+
+        let skill_dir = out_dir.join("api-fetcher");
+        let skill_md = fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        assert!(
+            skill_md.contains("vh_triggers"),
+            "SKILL.md should have triggers"
+        );
+        assert!(
+            skill_md.contains("vh_permissions"),
+            "SKILL.md should have permissions"
+        );
+        assert!(
+            skill_md.contains("vh_model"),
+            "SKILL.md should have model"
+        );
+        assert!(
+            skill_md.contains("vh_execution"),
+            "SKILL.md should have execution"
+        );
+
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn handle_author_skip_metadata_scaffolds_bare() {
+        let out_dir = temp_root("author-skip");
+        fs::create_dir_all(&out_dir).unwrap();
+
+        let result = handle_author(&serde_json::json!({
+            "name": "Simple Skill",
+            "system_prompt": "You help with things.",
+            "mode": "skip_metadata",
+            "output_dir": out_dir.as_str(),
+        }));
+
+        assert!(
+            result.is_error.is_none(),
+            "got: {:?}",
+            result.content[0].text
+        );
+
+        let skill_dir = out_dir.join("simple-skill");
+        let skill_md = fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        assert!(
+            !skill_md.contains("vh_triggers"),
+            "skip_metadata should not add triggers"
+        );
+
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn handle_author_confirm_scaffolds_with_provided_values() {
+        let out_dir = temp_root("author-confirm");
+        fs::create_dir_all(&out_dir).unwrap();
+
+        let result = handle_author_confirm(&serde_json::json!({
+            "name": "My Confirmed Skill",
+            "system_prompt": "You do confirmed things.",
+            "description": "A confirmed skill",
+            "vh_triggers": ["do confirmed things", "help with confirmation"],
+            "vh_permissions": {
+                "network": "registry",
+                "filesystem": "none",
+                "clipboard": "none"
+            },
+            "vh_model": {
+                "min_params_b": 7.0,
+                "recommended": ["llama3.2:8b"],
+                "fallback": "error"
+            },
+            "vh_execution": {
+                "timeout_ms": 60000,
+                "memory_mb": 512,
+                "sandbox": "relaxed"
+            },
+            "output_dir": out_dir.as_str(),
+        }));
+
+        assert!(
+            result.is_error.is_none(),
+            "got: {:?}",
+            result.content[0].text
+        );
+
+        let skill_dir = out_dir.join("my-confirmed-skill");
+        let skill_md = fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+        assert!(
+            skill_md.contains("do confirmed things"),
+            "should contain provided trigger"
+        );
+        assert!(
+            skill_md.contains("network: registry"),
+            "should contain provided permission"
+        );
+        assert!(
+            skill_md.contains("min_params_b: 7"),
+            "should contain provided model param"
+        );
+        assert!(
+            skill_md.contains("timeout_ms: 60000"),
+            "should contain provided timeout"
+        );
+
+        let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn handle_author_confirm_requires_name() {
+        let result = handle_author_confirm(&serde_json::json!({
+            "system_prompt": "test",
+        }));
+        assert_eq!(result.is_error, Some(true));
     }
 
     #[test]
