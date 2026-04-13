@@ -15,6 +15,7 @@ pub mod plugin_import;
 pub mod policy;
 #[cfg(feature = "registry")]
 pub mod registry;
+pub mod ratings;
 pub mod recommend;
 pub mod resolver;
 pub mod state;

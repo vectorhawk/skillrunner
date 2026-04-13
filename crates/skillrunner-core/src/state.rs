@@ -83,6 +83,27 @@ impl AppState {
                 installed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS skill_execution_counts (
+                skill_id        TEXT NOT NULL,
+                version         TEXT NOT NULL,
+                count           INTEGER NOT NULL DEFAULT 0,
+                total_runs      INTEGER NOT NULL DEFAULT 0,
+                successful_runs INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (skill_id, version)
+            );
+
+            CREATE TABLE IF NOT EXISTS skill_ratings (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                skill_id    TEXT NOT NULL,
+                version     TEXT NOT NULL,
+                rating      TEXT NOT NULL CHECK (rating IN ('up', 'down')),
+                rated_at    INTEGER NOT NULL,
+                synced      INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_skill_ratings_one_per_version
+                ON skill_ratings (skill_id, version);
             "#,
         )?;
 

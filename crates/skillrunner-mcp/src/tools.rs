@@ -481,6 +481,27 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
         }),
     });
 
+    // Rating tool — always available once any skill is installed
+    tools.push(ToolDefinition {
+        name: "skillclub_rate".to_string(),
+        description: "Rate a skill after using it. Call this when the user gives a thumbs up or thumbs down on a skill result. Records the rating locally and syncs it to the registry.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "skill_id": {
+                    "type": "string",
+                    "description": "The skill ID to rate"
+                },
+                "rating": {
+                    "type": "string",
+                    "enum": ["up", "down"],
+                    "description": "thumbs up or thumbs down"
+                }
+            },
+            "required": ["skill_id", "rating"]
+        }),
+    });
+
     tools.push(ToolDefinition {
         name: "skillclub_plugin_export".to_string(),
         description: "Export a SkillClub plugin to Claude Code plugin or .mcpb Desktop Extension \
@@ -649,6 +670,7 @@ pub fn handle_tool_call(
         "skillclub_plugin_publish" => handle_plugin_publish(arguments, state, registry_url),
         "skillclub_plugin_export" => handle_plugin_export(arguments),
         "skillclub_plugin_import" => handle_plugin_import(arguments),
+        "skillclub_rate" => handle_rate(arguments, state),
         _ => handle_skill_run(
             name,
             arguments,
@@ -2376,6 +2398,52 @@ fn handle_plugin_import(arguments: &serde_json::Value) -> ToolCallResult {
     }
 }
 
+// ── Rating handler ───────────────────────────────────────────────────────────
+
+fn handle_rate(arguments: &serde_json::Value, state: &AppState) -> ToolCallResult {
+    let skill_id = match arguments.get("skill_id").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return ToolCallResult::error("Missing required parameter: skill_id"),
+    };
+
+    let rating = match arguments.get("rating").and_then(|v| v.as_str()) {
+        Some(r) if r == "up" || r == "down" => r,
+        Some(other) => {
+            return ToolCallResult::error(format!(
+                "Invalid rating '{other}': must be 'up' or 'down'"
+            ))
+        }
+        None => return ToolCallResult::error("Missing required parameter: rating"),
+    };
+
+    // Look up the active version for this skill.
+    let version: String = match Connection::open(&state.db_path) {
+        Ok(conn) => conn
+            .query_row(
+                "SELECT active_version FROM installed_skills WHERE skill_id = ?1",
+                rusqlite::params![skill_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "unknown".to_string()),
+        Err(_) => "unknown".to_string(),
+    };
+
+    match Connection::open(&state.db_path) {
+        Ok(conn) => {
+            match skillrunner_core::ratings::record_rating(&conn, skill_id, &version, rating) {
+                Ok(()) => {
+                    let label = if rating == "up" { "Thumbs up" } else { "Thumbs down" };
+                    ToolCallResult::success(format!(
+                        "{label} recorded for {skill_id}. Thanks for the feedback!"
+                    ))
+                }
+                Err(e) => ToolCallResult::error(format!("Failed to record rating: {e}")),
+            }
+        }
+        Err(e) => ToolCallResult::error(format!("Failed to open database: {e}")),
+    }
+}
+
 // ── Skill execution handler ──────────────────────────────────────────────────
 
 fn handle_skill_run(
@@ -2428,14 +2496,56 @@ fn handle_skill_run(
                     })
                 });
 
-            let text = match &output {
+            let mut text = match &output {
                 serde_json::Value::String(s) => s.clone(),
                 other => serde_json::to_string_pretty(other).unwrap_or_default(),
             };
 
+            // Increment execution count and conditionally append the rating prompt.
+            // Open a separate connection so failures here never block the response.
+            if let Ok(conn) = Connection::open(&state.db_path) {
+                let version_str = result.version.clone();
+                let prompt_due =
+                    match skillrunner_core::ratings::increment_execution_count(
+                        &conn,
+                        &result.skill_id,
+                        &version_str,
+                    ) {
+                        Ok(count) => skillrunner_core::ratings::should_prompt_for_rating(count),
+                        Err(_) => false,
+                    };
+
+                if prompt_due {
+                    let already_rated = skillrunner_core::ratings::has_existing_rating(
+                        &conn,
+                        &result.skill_id,
+                        &version_str,
+                    )
+                    .unwrap_or(true); // default to true (suppress) on error
+
+                    if !already_rated {
+                        text.push_str(
+                            "\n\n---\nWas this skill helpful? Reply 'thumbs up' or 'thumbs down'.",
+                        );
+                    }
+                }
+            }
+
             ToolCallResult::success(text)
         }
-        Err(e) => ToolCallResult::error(format!("Skill execution failed: {e}")),
+        Err(e) => {
+            // Record failure in execution stats so the registry can track success rate.
+            // Best-effort: open a separate connection so errors here never mask the real error.
+            if let Ok(conn) = Connection::open(&state.db_path) {
+                // Extract skill_id+version from resolver or fall back to the name we were given.
+                // At this point we don't have a resolved version, so we record against the
+                // skill_id string with an empty version sentinel that the registry can ignore.
+                let _ = skillrunner_core::ratings::record_failed_execution(
+                    &conn, skill_id, "unknown",
+                );
+            }
+            ToolCallResult::error(format!("Skill execution failed: {e}"))
+        }
     }
 }
 

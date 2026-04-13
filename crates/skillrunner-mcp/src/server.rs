@@ -47,6 +47,10 @@ struct ServerState {
     last_skill_sync: Option<Instant>,
     /// Time of the last audit buffer flush.
     last_audit_flush: Option<Instant>,
+    /// Time of the last unsynced-ratings upload.
+    last_ratings_flush: Option<Instant>,
+    /// Time of the last execution-stats upload.
+    last_exec_stats_flush: Option<Instant>,
     /// Time of the last unmanaged server scan.
     last_unmanaged_scan: Option<Instant>,
     /// Cached machine hostname for audit events.
@@ -62,6 +66,8 @@ impl ServerState {
             last_aggregated_tool_count: 0,
             last_skill_sync: None,
             last_audit_flush: None,
+            last_ratings_flush: None,
+            last_exec_stats_flush: None,
             last_unmanaged_scan: None,
             machine_id: crate::setup::get_machine_id(),
         }
@@ -127,6 +133,98 @@ impl ServerState {
             Ok(0) => {}
             Ok(n) => info!(count = n, "flushed audit events to registry"),
             Err(e) => warn!(error = %e, "audit flush failed"),
+        }
+    }
+
+    /// Upload unsynced skill ratings to the registry on the same 300 s throttle.
+    fn maybe_flush_ratings(&mut self, app_state: &AppState) {
+        let should_flush = match self.last_ratings_flush {
+            None => true,
+            Some(t) => t.elapsed() >= AGGREGATOR_REFRESH_INTERVAL,
+        };
+
+        if !should_flush {
+            return;
+        }
+
+        let Some(registry) = &self.registry_client else {
+            return;
+        };
+
+        self.last_ratings_flush = Some(Instant::now());
+
+        let conn = match rusqlite::Connection::open(&app_state.db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "ratings flush: failed to open database");
+                return;
+            }
+        };
+
+        let unsynced = match skillrunner_core::ratings::get_unsynced_ratings(&conn) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "ratings flush: failed to read unsynced ratings");
+                return;
+            }
+        };
+
+        if unsynced.is_empty() {
+            return;
+        }
+
+        match registry.upload_skill_ratings(&unsynced) {
+            Ok(()) => {
+                let ids: Vec<i64> = unsynced.iter().map(|r| r.id).collect();
+                match skillrunner_core::ratings::mark_ratings_synced(&conn, &ids) {
+                    Ok(()) => info!(count = ids.len(), "flushed skill ratings to registry"),
+                    Err(e) => warn!(error = %e, "failed to mark ratings as synced after upload"),
+                }
+            }
+            Err(e) => warn!(error = %e, "ratings flush: upload failed"),
+        }
+    }
+
+    /// Upload execution stats to the registry on the same 300 s throttle.
+    fn maybe_flush_execution_stats(&mut self, app_state: &AppState) {
+        let should_flush = match self.last_exec_stats_flush {
+            None => true,
+            Some(t) => t.elapsed() >= AGGREGATOR_REFRESH_INTERVAL,
+        };
+
+        if !should_flush {
+            return;
+        }
+
+        let Some(registry) = &self.registry_client else {
+            return;
+        };
+
+        self.last_exec_stats_flush = Some(Instant::now());
+
+        let conn = match rusqlite::Connection::open(&app_state.db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "exec stats flush: failed to open database");
+                return;
+            }
+        };
+
+        let stats = match skillrunner_core::ratings::get_execution_stats(&conn) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "exec stats flush: failed to read execution stats");
+                return;
+            }
+        };
+
+        if stats.is_empty() {
+            return;
+        }
+
+        match registry.upload_execution_stats(&stats) {
+            Ok(()) => info!(count = stats.len(), "flushed execution stats to registry"),
+            Err(e) => warn!(error = %e, "exec stats flush: upload failed"),
         }
     }
 
@@ -349,6 +447,8 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
             let skills = server_state.maybe_sync_skills(&state);
             server_state.maybe_scan_unmanaged(&state);
             server_state.maybe_flush_audit(&state);
+            server_state.maybe_flush_ratings(&state);
+            server_state.maybe_flush_execution_stats(&state);
             (agg, skills)
         } else {
             (false, false)
@@ -507,7 +607,13 @@ fn build_instructions(state: &AppState) -> String {
          directly as tools by their skill ID. \
          \
          When the user asks about 'skills', 'what skills are available', 'what can you do', \
-         or similar queries about capabilities, use skillclub_list and skillclub_search."
+         or similar queries about capabilities, use skillclub_list and skillclub_search. \
+         \
+         PROACTIVE SKILL DISCOVERY: When the user begins a task that could benefit from a \
+         specialized skill, call skillclub_search with relevant keywords before proceeding \
+         manually. If a matching skill exists and is approved for their organization, mention \
+         it to the user and offer to install it. Do not search more than once per conversation \
+         topic. If the user declines, proceed without the skill."
     )
 }
 

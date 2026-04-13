@@ -640,6 +640,103 @@ impl RegistryClient {
             None
         }
     }
+
+    /// Upload a batch of skill ratings to the registry.
+    ///
+    /// Posts to `POST /api/runner/skill-ratings`. Requires that `auth_token` is
+    /// set (via [`with_auth`]) for authenticated registries; the endpoint may
+    /// also accept unauthenticated requests depending on registry policy.
+    ///
+    /// On success, callers should call
+    /// [`ratings::mark_ratings_synced`](crate::ratings::mark_ratings_synced)
+    /// with the uploaded IDs.
+    pub fn upload_skill_ratings(
+        &self,
+        ratings: &[crate::ratings::LocalRating],
+    ) -> Result<()> {
+        if ratings.is_empty() {
+            return Ok(());
+        }
+
+        let url = format!(
+            "{}/api/runner/skill-ratings",
+            self.base_url.trim_end_matches('/')
+        );
+
+        let payload = serde_json::json!({
+            "ratings": ratings.iter().map(|r| serde_json::json!({
+                "skill_id": r.skill_id,
+                "version":  r.version,
+                "rating":   r.rating,
+                "rated_at": r.rated_at,
+            })).collect::<Vec<_>>()
+        });
+
+        debug!(url, count = ratings.len(), "uploading skill ratings");
+
+        let mut req = self.http.post(&url).json(&payload);
+        if let Some(token) = &self.auth_token {
+            req = req.bearer_auth(token);
+        }
+
+        let resp = req
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!("rating upload failed (HTTP {status}): {body}");
+        }
+
+        Ok(())
+    }
+
+    /// Upload a batch of execution stats to the registry.
+    ///
+    /// Posts to `POST /api/runner/execution-stats`. Returns immediately if the
+    /// slice is empty (no-op).
+    pub fn upload_execution_stats(
+        &self,
+        stats: &[crate::ratings::ExecutionStats],
+    ) -> Result<()> {
+        if stats.is_empty() {
+            return Ok(());
+        }
+
+        let url = format!(
+            "{}/api/runner/execution-stats",
+            self.base_url.trim_end_matches('/')
+        );
+
+        let payload = serde_json::json!({
+            "stats": stats.iter().map(|s| serde_json::json!({
+                "skill_id":       s.skill_id,
+                "version":        s.version,
+                "total_runs":     s.total_runs,
+                "successful_runs": s.successful_runs,
+            })).collect::<Vec<_>>()
+        });
+
+        debug!(url, count = stats.len(), "uploading execution stats");
+
+        let mut req = self.http.post(&url).json(&payload);
+        if let Some(token) = &self.auth_token {
+            req = req.bearer_auth(token);
+        }
+
+        let resp = req
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!("execution stats upload failed (HTTP {status}): {body}");
+        }
+
+        Ok(())
+    }
 }
 
 // ── HttpPolicyClient ──────────────────────────────────────────────────────────
