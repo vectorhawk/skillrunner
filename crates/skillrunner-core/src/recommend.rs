@@ -398,6 +398,84 @@ fn compute_confidence(
 }
 
 // ---------------------------------------------------------------------------
+// LLM-assisted trigger generation
+// ---------------------------------------------------------------------------
+
+/// Generate richer trigger phrases using a local LLM.
+/// Falls back to heuristic triggers if the LLM call fails or returns unparseable output.
+///
+/// The `model_client` is called synchronously (the trait is not async). Callers
+/// in async contexts should use `tokio::task::spawn_blocking` if blocking is a concern.
+pub fn recommend_triggers_with_llm(
+    name: &str,
+    description: &str,
+    system_prompt: &str,
+    model_client: &dyn crate::model::ModelClient,
+) -> Vec<String> {
+    let analysis_prompt = format!(
+        "You are analyzing an AI skill to generate trigger phrases. \
+         Trigger phrases are short natural-language descriptions of situations \
+         where this skill should be invoked.\n\n\
+         Skill name: {name}\n\
+         Description: {description}\n\
+         System prompt: {system_prompt}\n\n\
+         Generate 3-5 trigger phrases. Each should be 3-10 words, lowercase, \
+         describing when a user would want this skill.\n\n\
+         Respond with ONLY a JSON array of strings. Example:\n\
+         [\"compare two contracts\", \"find differences in legal docs\", \"review agreement changes\"]\n\n\
+         JSON array:"
+    );
+
+    let request = crate::model::ModelRequest {
+        system_prompt: String::new(),
+        user_message: analysis_prompt,
+        json_output: false,
+    };
+
+    match model_client.generate(request) {
+        Ok(response) => parse_trigger_response(&response.text)
+            .unwrap_or_else(|| build_triggers(name, description)),
+        Err(_) => {
+            // LLM unavailable — fall back to heuristic triggers.
+            build_triggers(name, description)
+        }
+    }
+}
+
+/// Try to extract a JSON array of strings from an LLM response.
+/// Returns None if parsing fails.
+fn parse_trigger_response(response: &str) -> Option<Vec<String>> {
+    let trimmed = response.trim();
+
+    // Try direct parse first.
+    if let Ok(arr) = serde_json::from_str::<Vec<String>>(trimmed) {
+        return Some(filter_triggers(arr));
+    }
+
+    // Try to find a JSON array within the response (handles markdown fences and prose wrappers).
+    if let Some(start) = trimmed.find('[') {
+        if let Some(end) = trimmed.rfind(']') {
+            if end > start {
+                let slice = &trimmed[start..=end];
+                if let Ok(arr) = serde_json::from_str::<Vec<String>>(slice) {
+                    return Some(filter_triggers(arr));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn filter_triggers(raw: Vec<String>) -> Vec<String> {
+    raw.into_iter()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| s.len() >= 3 && s.len() <= 200)
+        .take(10)
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -624,6 +702,102 @@ mod tests {
         for t in &rec.triggers {
             assert!(t.len() >= 3, "trigger '{}' is shorter than 3 chars", t);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // LLM trigger generation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_trigger_response_valid_json() {
+        let response = r#"["compare contracts", "diff legal docs", "review changes"]"#;
+        let result = parse_trigger_response(response).unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], "compare contracts");
+    }
+
+    #[test]
+    fn parse_trigger_response_with_markdown_fences() {
+        let response = "Here are the triggers:\n```json\n[\"trigger one\", \"trigger two\"]\n```";
+        let result = parse_trigger_response(response).unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn parse_trigger_response_with_extra_text() {
+        let response = "Based on the skill, here are triggers: [\"do something\", \"help with task\"] I hope this helps!";
+        let result = parse_trigger_response(response).unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn parse_trigger_response_invalid_returns_none() {
+        let result = parse_trigger_response("This is not JSON at all");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn filter_triggers_removes_short_and_long() {
+        let raw = vec![
+            "ab".to_string(),
+            "valid trigger".to_string(),
+            "x".repeat(201),
+        ];
+        let result = filter_triggers(raw);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0], "valid trigger");
+    }
+
+    #[test]
+    fn recommend_triggers_with_llm_uses_llm_response() {
+        let mock = crate::model::MockModelClient::new(
+            r#"["analyze the contract", "compare legal docs", "review agreement"]"#,
+        );
+        let triggers = recommend_triggers_with_llm(
+            "Contract Compare",
+            "Compares two contracts",
+            "You compare contracts.",
+            &mock,
+        );
+        assert_eq!(triggers.len(), 3);
+        assert_eq!(triggers[0], "analyze the contract");
+    }
+
+    #[test]
+    fn recommend_triggers_with_llm_falls_back_on_bad_response() {
+        use anyhow::anyhow;
+
+        struct FailingClient;
+        impl crate::model::ModelClient for FailingClient {
+            fn generate(
+                &self,
+                _request: crate::model::ModelRequest,
+            ) -> anyhow::Result<crate::model::ModelResponse> {
+                Err(anyhow!("Ollama unavailable"))
+            }
+        }
+
+        let triggers = recommend_triggers_with_llm(
+            "Contract Compare",
+            "Compares two contracts",
+            "You compare contracts.",
+            &FailingClient,
+        );
+        // Falls back to heuristic — must produce at least one trigger.
+        assert!(!triggers.is_empty());
+    }
+
+    #[test]
+    fn recommend_triggers_with_llm_falls_back_on_unparseable_response() {
+        let mock = crate::model::MockModelClient::new("This is not valid JSON at all.");
+        let triggers = recommend_triggers_with_llm(
+            "Contract Compare",
+            "Compares two contracts",
+            "You compare contracts.",
+            &mock,
+        );
+        // Falls back to heuristic — should produce the rearranged name trigger.
+        assert!(triggers.iter().any(|t| t.contains("contract") || t.contains("compare")));
     }
 
     #[test]
