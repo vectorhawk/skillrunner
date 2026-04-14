@@ -391,7 +391,9 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
     // Create the sampling client (delegates LLM calls to the AI client)
     let sampling_client = McpSamplingClient::from_shared(Arc::clone(&shared_io));
 
-    // Create the hybrid model client: tries Ollama first, falls back to sampling
+    // Create the hybrid model client. The decision of "try local first"
+    // vs "use MCP sampling directly" happens per-call, driven by the
+    // skill's `vh_model.prefer_local` field on the ModelRequest.
     let hybrid_client = HybridModelClient::new(
         if ollama_available {
             Some(&ollama as &dyn ModelClient)
@@ -399,7 +401,6 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
             None
         },
         &sampling_client,
-        ollama_available,
     );
 
     info!(

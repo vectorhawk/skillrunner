@@ -9,6 +9,16 @@ pub struct ModelRequest {
     pub user_message: String,
     /// When true the model is asked to return valid JSON.
     pub json_output: bool,
+    /// Skill's preference for execution backend.
+    ///
+    /// When `true`, the runtime tries a locally-running model first
+    /// (Ollama), falling back to MCP sampling if the local call fails
+    /// or no local model is available. When `false` (the default), the
+    /// runtime uses MCP sampling directly — the AI client handles the
+    /// generation.
+    ///
+    /// Populated from `vh_model.prefer_local` in the skill's manifest.
+    pub prefer_local: bool,
 }
 
 /// Identifies which backend produced a model response.

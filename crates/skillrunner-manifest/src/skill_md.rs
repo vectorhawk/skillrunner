@@ -87,6 +87,8 @@ struct VhModel {
     recommended: Vec<String>,
     #[serde(default)]
     fallback: Option<ModelFallback>,
+    #[serde(default)]
+    prefer_local: Option<bool>,
 }
 
 /// `vh_schemas` sub-object.
@@ -153,6 +155,7 @@ pub(crate) fn load_from_skill_md_dir(root: Utf8PathBuf) -> Result<SkillPackage, 
         min_params_b: m.min_params_b,
         recommended: m.recommended.clone(),
         fallback: m.fallback,
+        prefer_local: m.prefer_local,
     });
 
     let (inputs_schema, outputs_schema) = match &frontmatter.vh_schemas {

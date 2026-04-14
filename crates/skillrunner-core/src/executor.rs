@@ -321,10 +321,18 @@ fn execute_llm_step(pkg: &SkillPackage, p: LlmStepParams<'_>) -> Result<StepResu
     // Resolve step inputs → user message string.
     let user_message = resolve_inputs(step_inputs, run_input, step_outputs);
 
+    let prefer_local = pkg
+        .manifest
+        .model_requirements
+        .as_ref()
+        .and_then(|m| m.prefer_local)
+        .unwrap_or(false);
+
     let request = ModelRequest {
         system_prompt,
         user_message,
         json_output: output_schema_rel.is_some(),
+        prefer_local,
     };
 
     let response = client

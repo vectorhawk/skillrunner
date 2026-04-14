@@ -430,6 +430,7 @@ pub fn recommend_triggers_with_llm(
         system_prompt: String::new(),
         user_message: analysis_prompt,
         json_output: false,
+        prefer_local: false,
     };
 
     match model_client.generate(request) {

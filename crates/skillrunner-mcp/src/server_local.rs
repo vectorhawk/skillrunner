@@ -109,7 +109,6 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
             None
         },
         &sampling_client,
-        ollama_available,
     );
 
     info!(

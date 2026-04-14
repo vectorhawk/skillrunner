@@ -305,6 +305,7 @@ mod tests {
                 system_prompt: "You are helpful.".to_string(),
                 user_message: "Say hello".to_string(),
                 json_output: false,
+                prefer_local: false,
             })
             .unwrap();
 
@@ -329,6 +330,7 @@ mod tests {
                 system_prompt: "test".to_string(),
                 user_message: "test".to_string(),
                 json_output: false,
+                prefer_local: false,
             })
             .expect_err("should fail on 500");
 
@@ -351,6 +353,7 @@ mod tests {
                 system_prompt: "test".to_string(),
                 user_message: "test".to_string(),
                 json_output: false,
+                prefer_local: false,
             })
             .expect_err("should fail on bad json");
 
@@ -376,6 +379,7 @@ mod tests {
                 system_prompt: "Return JSON".to_string(),
                 user_message: "test".to_string(),
                 json_output: true,
+                prefer_local: false,
             })
             .unwrap();
 

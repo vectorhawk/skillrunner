@@ -164,29 +164,23 @@ impl ModelClient for McpSamplingClient {
 pub struct HybridModelClient<'a> {
     ollama: Option<&'a dyn ModelClient>,
     sampling: &'a McpSamplingClient,
-    /// Whether the local model can handle the current skill's requirements.
-    /// Set per-skill-run based on model_requirements check.
-    local_capable: bool,
 }
 
 impl<'a> HybridModelClient<'a> {
     pub fn new(
         ollama: Option<&'a dyn ModelClient>,
         sampling: &'a McpSamplingClient,
-        local_capable: bool,
     ) -> Self {
-        Self {
-            ollama,
-            sampling,
-            local_capable,
-        }
+        Self { ollama, sampling }
     }
 }
 
 impl ModelClient for HybridModelClient<'_> {
     fn generate(&self, request: ModelRequest) -> Result<ModelResponse> {
-        // Try local first if available and capable
-        if self.local_capable {
+        // Per-skill preference: when the skill's manifest declares
+        // `vh_model.prefer_local: true`, try Ollama first. Otherwise we
+        // use MCP sampling directly — the AI client handles the call.
+        if request.prefer_local {
             if let Some(ollama) = self.ollama {
                 match ollama.generate(request.clone()) {
                     Ok(response) => return Ok(response),
@@ -201,7 +195,7 @@ impl ModelClient for HybridModelClient<'_> {
         }
 
         // Delegate to AI client via MCP sampling
-        tracing::info!("Delegating LLM call to AI client via MCP sampling");
+        tracing::debug!("Delegating LLM call to AI client via MCP sampling");
         self.sampling.generate(request)
     }
 }
@@ -237,6 +231,7 @@ mod tests {
                 system_prompt: "You are helpful.".to_string(),
                 user_message: "Say hello".to_string(),
                 json_output: false,
+                prefer_local: false,
             })
             .unwrap();
 
@@ -265,6 +260,7 @@ mod tests {
                 system_prompt: "test".to_string(),
                 user_message: "test".to_string(),
                 json_output: false,
+                prefer_local: false,
             })
             .expect_err("should fail on error response");
 
@@ -289,12 +285,13 @@ mod tests {
         let writer = Box::new(Vec::<u8>::new());
         let sampling = McpSamplingClient::new(writer, reader);
 
-        let hybrid = HybridModelClient::new(Some(&mock), &sampling, true);
+        let hybrid = HybridModelClient::new(Some(&mock), &sampling);
         let result = hybrid
             .generate(ModelRequest {
                 system_prompt: "test".to_string(),
                 user_message: "test".to_string(),
                 json_output: false,
+                prefer_local: true,
             })
             .unwrap();
 
@@ -302,7 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_client_delegates_when_not_capable() {
+    fn hybrid_client_delegates_when_prefer_local_false() {
         use skillrunner_core::model::MockModelClient;
 
         let mock = MockModelClient::new("local response");
@@ -316,12 +313,13 @@ mod tests {
         let writer = Box::new(Vec::<u8>::new());
         let sampling = McpSamplingClient::new(writer, reader);
 
-        let hybrid = HybridModelClient::new(Some(&mock), &sampling, false);
+        let hybrid = HybridModelClient::new(Some(&mock), &sampling);
         let result = hybrid
             .generate(ModelRequest {
                 system_prompt: "test".to_string(),
                 user_message: "test".to_string(),
                 json_output: false,
+                prefer_local: false,
             })
             .unwrap();
 
@@ -340,12 +338,13 @@ mod tests {
         let writer = Box::new(Vec::<u8>::new());
         let sampling = McpSamplingClient::new(writer, reader);
 
-        let hybrid = HybridModelClient::new(None, &sampling, false);
+        let hybrid = HybridModelClient::new(None, &sampling);
         let result = hybrid
             .generate(ModelRequest {
                 system_prompt: "test".to_string(),
                 user_message: "test".to_string(),
                 json_output: false,
+                prefer_local: false,
             })
             .unwrap();
 
@@ -375,12 +374,13 @@ mod tests {
         let writer = Box::new(Vec::<u8>::new());
         let sampling = McpSamplingClient::new(writer, reader);
 
-        let hybrid = HybridModelClient::new(Some(&failing), &sampling, true);
+        let hybrid = HybridModelClient::new(Some(&failing), &sampling);
         let result = hybrid
             .generate(ModelRequest {
                 system_prompt: "test".to_string(),
                 user_message: "test".to_string(),
                 json_output: false,
+                prefer_local: true,
             })
             .unwrap();
 
@@ -426,6 +426,7 @@ mod tests {
                 system_prompt: "test".to_string(),
                 user_message: "test".to_string(),
                 json_output: false,
+                prefer_local: false,
             })
             .unwrap();
 

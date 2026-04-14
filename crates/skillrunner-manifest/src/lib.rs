@@ -133,6 +133,11 @@ pub struct ModelRequirements {
     pub recommended: Vec<String>,
     /// Behavior when no recommended model is available locally.
     pub fallback: Option<ModelFallback>,
+    /// When `true`, the runtime tries a locally-running model first
+    /// (Ollama) and falls back to MCP sampling if that fails or no
+    /// local model is available. When `false` (default), the runtime
+    /// uses MCP sampling directly — the AI client handles generation.
+    pub prefer_local: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

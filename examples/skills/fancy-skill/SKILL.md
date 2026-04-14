@@ -2,7 +2,7 @@
 name: fancy-skill
 description: Transform ordinary text into fancy Regency era English as if written in Regency-era England.
 license: Apache-2.0
-vh_version: 0.4.0
+vh_version: 0.6.0
 vh_publisher: skillclub
 vh_permissions:
   network: none
@@ -12,6 +12,8 @@ vh_execution:
   sandbox: strict
   timeout_ms: 60000
   memory_mb: 512
+vh_model:
+  prefer_local: true
 vh_triggers:
   - rewrite in regency english
   - make text sound old fashioned

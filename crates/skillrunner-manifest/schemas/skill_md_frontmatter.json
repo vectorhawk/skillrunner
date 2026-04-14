@@ -101,6 +101,10 @@
           "type": "string",
           "enum": ["mcp_sampling", "error"],
           "description": "VectorHawk: behavior when no recommended model is available locally. NEW FOR AUTH1."
+        },
+        "prefer_local": {
+          "type": "boolean",
+          "description": "VectorHawk: when true, try a locally-running model (Ollama) first and fall back to MCP sampling if the local call fails. When false (default), use MCP sampling directly — the AI client generates."
         }
       }
     },
