@@ -337,8 +337,20 @@ fn execute_llm_step(pkg: &SkillPackage, p: LlmStepParams<'_>) -> Result<StepResu
 
     // Validate output against schema when present.
     if let (Some(schema_rel), Some(output_val)) = (output_schema_rel, &output) {
-        validate_output(&pkg.root, schema_rel, output_val)
-            .with_context(|| format!("step '{id}' output failed schema validation"))?;
+        validate_output(&pkg.root, schema_rel, output_val).with_context(|| {
+            // Truncate raw output to keep error readable while still showing
+            // enough for the author to diagnose prompt/model issues.
+            let raw = &response.text;
+            let preview = if raw.chars().count() > 500 {
+                format!("{}…", raw.chars().take(500).collect::<String>())
+            } else {
+                raw.clone()
+            };
+            format!(
+                "step '{id}' output failed schema validation (schema: {schema_rel}). \
+                 Model returned: {preview}"
+            )
+        })?;
     }
 
     Ok(StepResult {
