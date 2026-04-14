@@ -758,6 +758,19 @@ impl HttpPolicyClient {
             db_path: state.db_path.clone(),
         }
     }
+
+    /// Delete the cached policy entry for `skill_id` so the next
+    /// `fetch_policy` call re-fetches from the registry.
+    ///
+    /// This is best-effort — callers should ignore errors.
+    pub fn invalidate(&self, skill_id: &str) -> Result<()> {
+        let conn = Connection::open(&self.db_path)?;
+        conn.execute(
+            "DELETE FROM policy_cache WHERE skill_id = ?1",
+            rusqlite::params![skill_id],
+        )?;
+        Ok(())
+    }
 }
 
 impl PolicyClient for HttpPolicyClient {

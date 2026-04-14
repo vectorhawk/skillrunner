@@ -211,6 +211,13 @@ enum SkillCommands {
     Uninstall {
         skill_id: String,
     },
+    /// Update an installed skill to the latest version from the registry
+    Update {
+        skill_id: String,
+        /// VectorHawk registry URL (overrides VECTORHAWK_REGISTRY_URL)
+        #[arg(long)]
+        registry_url: Option<String>,
+    },
     List,
     Resolve {
         skill_id: String,
@@ -940,6 +947,16 @@ fn main() -> Result<()> {
                     Some(version) => println!("Uninstalled {}@{}", skill_id, version),
                     None => println!("Skill '{}' is not installed.", skill_id),
                 }
+            }
+            SkillCommands::Update {
+                skill_id,
+                registry_url,
+            } => {
+                let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
+                let registry = RegistryClient::new(&url);
+                let installed_ver =
+                    install_from_registry(&app.state, &registry, &skill_id, None)?;
+                println!("Updated {} to v{}", skill_id, installed_ver);
             }
             SkillCommands::Install {
                 skill_ref,

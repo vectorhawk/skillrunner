@@ -3,7 +3,7 @@ use crate::protocol::{
     SamplingCreateMessageResult, SamplingMessage,
 };
 use anyhow::{Context, Result};
-use skillrunner_core::model::{ModelClient, ModelRequest, ModelResponse};
+use skillrunner_core::model::{ModelClient, ModelRequest, ModelResponse, ModelSource};
 use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -154,6 +154,7 @@ impl ModelClient for McpSamplingClient {
             prompt_tokens: 0, // Client doesn't report these via MCP sampling
             completion_tokens: 0,
             latency_ms,
+            source: ModelSource::McpSampling,
         })
     }
 }

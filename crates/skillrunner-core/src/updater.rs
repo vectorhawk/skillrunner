@@ -299,6 +299,47 @@ fn query_installed_version(state: &AppState, skill_id: &str) -> Result<Option<St
     Ok(ver)
 }
 
+/// Check whether a newer version of `skill_id` is available in the registry.
+///
+/// Returns `Some(latest_version)` when the registry advertises a version newer
+/// than what is currently installed.  Returns `None` when the skill is already
+/// up-to-date, is not installed, or the registry call fails (caller should
+/// treat `None` as "proceed normally" so registry unavailability is not
+/// user-visible during skill execution).
+///
+/// This function is intentionally read-only — it never installs anything.
+pub fn check_for_update(
+    state: &AppState,
+    registry: &RegistryClient,
+    skill_id: &str,
+) -> Result<Option<Version>> {
+    let installed_str = match query_installed_version(state, skill_id)? {
+        Some(v) => v,
+        None => return Ok(None), // not installed
+    };
+
+    let installed = Version::parse(&installed_str)
+        .with_context(|| format!("installed version '{installed_str}' is not valid semver"))?;
+
+    let detail = registry
+        .fetch_skill_detail(skill_id)
+        .with_context(|| format!("failed to query registry for '{skill_id}'"))?;
+
+    let latest_str = match detail.latest_version {
+        Some(v) => v,
+        None => return Ok(None), // no published versions
+    };
+
+    let latest = Version::parse(&latest_str)
+        .with_context(|| format!("registry returned invalid semver '{latest_str}'"))?;
+
+    if latest > installed {
+        Ok(Some(latest))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Check all installed skills for lifecycle changes and available updates from the registry.
 ///
 /// **Lifecycle phase** (runs first, requires `POST /skills/status`):

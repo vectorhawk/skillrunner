@@ -2,24 +2,47 @@ use crate::protocol::{ToolCallResult, ToolDefinition};
 use anyhow::Result;
 use camino::Utf8PathBuf;
 use rusqlite::Connection;
+use semver::Version;
 use skillrunner_core::{
     auth::{self, AuthClient},
-    executor::run_skill,
+    executor::{run_skill, RunResult},
     import::import_skill_md,
     install::{install_unpacked_skill, uninstall_skill},
     mcp_governance,
-    model::ModelClient,
+    model::{ModelClient, ModelSource},
     policy::PolicyClient,
     registry::RegistryClient,
     state::AppState,
     updater::{
-        install_from_registry, install_plugin_from_registry, package_plugin, tar_gz_skill_source,
+        check_for_update, install_from_registry, install_plugin_from_registry, package_plugin,
+        tar_gz_skill_source,
     },
     validator::validate_bundle,
 };
 use skillrunner_manifest::SkillPackage;
+use std::collections::HashMap;
 use std::fs;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tracing::debug;
+
+/// How long a cached update-check result is considered fresh before a re-check.
+const UPDATE_CHECK_TTL: Duration = Duration::from_secs(600); // 10 minutes
+
+/// A single cached result from a registry update check for one skill.
+pub struct UpdateCheckEntry {
+    /// When this entry was populated.
+    pub checked_at: Instant,
+    /// The latest version from the registry, if it is newer than installed.
+    /// `None` means the skill is already up-to-date, or the check failed.
+    pub latest_version: Option<Version>,
+}
+
+/// Shared update-check cache passed from `ServerState` to the tools layer.
+///
+/// Using `Arc<Mutex<…>>` so `ServerState` can hold it and hand a reference
+/// to `handle_tool_call` without moving or cloning the whole map.
+pub type UpdateCheckCache = Arc<Mutex<HashMap<String, UpdateCheckEntry>>>;
 
 const GOVERNANCE_FOOTER: &str = "\n\n---\nTo add new MCP servers, use /mcp-request. To add plugins, use /plugin-install. Direct installation via /mcp bypasses governance.";
 
@@ -353,6 +376,26 @@ pub fn build_tool_list(state: &AppState, registry_url: &Option<String>) -> Vec<T
         });
     } // end logged_in block for search/publish/logout
 
+    // Update tool — available whenever a registry URL is configured.
+    if registry_url.is_some() {
+        tools.push(ToolDefinition {
+            name: "skillclub_update".to_string(),
+            description: "Update an installed skill to the latest version from the registry. \
+                Call this after skillclub_update notifies you that a newer version is available."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "skill_id": {
+                        "type": "string",
+                        "description": "The skill ID to update"
+                    }
+                },
+                "required": ["skill_id"]
+            }),
+        });
+    }
+
     // Info and import are always available (local operations)
     tools.push(ToolDefinition {
         name: "skillclub_info".to_string(),
@@ -633,9 +676,101 @@ fn skill_to_tool(skill_id: &str, active_path: &str) -> Result<ToolDefinition> {
     })
 }
 
+// ── Update check helpers ─────────────────────────────────────────────────────
+
+/// Consult the update-check cache for `skill_id`.
+///
+/// Returns `Some(ToolCallResult)` (an error-style prompt asking the user to
+/// update or skip) when a newer version is available in the registry.
+/// Returns `None` when the skill is up-to-date, the check failed, or no
+/// registry client is configured — in all of these cases the caller should
+/// proceed with execution as normal.
+fn maybe_build_update_prompt(
+    skill_id: &str,
+    state: &AppState,
+    registry_client: Option<&RegistryClient>,
+    cache: &UpdateCheckCache,
+) -> Option<ToolCallResult> {
+    let registry = registry_client?;
+
+    // Resolve latest version: use a cached result if it is still fresh.
+    let latest_version = {
+        let cached = cache.lock().ok().and_then(|guard| {
+            guard.get(skill_id).and_then(|entry| {
+                if entry.checked_at.elapsed() < UPDATE_CHECK_TTL {
+                    Some(entry.latest_version.clone())
+                } else {
+                    None // stale
+                }
+            })
+        });
+
+        if let Some(from_cache) = cached {
+            from_cache
+        } else {
+            // Cache miss or stale — query the registry (best-effort).
+            let check_result = check_for_update(state, registry, skill_id);
+
+            // If the registry call succeeded, we have fresh network access.
+            // Invalidate the cached policy so the next resolve_skill call
+            // re-fetches the live policy state — which will now show "blocked"
+            // if the skill has been unpublished.
+            if check_result.is_ok() {
+                if let Ok(conn) = Connection::open(&state.db_path) {
+                    let _ = conn.execute(
+                        "DELETE FROM policy_cache WHERE skill_id = ?1",
+                        rusqlite::params![skill_id],
+                    );
+                }
+            }
+
+            let result = check_result.unwrap_or(None);
+
+            // Store the result so the next call within the TTL skips the
+            // network round-trip regardless of the outcome.
+            if let Ok(mut guard) = cache.lock() {
+                guard.insert(
+                    skill_id.to_string(),
+                    UpdateCheckEntry {
+                        checked_at: Instant::now(),
+                        latest_version: result.clone(),
+                    },
+                );
+            }
+
+            result
+        }
+    };
+
+    let latest = latest_version?;
+
+    // There is a newer version — look up the installed version string for the
+    // human-readable prompt.  If we cannot read it, skip the prompt rather
+    // than blocking execution.
+    let installed_str = {
+        let conn = Connection::open(&state.db_path).ok()?;
+        conn.query_row(
+            "SELECT active_version FROM installed_skills WHERE skill_id = ?1",
+            [skill_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()?
+    };
+
+    let message = format!(
+        "Update available: {skill_id} v{installed_str} \u{2192} v{latest}\n\n\
+         Would you like to update before running? You have two options:\n\
+         1. Call skillclub_update(skill_id=\"{skill_id}\") to install v{latest}, then retry.\n\
+         2. Call this skill again with skip_update_check=true to run v{installed_str}."
+    );
+
+    Some(ToolCallResult::error(message))
+}
+
 // ── Tool dispatch ────────────────────────────────────────────────────────────
 
 /// Execute a tool call and return the MCP result.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_tool_call(
     name: &str,
     arguments: &serde_json::Value,
@@ -644,6 +779,7 @@ pub fn handle_tool_call(
     model_client: Option<&dyn ModelClient>,
     registry_client: Option<&RegistryClient>,
     registry_url: &Option<String>,
+    update_check_cache: &UpdateCheckCache,
 ) -> ToolCallResult {
     let result = match name {
         "skillclub_list" => handle_list(state, registry_url),
@@ -671,6 +807,7 @@ pub fn handle_tool_call(
         "skillclub_plugin_export" => handle_plugin_export(arguments),
         "skillclub_plugin_import" => handle_plugin_import(arguments),
         "skillclub_rate" => handle_rate(arguments, state),
+        "skillclub_update" => handle_update(arguments, state, registry_url),
         _ => handle_skill_run(
             name,
             arguments,
@@ -678,6 +815,7 @@ pub fn handle_tool_call(
             policy_client,
             model_client,
             registry_client,
+            update_check_cache,
         ),
     };
 
@@ -871,6 +1009,28 @@ fn handle_uninstall(arguments: &serde_json::Value, state: &AppState) -> ToolCall
         }
         Ok(None) => ToolCallResult::error(format!("Skill '{skill_id}' is not installed.")),
         Err(e) => ToolCallResult::error(format!("Failed to uninstall '{skill_id}': {e}")),
+    }
+}
+
+fn handle_update(
+    arguments: &serde_json::Value,
+    state: &AppState,
+    registry_url: &Option<String>,
+) -> ToolCallResult {
+    let skill_id = match arguments.get("skill_id").and_then(|v| v.as_str()) {
+        Some(id) => id,
+        None => return ToolCallResult::error("Missing required parameter: skill_id"),
+    };
+
+    let url = match registry_url {
+        Some(u) => u,
+        None => return ToolCallResult::error("No registry configured — cannot update skills"),
+    };
+
+    let registry = RegistryClient::new(url);
+    match install_from_registry(state, &registry, skill_id, None) {
+        Ok(version) => ToolCallResult::success(format!("Updated {skill_id} to v{version}")),
+        Err(e) => ToolCallResult::error(format!("Update failed: {e}")),
     }
 }
 
@@ -2446,6 +2606,62 @@ fn handle_rate(arguments: &serde_json::Value, state: &AppState) -> ToolCallResul
 
 // ── Skill execution handler ──────────────────────────────────────────────────
 
+/// Build the one-liner LLM execution prefix for a skill run.
+///
+/// Returns `None` when no LLM steps ran (pure tool/transform workflows).
+/// Returns `Some(prefix_string)` when at least one LLM step fired.
+///
+/// The prefix distinguishes local Ollama from remote MCP sampling, and
+/// collapses multi-step token counts into a single aggregate line.
+fn build_llm_execution_summary(result: &RunResult) -> Option<String> {
+    let llm_steps: Vec<_> = result
+        .steps
+        .iter()
+        .filter(|s| s.model_source.is_some())
+        .collect();
+
+    if llm_steps.is_empty() {
+        return None;
+    }
+
+    let total_prompt: u64 = llm_steps.iter().filter_map(|s| s.prompt_tokens).sum();
+    let total_completion: u64 = llm_steps.iter().filter_map(|s| s.completion_tokens).sum();
+    let total_latency: u64 = llm_steps.iter().filter_map(|s| s.latency_ms).sum();
+    let step_count = llm_steps.len();
+
+    // Determine the dominant source. If any step used MCP sampling we report
+    // that, since it is the more surprising / noteworthy path.
+    let has_sampling = llm_steps
+        .iter()
+        .any(|s| matches!(&s.model_source, Some(ModelSource::McpSampling)));
+
+    let source_label = if has_sampling {
+        "remote model via MCP sampling".to_string()
+    } else {
+        // All local — use the model name from the first LLM step.
+        let model_name = llm_steps
+            .iter()
+            .find_map(|s| match &s.model_source {
+                Some(ModelSource::Local(name)) => Some(name.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "local model".to_string());
+        format!("local model {model_name}")
+    };
+
+    let step_phrase = if step_count == 1 {
+        "1 step".to_string()
+    } else {
+        format!("{step_count} steps")
+    };
+
+    Some(format!(
+        "\u{25b6} Ran {} v{} \u{2014} used {source_label} across {step_phrase} \
+         ({total_prompt}\u{2192}{total_completion} tokens, {total_latency}ms)",
+        result.skill_id, result.version,
+    ))
+}
+
 fn handle_skill_run(
     skill_id: &str,
     arguments: &serde_json::Value,
@@ -2453,6 +2669,7 @@ fn handle_skill_run(
     policy_client: &dyn PolicyClient,
     model_client: Option<&dyn ModelClient>,
     registry_client: Option<&RegistryClient>,
+    update_check_cache: &UpdateCheckCache,
 ) -> ToolCallResult {
     // Check if skill is deactivated before attempting execution
     if let Ok(conn) = Connection::open(&state.db_path) {
@@ -2468,6 +2685,23 @@ fn handle_skill_run(
                     skill_id
                 ));
             }
+        }
+    }
+
+    // Update-check gate: unless the caller passes skip_update_check=true,
+    // query the registry (with a 10-minute cache) and prompt the user if a
+    // newer version is available.  Registry failures are silenced so they
+    // never block the user's actual work.
+    let skip_update_check = arguments
+        .get("skip_update_check")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if !skip_update_check {
+        if let Some(update_prompt) =
+            maybe_build_update_prompt(skill_id, state, registry_client, update_check_cache)
+        {
+            return update_prompt;
         }
     }
 
@@ -2496,9 +2730,19 @@ fn handle_skill_run(
                     })
                 });
 
-            let mut text = match &output {
+            let output_text = match &output {
                 serde_json::Value::String(s) => s.clone(),
                 other => serde_json::to_string_pretty(other).unwrap_or_default(),
+            };
+
+            // Build the full response: LLM summary prefix (if any LLM steps
+            // ran) at the top, skill output in the middle, rating prompt
+            // (when due) at the bottom.
+            let llm_summary = build_llm_execution_summary(&result);
+
+            let mut text = match llm_summary {
+                Some(summary) => format!("{summary}\n\n{output_text}"),
+                None => output_text,
             };
 
             // Increment execution count and conditionally append the rating prompt.
@@ -2544,6 +2788,20 @@ fn handle_skill_run(
                     &conn, skill_id, "unknown",
                 );
             }
+
+            // Surface blocked/unpublished errors with a clear, actionable message
+            // rather than the generic "Skill execution failed" prefix.
+            let err_str = e.to_string();
+            if let Some((_, reason_raw)) = err_str.split_once("is blocked:") {
+                // Extract the reason from the error: "skill '...' is blocked: <reason>"
+                let reason = reason_raw.trim();
+                return ToolCallResult::error(format!(
+                    "\u{26d4} Skill '{skill_id}' is blocked: {reason}\n\n\
+                     If this skill was recently unpublished, run `skillclub_uninstall` to remove it.\n\
+                     If you believe this is an error, contact your administrator."
+                ));
+            }
+
             // Build full error chain so the actual root cause (e.g. jsonschema
             // violation) is visible in the MCP response, not just the outermost
             // context wrap.
@@ -3126,11 +3384,16 @@ mod tests {
         let _ = fs::remove_dir_all(&state_root);
     }
 
+    fn empty_update_cache() -> UpdateCheckCache {
+        Arc::new(Mutex::new(std::collections::HashMap::new()))
+    }
+
     #[test]
     fn handle_skill_run_not_installed() {
         let state_root = temp_root("handle-run-missing");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
         let policy = MockPolicyClient::new();
+        let cache = empty_update_cache();
 
         let result = handle_skill_run(
             "ghost-skill",
@@ -3139,6 +3402,7 @@ mod tests {
             &policy,
             None,
             None,
+            &cache,
         );
         assert_eq!(result.is_error, Some(true));
         assert!(result.content[0].text.contains("not installed"));
@@ -3157,6 +3421,7 @@ mod tests {
         install_unpacked_skill(&state, &pkg).unwrap();
 
         let policy = MockPolicyClient::new();
+        let cache = empty_update_cache();
         let result = handle_skill_run(
             "test-skill",
             &serde_json::json!({"query": "hello"}),
@@ -3164,12 +3429,203 @@ mod tests {
             &policy,
             None, // stub mode
             None,
+            &cache,
         );
         // Stub mode returns no output, so we get the summary
         assert!(result.is_error.is_none());
 
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    // ── Update-check and skillclub_update tests ───────────────────────────
+
+    #[test]
+    fn handle_skill_run_skips_update_check_when_flag_set() {
+        // With skip_update_check=true, the skill should run normally even when
+        // the cache contains an update entry (no registry needed).
+        let state_root = temp_root("run-skip-update");
+        let skill_root = temp_root("run-skip-update-skill");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        write_test_skill(&skill_root);
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg).unwrap();
+
+        // Pre-populate cache with an "update available" entry.
+        let cache: UpdateCheckCache = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        {
+            let mut guard = cache.lock().unwrap();
+            guard.insert(
+                "test-skill".to_string(),
+                UpdateCheckEntry {
+                    checked_at: Instant::now(),
+                    latest_version: Some(Version::parse("9.9.9").unwrap()),
+                },
+            );
+        }
+
+        let policy = MockPolicyClient::new();
+        let result = handle_skill_run(
+            "test-skill",
+            &serde_json::json!({"query": "hello", "skip_update_check": true}),
+            &state,
+            &policy,
+            None,
+            None,
+            &cache,
+        );
+        // Should succeed (not blocked by the update prompt)
+        assert!(
+            result.is_error.is_none(),
+            "expected success, got: {}",
+            result.content[0].text
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    #[test]
+    fn handle_skill_run_returns_update_prompt_when_available() {
+        // When the cache already holds an update entry, the skill should NOT
+        // execute — instead it should return the update prompt as an error.
+        let state_root = temp_root("run-update-prompt");
+        let skill_root = temp_root("run-update-prompt-skill");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        write_test_skill(&skill_root);
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg).unwrap();
+
+        // Use a RegistryClient pointing at a mock server that returns a
+        // higher version.  We bypass the network by pre-seeding the cache
+        // directly so this test remains a unit test.
+        let cache: UpdateCheckCache = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        {
+            let mut guard = cache.lock().unwrap();
+            guard.insert(
+                "test-skill".to_string(),
+                UpdateCheckEntry {
+                    checked_at: Instant::now(),
+                    latest_version: Some(Version::parse("2.0.0").unwrap()),
+                },
+            );
+        }
+
+        let policy = MockPolicyClient::new();
+        // We need a RegistryClient so the update-check gate doesn't short-circuit.
+        // Point it at a dummy URL — the cache hit means no actual HTTP call is made.
+        let registry = RegistryClient::new("http://127.0.0.1:1"); // unreachable but not called
+        let result = handle_skill_run(
+            "test-skill",
+            &serde_json::json!({"query": "hello"}),
+            &state,
+            &policy,
+            None,
+            Some(&registry),
+            &cache,
+        );
+        assert_eq!(result.is_error, Some(true));
+        let text = &result.content[0].text;
+        assert!(
+            text.contains("Update available") || text.contains("update"),
+            "expected update prompt, got: {text}"
+        );
+        assert!(
+            text.contains("skillclub_update") || text.contains("skip_update_check"),
+            "expected instructions in prompt, got: {text}"
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    #[test]
+    fn handle_update_requires_skill_id() {
+        let state_root = temp_root("update-no-id");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let result = handle_update(
+            &serde_json::json!({}),
+            &state,
+            &Some("http://localhost:8000".to_string()),
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.content[0].text.contains("skill_id"));
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_update_requires_registry_url() {
+        let state_root = temp_root("update-no-reg");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        let result = handle_update(
+            &serde_json::json!({"skill_id": "some-skill"}),
+            &state,
+            &None,
+        );
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result.content[0].text.contains("registry"),
+            "got: {}",
+            result.content[0].text
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+    }
+
+    #[test]
+    fn handle_update_calls_install_from_registry() {
+        use mockito::Server;
+        let mut server = Server::new();
+
+        // Endpoint 1: fetch_skill_detail returns latest_version
+        let _mock_detail = server
+            .mock("GET", "/skills/test-skill")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"skill_id":"test-skill","name":"Test Skill","latest_version":"0.2.0","publisher_name":"test","description":"A test skill"}"#)
+            .create();
+
+        // Endpoint 2: fetch_artifact_metadata
+        let _mock_meta = server
+            .mock("GET", "/skills/test-skill/versions/0.2.0/artifact")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"download_url":"/artifacts/test-skill-0.2.0.cskill","sha256":"abc123"}"#)
+            .create();
+
+        // We don't go further (download would fail) — but handle_update returning
+        // "Update failed" is acceptable here because install_from_registry will
+        // fail on the download step.  The key assertion is that it got past the
+        // parameter validation and attempted the registry call.
+        let state_root = temp_root("update-calls-registry");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+        let registry_url = server.url();
+
+        let result = handle_update(
+            &serde_json::json!({"skill_id": "test-skill"}),
+            &state,
+            &Some(registry_url),
+        );
+
+        // Either success (if the mock download somehow completes) or a registry-
+        // related error — either way it must NOT be the "missing skill_id" or
+        // "no registry" early-exit error.
+        let text = &result.content[0].text;
+        assert!(
+            !text.contains("Missing required parameter"),
+            "should not be param error, got: {text}"
+        );
+        assert!(
+            !text.contains("No registry configured"),
+            "should not be missing-registry error, got: {text}"
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
     }
 
     // ── Auth tool tests ───────────────────────────────────────────────────
@@ -3803,5 +4259,205 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&state_root);
+    }
+
+    // ── LLM execution summary tests ──────────────────────────────────────────
+
+    fn write_tool_only_skill(root: &Utf8PathBuf) {
+        // A skill whose workflow has only a `tool` step — no LLM.
+        // extract_text reads a field named "doc" from the run input.
+        fs::create_dir_all(root).unwrap();
+        fs::write(
+            root.join("SKILL.md"),
+            "---\n\
+             name: Tool Only Skill\n\
+             description: A tool-only skill\n\
+             license: Apache-2.0\n\
+             vh_version: 0.1.0\n\
+             vh_publisher: skillclub\n\
+             vh_permissions:\n  \
+               network: none\n  \
+               filesystem: none\n  \
+               clipboard: none\n\
+             vh_execution:\n  \
+               sandbox: strict\n  \
+               timeout_ms: 30000\n  \
+               memory_mb: 256\n\
+             vh_schemas:\n  \
+               inputs:\n    \
+                 type: object\n    \
+                 properties:\n      \
+                   doc:\n        \
+                     type: string\n    \
+                 required:\n      \
+                   - doc\n  \
+               outputs:\n    \
+                 type: object\n\
+             vh_workflow_ref: workflow.yaml\n\
+             ---\n\
+             \n\
+             Extract text.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("workflow.yaml"),
+            "name: tool_only_skill\nsteps:\n  - id: extract\n    type: tool\n    tool: extract_text\n    input: doc\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn handle_skill_run_prefixes_llm_summary() {
+        use skillrunner_core::model::MockModelClient;
+
+        let state_root = temp_root("run-llm-prefix");
+        let skill_root = temp_root("run-llm-prefix-skill");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        write_test_skill(&skill_root);
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg).unwrap();
+
+        let policy = MockPolicyClient::new();
+        let cache = empty_update_cache();
+        let mock_model = MockModelClient::new("skill output text").with_tokens(10, 5);
+
+        let result = handle_skill_run(
+            "test-skill",
+            &serde_json::json!({"query": "hello", "skip_update_check": true}),
+            &state,
+            &policy,
+            Some(&mock_model),
+            None,
+            &cache,
+        );
+
+        assert!(result.is_error.is_none(), "expected success");
+        let text = &result.content[0].text;
+        assert!(
+            text.contains("\u{25b6} Ran test-skill"),
+            "expected LLM summary prefix, got: {text}"
+        );
+        assert!(
+            text.contains("local model mock-model"),
+            "expected model name in prefix, got: {text}"
+        );
+        assert!(
+            text.contains("skill output text"),
+            "expected skill output after prefix, got: {text}"
+        );
+        // Prefix must come before the skill output
+        let prefix_pos = text.find("\u{25b6}").unwrap();
+        let output_pos = text.find("skill output text").unwrap();
+        assert!(
+            prefix_pos < output_pos,
+            "prefix must appear before output"
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    #[test]
+    fn handle_skill_run_no_prefix_for_tool_only_workflow() {
+        let state_root = temp_root("run-tool-no-prefix");
+        let skill_root = temp_root("run-tool-no-prefix-skill");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        write_tool_only_skill(&skill_root);
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg).unwrap();
+
+        let policy = MockPolicyClient::new();
+        let cache = empty_update_cache();
+
+        let result = handle_skill_run(
+            "tool-only-skill",
+            &serde_json::json!({"doc": "hello world", "skip_update_check": true}),
+            &state,
+            &policy,
+            None, // no model client — only tool steps run
+            None,
+            &cache,
+        );
+
+        assert!(result.is_error.is_none(), "expected success, got: {:?}", result.content[0].text);
+        let text = &result.content[0].text;
+        assert!(
+            !text.contains("\u{25b6}"),
+            "tool-only skill should have no LLM summary prefix, got: {text}"
+        );
+
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
+    }
+
+    #[test]
+    fn handle_skill_run_composite_with_rating_prompt() {
+        use skillrunner_core::model::MockModelClient;
+
+        // On the 3rd execution, both the LLM prefix and the rating prompt
+        // should appear with the correct ordering: prefix → output → rating.
+        let state_root = temp_root("run-composite-rating");
+        let skill_root = temp_root("run-composite-rating-skill");
+        let state = AppState::bootstrap_in(state_root.clone()).unwrap();
+
+        write_test_skill(&skill_root);
+        let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
+        install_unpacked_skill(&state, &pkg).unwrap();
+
+        let policy = MockPolicyClient::new();
+        let cache = empty_update_cache();
+        let mock_model = MockModelClient::new("the answer").with_tokens(8, 4);
+
+        // Run twice to increment the counter to 2.
+        for _ in 0..2 {
+            let _ = handle_skill_run(
+                "test-skill",
+                &serde_json::json!({"query": "q", "skip_update_check": true}),
+                &state,
+                &policy,
+                Some(&mock_model),
+                None,
+                &cache,
+            );
+        }
+
+        // 3rd run should trigger the rating prompt.
+        let result = handle_skill_run(
+            "test-skill",
+            &serde_json::json!({"query": "q", "skip_update_check": true}),
+            &state,
+            &policy,
+            Some(&mock_model),
+            None,
+            &cache,
+        );
+
+        assert!(result.is_error.is_none(), "expected success");
+        let text = &result.content[0].text;
+
+        assert!(
+            text.contains("\u{25b6}"),
+            "LLM summary prefix must be present, got: {text}"
+        );
+        assert!(
+            text.contains("the answer"),
+            "skill output must be present, got: {text}"
+        );
+        assert!(
+            text.contains("Was this skill helpful?"),
+            "rating prompt must be present, got: {text}"
+        );
+
+        // Order: prefix → output → rating
+        let prefix_pos = text.find("\u{25b6}").unwrap();
+        let output_pos = text.find("the answer").unwrap();
+        let rating_pos = text.find("Was this skill helpful?").unwrap();
+        assert!(prefix_pos < output_pos, "prefix must precede output");
+        assert!(output_pos < rating_pos, "output must precede rating prompt");
+
+        let _ = fs::remove_dir_all(&state_root);
+        let _ = fs::remove_dir_all(&skill_root);
     }
 }

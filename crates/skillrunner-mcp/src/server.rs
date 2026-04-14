@@ -6,7 +6,7 @@ use crate::{
         METHOD_NOT_FOUND,
     },
     sampling::{HybridModelClient, McpSamplingClient, SharedIo},
-    tools::{build_tool_list, handle_tool_call},
+    tools::{build_tool_list, handle_tool_call, UpdateCheckCache},
 };
 use anyhow::Result;
 use skillrunner_core::{
@@ -18,6 +18,7 @@ use skillrunner_core::{
     state::AppState,
     updater::check_skill_updates,
 };
+use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -55,6 +56,13 @@ struct ServerState {
     last_unmanaged_scan: Option<Instant>,
     /// Cached machine hostname for audit events.
     machine_id: String,
+    /// Per-skill update-check results, shared with the tools layer.
+    ///
+    /// Each entry records when the check was last performed and the latest
+    /// registry version (None = already up-to-date or check failed).
+    /// The cache is shared via Arc so `dispatch_request` can hand a
+    /// reference to `handle_tool_call` without passing `ServerState` itself.
+    update_check_cache: UpdateCheckCache,
 }
 
 impl ServerState {
@@ -70,6 +78,16 @@ impl ServerState {
             last_exec_stats_flush: None,
             last_unmanaged_scan: None,
             machine_id: crate::setup::get_machine_id(),
+            update_check_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Remove the cached update-check result for `skill_id` so that the next
+    /// invocation re-queries the registry.  Called after a successful update
+    /// so the skill is no longer presented as "has update available".
+    fn invalidate_update_cache(&self, skill_id: &str) {
+        if let Ok(mut cache) = self.update_check_cache.lock() {
+            cache.remove(skill_id);
         }
     }
 
@@ -464,7 +482,20 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
             server_state.registry_client.as_ref(),
             &server_state.aggregator,
             &server_state.machine_id,
+            &server_state.update_check_cache,
         );
+
+        // After a successful skillclub_update, clear the cache entry so the
+        // next run no longer shows a stale "update available" prompt.
+        if request.method == "tools/call" {
+            if let Ok(params) = serde_json::from_value::<ToolCallParams>(request.params.clone()) {
+                if params.name == "skillclub_update" {
+                    if let Some(skill_id) = params.arguments.get("skill_id").and_then(|v| v.as_str()) {
+                        server_state.invalidate_update_cache(skill_id);
+                    }
+                }
+            }
+        }
 
         // Write response (lock shared_io)
         {
@@ -523,6 +554,7 @@ fn emit_tool_called_event(state: &AppState, tool_name: &str, machine_id: &str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_request(
     request: &JsonRpcRequest,
     state: &AppState,
@@ -531,6 +563,7 @@ fn dispatch_request(
     registry_client: Option<&RegistryClient>,
     aggregator: &BackendRegistry,
     machine_id: &str,
+    update_check_cache: &UpdateCheckCache,
 ) -> JsonRpcResponse {
     match request.method.as_str() {
         "initialize" => handle_initialize(request, state),
@@ -543,6 +576,7 @@ fn dispatch_request(
             registry_client,
             aggregator,
             machine_id,
+            update_check_cache,
         ),
         _ => JsonRpcResponse::error(
             request.id.clone(),
@@ -675,6 +709,7 @@ fn handle_tools_list(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_tools_call(
     request: &JsonRpcRequest,
     state: &AppState,
@@ -683,6 +718,7 @@ fn handle_tools_call(
     registry_client: Option<&RegistryClient>,
     aggregator: &BackendRegistry,
     machine_id: &str,
+    update_check_cache: &UpdateCheckCache,
 ) -> JsonRpcResponse {
     let params: ToolCallParams = match serde_json::from_value(request.params.clone()) {
         Ok(p) => p,
@@ -755,6 +791,7 @@ fn handle_tools_call(
             model_client,
             registry_client,
             registry_url,
+            update_check_cache,
         )
     } else {
         let mock_policy = MockPolicyClient::new();
@@ -766,6 +803,7 @@ fn handle_tools_call(
             model_client,
             None,
             registry_url,
+            update_check_cache,
         )
     };
 
@@ -1019,6 +1057,7 @@ mod tests {
             params: serde_json::json!({}),
         };
 
+        let cache = Arc::new(Mutex::new(HashMap::new()));
         let resp = dispatch_request(
             &req,
             &state,
@@ -1027,6 +1066,7 @@ mod tests {
             None,
             &aggregator,
             "test-machine",
+            &cache,
         );
         assert!(resp.error.is_some());
         assert_eq!(resp.error.as_ref().unwrap().code, METHOD_NOT_FOUND);

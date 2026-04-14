@@ -11,6 +11,19 @@ pub struct ModelRequest {
     pub json_output: bool,
 }
 
+/// Identifies which backend produced a model response.
+///
+/// This is carried through `ModelResponse` so callers can surface
+/// "local model" vs "remote model via MCP sampling" to the user.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModelSource {
+    /// A locally-running Ollama instance. Contains the resolved model name
+    /// (e.g. `"llama3.2:8b"`).
+    Local(String),
+    /// The AI client handled the request via MCP `sampling/createMessage`.
+    McpSampling,
+}
+
 /// The raw response returned by the model, including accounting data.
 #[derive(Debug)]
 pub struct ModelResponse {
@@ -22,6 +35,8 @@ pub struct ModelResponse {
     pub completion_tokens: u64,
     /// Wall-clock time for the call in milliseconds.
     pub latency_ms: u64,
+    /// Which backend produced this response.
+    pub source: ModelSource,
 }
 
 /// Abstraction over any text-generation backend.
@@ -60,6 +75,7 @@ impl ModelClient for MockModelClient {
             prompt_tokens: self.prompt_tokens,
             completion_tokens: self.completion_tokens,
             latency_ms: 1,
+            source: ModelSource::Local("mock-model".to_string()),
         })
     }
 }

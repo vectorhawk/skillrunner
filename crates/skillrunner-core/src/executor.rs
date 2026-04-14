@@ -1,5 +1,5 @@
 use crate::{
-    model::{ModelClient, ModelRequest},
+    model::{ModelClient, ModelRequest, ModelSource},
     policy::PolicyClient,
     resolver::{resolve_skill, ResolveOutcome},
     state::AppState,
@@ -31,6 +31,8 @@ pub struct StepResult {
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
     pub latency_ms: Option<u64>,
+    /// Which backend handled this step (None for non-llm steps and stubs).
+    pub model_source: Option<ModelSource>,
 }
 
 #[derive(Debug)]
@@ -206,6 +208,7 @@ fn execute_tool_step(
                 prompt_tokens: None,
                 completion_tokens: None,
                 latency_ms: None,
+                model_source: None,
             })
         }
         other => anyhow::bail!("tool step '{id}': unknown built-in tool '{other}'"),
@@ -244,6 +247,7 @@ fn execute_transform_step(
         prompt_tokens: None,
         completion_tokens: None,
         latency_ms: None,
+        model_source: None,
     })
 }
 
@@ -278,6 +282,7 @@ fn execute_validate_step(
         prompt_tokens: None,
         completion_tokens: None,
         latency_ms: None,
+        model_source: None,
     })
 }
 
@@ -364,6 +369,7 @@ fn execute_llm_step(pkg: &SkillPackage, p: LlmStepParams<'_>) -> Result<StepResu
         prompt_tokens: Some(response.prompt_tokens),
         completion_tokens: Some(response.completion_tokens),
         latency_ms: Some(response.latency_ms),
+        model_source: Some(response.source),
     })
 }
 
@@ -461,6 +467,7 @@ fn stub_step(step: &WorkflowStep) -> StepResult {
         prompt_tokens: None,
         completion_tokens: None,
         latency_ms: None,
+        model_source: None,
     }
 }
 

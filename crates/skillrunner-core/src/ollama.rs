@@ -1,4 +1,4 @@
-use crate::model::{ModelClient, ModelRequest, ModelResponse};
+use crate::model::{ModelClient, ModelRequest, ModelResponse, ModelSource};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
@@ -166,6 +166,7 @@ impl ModelClient for OllamaClient {
             prompt_tokens: ollama_resp.prompt_eval_count,
             completion_tokens: ollama_resp.eval_count,
             latency_ms,
+            source: ModelSource::Local(self.model.clone()),
         })
     }
 }
