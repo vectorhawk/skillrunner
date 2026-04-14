@@ -2544,7 +2544,16 @@ fn handle_skill_run(
                     &conn, skill_id, "unknown",
                 );
             }
-            ToolCallResult::error(format!("Skill execution failed: {e}"))
+            // Build full error chain so the actual root cause (e.g. jsonschema
+            // violation) is visible in the MCP response, not just the outermost
+            // context wrap.
+            let mut chain = format!("Skill execution failed: {e}");
+            let mut source = e.source();
+            while let Some(src) = source {
+                chain.push_str(&format!("\n  caused by: {src}"));
+                source = src.source();
+            }
+            ToolCallResult::error(chain)
         }
     }
 }
