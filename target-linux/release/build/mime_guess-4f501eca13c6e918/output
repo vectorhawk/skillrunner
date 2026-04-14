@@ -1,1 +1,0 @@
-cargo:rustc-env=MIME_TYPES_GENERATED_PATH=/src/target-linux/release/build/mime_guess-4f501eca13c6e918/out/mime_types_generated.rs
