@@ -1,0 +1,8 @@
+name: caveman_speak
+steps:
+  - id: compress
+    type: llm
+    prompt: prompts/compress.txt
+    inputs:
+      text: input.text
+    output_schema: schemas/output.schema.json

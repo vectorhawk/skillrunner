@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["compressed", "original_words", "compressed_words", "compression_ratio"],
+  "properties": {
+    "compressed": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The text compressed into caveman speak."
+    },
+    "original_words": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Word count of the original input."
+    },
+    "compressed_words": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Word count of the compressed output."
+    },
+    "compression_ratio": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "compressed_words divided by original_words."
+    }
+  },
+  "additionalProperties": false
+}
