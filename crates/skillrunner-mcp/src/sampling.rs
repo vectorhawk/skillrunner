@@ -180,6 +180,14 @@ impl ModelClient for HybridModelClient<'_> {
         // Per-skill preference: when the skill's manifest declares
         // `vh_model.prefer_local: true`, try Ollama first. Otherwise we
         // use MCP sampling directly — the AI client handles the call.
+        // Symmetric fallback strategy:
+        // - prefer_local=true:  try Ollama → fall back to MCP sampling
+        // - prefer_local=false: try MCP sampling → fall back to Ollama
+        //
+        // Either path falls back to the other on failure. This keeps skills
+        // working when the AI client doesn't support sampling (common in
+        // some MCP clients) as long as Ollama is installed — and vice
+        // versa. If both are unavailable, the original error is returned.
         if request.prefer_local {
             if let Some(ollama) = self.ollama {
                 match ollama.generate(request.clone()) {
@@ -188,15 +196,28 @@ impl ModelClient for HybridModelClient<'_> {
                         tracing::warn!(
                             "Local model failed, falling back to AI client via sampling: {e}"
                         );
-                        // Fall through to sampling with the original request
+                        // Fall through to sampling
                     }
                 }
             }
+            tracing::debug!("Delegating LLM call to AI client via MCP sampling");
+            return self.sampling.generate(request);
         }
 
-        // Delegate to AI client via MCP sampling
+        // Default path: try sampling first, fall back to local if available.
         tracing::debug!("Delegating LLM call to AI client via MCP sampling");
-        self.sampling.generate(request)
+        match self.sampling.generate(request.clone()) {
+            Ok(response) => Ok(response),
+            Err(sampling_err) => {
+                if let Some(ollama) = self.ollama {
+                    tracing::warn!(
+                        "MCP sampling unavailable, falling back to local model: {sampling_err}"
+                    );
+                    return ollama.generate(request);
+                }
+                Err(sampling_err)
+            }
+        }
     }
 }
 
@@ -385,6 +406,64 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.text, "fallback response");
+    }
+
+    #[test]
+    fn hybrid_client_falls_back_to_local_when_sampling_fails() {
+        use skillrunner_core::model::MockModelClient;
+
+        // Sampling client that will return an error response
+        // (mimics an MCP client that doesn't support sampling/createMessage).
+        let error_response_json = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1000,
+            "error": { "code": -32601, "message": "Sampling not supported" }
+        });
+        let reader = Box::new(Cursor::new(
+            format!("{}\n", serde_json::to_string(&error_response_json).unwrap()).into_bytes(),
+        ));
+        let writer = Box::new(Vec::<u8>::new());
+        let sampling = McpSamplingClient::new(writer, reader);
+
+        let ollama = MockModelClient::new("local fallback");
+        let hybrid = HybridModelClient::new(Some(&ollama), &sampling);
+
+        // prefer_local: false, but sampling fails → should fall back to local
+        let result = hybrid
+            .generate(ModelRequest {
+                system_prompt: "test".to_string(),
+                user_message: "test".to_string(),
+                json_output: false,
+                prefer_local: false,
+            })
+            .unwrap();
+
+        assert_eq!(result.text, "local fallback");
+    }
+
+    #[test]
+    fn hybrid_client_returns_sampling_error_when_no_local() {
+        // Sampling client that returns an error, with no ollama fallback.
+        let error_response_json = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1000,
+            "error": { "code": -32601, "message": "Sampling not supported" }
+        });
+        let reader = Box::new(Cursor::new(
+            format!("{}\n", serde_json::to_string(&error_response_json).unwrap()).into_bytes(),
+        ));
+        let writer = Box::new(Vec::<u8>::new());
+        let sampling = McpSamplingClient::new(writer, reader);
+
+        let hybrid = HybridModelClient::new(None, &sampling);
+        let err = hybrid
+            .generate(ModelRequest {
+                system_prompt: "test".to_string(),
+                user_message: "test".to_string(),
+                json_output: false,
+                prefer_local: false,
+            })
+            .expect_err("should fail with no fallback available");
+
+        assert!(err.to_string().contains("Sampling not supported"));
     }
 
     #[test]
