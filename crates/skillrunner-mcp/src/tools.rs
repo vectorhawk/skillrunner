@@ -782,7 +782,7 @@ pub fn handle_tool_call(
     update_check_cache: &UpdateCheckCache,
 ) -> ToolCallResult {
     let result = match name {
-        "skillclub_list" => handle_list(state, registry_url),
+        "skillclub_list" => handle_list(state, registry_url, update_check_cache),
         "skillclub_search" => handle_search(arguments, registry_url),
         "skillclub_install" => handle_install(arguments, state, registry_url),
         "skillclub_uninstall" => handle_uninstall(arguments, state),
@@ -839,7 +839,39 @@ pub fn handle_tool_call(
 
 // ── Management tool handlers ─────────────────────────────────────────────────
 
-fn handle_list(state: &AppState, registry_url: &Option<String>) -> ToolCallResult {
+fn handle_list(
+    state: &AppState,
+    registry_url: &Option<String>,
+    update_check_cache: &UpdateCheckCache,
+) -> ToolCallResult {
+    // Force a fresh sync with the registry on every list call. This picks up
+    // lifecycle changes (unpublish → deactivate, reactivation) and version
+    // upgrades. Best-effort: if the registry is unreachable, we fall through
+    // to the local DB view.
+    let mut sync_msg: Option<String> = None;
+    if let Some(url) = registry_url.as_ref() {
+        let registry = skillrunner_core::registry::RegistryClient::new(url);
+        let policy_client = skillrunner_core::registry::HttpPolicyClient::new(
+            skillrunner_core::registry::RegistryClient::new(url),
+            state,
+        );
+        match skillrunner_core::updater::check_skill_updates(state, &registry, &policy_client) {
+            Ok(0) => {}
+            Ok(n) => {
+                sync_msg = Some(format!("🔄 Synced with registry: {n} skill(s) updated.\n\n"));
+                // Any in-memory update-check results may now be stale (we just
+                // pulled changes). Clear the whole cache — next skill call
+                // repopulates on demand.
+                if let Ok(mut cache) = update_check_cache.lock() {
+                    cache.clear();
+                }
+            }
+            Err(_) => {
+                // Registry unreachable — proceed with local view.
+            }
+        }
+    }
+
     let conn = match Connection::open(&state.db_path) {
         Ok(c) => c,
         Err(e) => return ToolCallResult::error(format!("Failed to open state DB: {e}")),
@@ -894,10 +926,14 @@ fn handle_list(state: &AppState, registry_url: &Option<String>) -> ToolCallResul
              - Use skillclub_login to sign in and access the skill registry"
         };
 
-        ToolCallResult::success(format!("No skills installed.{next_steps}{footer}"))
+        let prefix = sync_msg.unwrap_or_default();
+        ToolCallResult::success(format!("{prefix}No skills installed.{next_steps}{footer}"))
     } else {
         match serde_json::to_string_pretty(&skills) {
-            Ok(text) => ToolCallResult::success(format!("{text}{footer}")),
+            Ok(text) => {
+                let prefix = sync_msg.unwrap_or_default();
+                ToolCallResult::success(format!("{prefix}{text}{footer}"))
+            }
             Err(e) => ToolCallResult::error(format!("Failed to serialize: {e}")),
         }
     }
@@ -2967,7 +3003,7 @@ mod tests {
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
         install_unpacked_skill(&state, &pkg).unwrap();
 
-        let result = handle_list(&state, &None);
+        let result = handle_list(&state, &None, &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())));
         assert!(result.is_error.is_none());
         let text = &result.content[0].text;
         assert!(
@@ -2984,7 +3020,7 @@ mod tests {
         let state_root = temp_root("handle-list-empty");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
 
-        let result = handle_list(&state, &None);
+        let result = handle_list(&state, &None, &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())));
         assert!(result.is_error.is_none());
         assert!(result.content[0].text.contains("No skills installed"));
 
@@ -3038,7 +3074,7 @@ mod tests {
         assert!(result.content[0].text.contains("0.1.0"));
 
         // Verify the skill appears in the list
-        let list_result = handle_list(&state, &None);
+        let list_result = handle_list(&state, &None, &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())));
         assert!(list_result.content[0].text.contains("test-skill"));
 
         let _ = fs::remove_dir_all(&state_root);
