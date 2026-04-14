@@ -1,0 +1,8 @@
+name: private_summarizer
+steps:
+  - id: summarize
+    type: llm
+    prompt: prompts/summarize.txt
+    inputs:
+      text: input.text
+    output_schema: schemas/output.schema.json

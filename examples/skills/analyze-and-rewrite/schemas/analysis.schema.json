@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["tone", "issues", "suggested_tone"],
+  "properties": {
+    "tone": {
+      "type": "string",
+      "enum": [
+        "formal",
+        "casual",
+        "neutral",
+        "aggressive",
+        "hedging",
+        "enthusiastic",
+        "technical"
+      ],
+      "description": "The detected tone of the source text."
+    },
+    "issues": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Short descriptions of any tone problems (empty if none)."
+    },
+    "suggested_tone": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The tone the rewrite should adopt."
+    }
+  },
+  "additionalProperties": false
+}

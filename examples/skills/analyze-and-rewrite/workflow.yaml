@@ -1,0 +1,18 @@
+name: analyze_and_rewrite
+steps:
+  - id: analyze
+    type: llm
+    prompt: prompts/analyze.txt
+    inputs:
+      text: input.text
+    output_schema: schemas/analysis.schema.json
+
+  - id: rewrite
+    type: llm
+    prompt: prompts/rewrite.txt
+    inputs:
+      text: input.text
+      target_audience: input.target_audience
+      current_tone: analyze.tone
+      suggested_tone: analyze.suggested_tone
+    output_schema: schemas/rewrite.schema.json
