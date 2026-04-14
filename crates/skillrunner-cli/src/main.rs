@@ -15,7 +15,8 @@ use skillrunner_core::{
     registry::{HttpPolicyClient, RegistryClient},
     resolver::{resolve_skill, ResolveOutcome},
     updater::{
-        check_skill_updates, install_from_registry, package_plugin, tar_gz_skill_source,
+        check_skill_updates, install_from_registry, install_plugin_from_registry, package_plugin,
+        tar_gz_skill_source,
     },
     validator::validate_bundle,
 };
@@ -115,6 +116,17 @@ enum McpCommands {
     },
     /// Manually trigger a skill sync (check for updates, lifecycle changes)
     Sync {
+        /// VectorHawk registry URL (overrides VECTORHAWK_REGISTRY_URL)
+        #[arg(long)]
+        registry_url: Option<String>,
+    },
+    /// Request access to an MCP server (enters the governance approval flow)
+    Request {
+        /// Name of the MCP server to request access to
+        server_name: String,
+        /// Optional package source (e.g., '@modelcontextprotocol/server-slack')
+        #[arg(long)]
+        package_source: Option<String>,
         /// VectorHawk registry URL (overrides VECTORHAWK_REGISTRY_URL)
         #[arg(long)]
         registry_url: Option<String>,
@@ -246,10 +258,13 @@ enum SkillCommands {
 
 #[derive(Subcommand)]
 enum PluginCommands {
-    /// Install a plugin from a local directory
+    /// Install a plugin from a local directory or from the registry by slug
     Install {
-        /// Path to a plugin directory containing plugin.json
-        path: Utf8PathBuf,
+        /// Plugin slug (for registry install) or local path to a plugin directory
+        plugin_ref: String,
+        /// VectorHawk registry URL (overrides VECTORHAWK_REGISTRY_URL)
+        #[arg(long)]
+        registry_url: Option<String>,
     },
     /// Uninstall an installed plugin (removes skills, commands, and MCP server records)
     Uninstall {
@@ -767,6 +782,49 @@ fn main() -> Result<()> {
                     Err(e) => println!("Sync failed: {e}"),
                 }
             }
+            McpCommands::Request {
+                server_name,
+                package_source,
+                registry_url,
+            } => {
+                let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
+                let tokens = auth::load_tokens(&app.state, &url)?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "not logged in; run `skillrunner auth login --registry-url {url}` first"
+                    )
+                })?;
+
+                let registry = RegistryClient::new(&url);
+                let resp = registry.submit_mcp_request(
+                    &server_name,
+                    package_source.as_deref(),
+                    &tokens.access_token,
+                )?;
+
+                let status = resp
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+
+                match status {
+                    "approved" => {
+                        println!("Request for '{server_name}' was approved.");
+                        println!(
+                            "Run `skillrunner mcp sync --registry-url {url}` to activate the server."
+                        );
+                    }
+                    "pending" => {
+                        println!("Request for '{server_name}' submitted — pending IT review.");
+                        println!(
+                            "Your admin will review it in the VectorHawk portal. \
+                             The server will auto-activate on the next sync after approval."
+                        );
+                    }
+                    other => {
+                        println!("Request for '{server_name}' submitted with status: {other}");
+                    }
+                }
+            }
         },
         Commands::Skill { command } => match command {
             SkillCommands::Import {
@@ -974,15 +1032,24 @@ fn main() -> Result<()> {
                     install_unpacked_skill(&app.state, &skill)?;
                     println!("Installed {}@{}", skill.manifest.id, skill.manifest.version);
                 } else {
+                    // Allow `id@version` shorthand in addition to the `--version` flag.
+                    let (skill_id, parsed_version) = match skill_ref.split_once('@') {
+                        Some((id, ver)) if !id.is_empty() && !ver.is_empty() => {
+                            (id.to_string(), Some(ver.to_string()))
+                        }
+                        _ => (skill_ref.clone(), None),
+                    };
+                    let effective_version = version.or(parsed_version);
+
                     let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
                     let registry = RegistryClient::new(&url);
                     let installed_ver = install_from_registry(
                         &app.state,
                         &registry,
-                        &skill_ref,
-                        version.as_deref(),
+                        &skill_id,
+                        effective_version.as_deref(),
                     )?;
-                    println!("Installed {}@{} from registry", skill_ref, installed_ver);
+                    println!("Installed {}@{} from registry", skill_id, installed_ver);
                 }
             }
             SkillCommands::Publish { path, registry_url } => {
@@ -1200,14 +1267,29 @@ fn main() -> Result<()> {
             }
         },
         Commands::Plugin { command } => match command {
-            PluginCommands::Install { path } => {
-                let pkg = skillrunner_manifest::PluginPackage::load_from_dir(&path)?;
-                println!(
-                    "Installing plugin '{}' v{}",
-                    pkg.manifest.name, pkg.manifest.version
-                );
+            PluginCommands::Install {
+                plugin_ref,
+                registry_url,
+            } => {
+                // Heuristic: if plugin_ref looks like a path, install from local dir.
+                let is_local = plugin_ref.contains('/')
+                    || plugin_ref.starts_with('.')
+                    || std::path::Path::new(&plugin_ref).exists();
 
-                let result = skillrunner_core::plugin::install_plugin_from_dir(&app.state, &path)?;
+                let result = if is_local {
+                    let path = Utf8PathBuf::from(&plugin_ref);
+                    let pkg = skillrunner_manifest::PluginPackage::load_from_dir(&path)?;
+                    println!(
+                        "Installing plugin '{}' v{}",
+                        pkg.manifest.name, pkg.manifest.version
+                    );
+                    skillrunner_core::plugin::install_plugin_from_dir(&app.state, &path)?
+                } else {
+                    let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
+                    let registry = RegistryClient::new(&url);
+                    println!("Installing plugin '{plugin_ref}' from registry");
+                    install_plugin_from_registry(&app.state, &registry, &plugin_ref)?
+                };
 
                 if !result.components.skill_ids.is_empty() {
                     println!("  Skills: {}", result.components.skill_ids.join(", "));
