@@ -341,19 +341,28 @@ fn execute_llm_step(pkg: &SkillPackage, p: LlmStepParams<'_>) -> Result<StepResu
     };
 
     // Validate output against schema when present.
+    //
+    // Security: we deliberately do NOT include the raw model output in the
+    // error message. A skill's LLM response can contain exfiltrated system
+    // prompt content, internal multi-step state, or other sensitive material
+    // (classic prompt-injection side channels). Exposing it in errors turns
+    // validation failures into a probing oracle. We surface only the schema
+    // path and structural reason; authors debug with local runs, not prod
+    // error traces.
     if let (Some(schema_rel), Some(output_val)) = (output_schema_rel, &output) {
+        let shape = match output_val {
+            serde_json::Value::String(_) => "string (not JSON)",
+            serde_json::Value::Object(_) => "object",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "boolean",
+            serde_json::Value::Number(_) => "number",
+        };
         validate_output(&pkg.root, schema_rel, output_val).with_context(|| {
-            // Truncate raw output to keep error readable while still showing
-            // enough for the author to diagnose prompt/model issues.
-            let raw = &response.text;
-            let preview = if raw.chars().count() > 500 {
-                format!("{}…", raw.chars().take(500).collect::<String>())
-            } else {
-                raw.clone()
-            };
             format!(
-                "step '{id}' output failed schema validation (schema: {schema_rel}). \
-                 Model returned: {preview}"
+                "step '{id}' output failed schema validation. Schema: {schema_rel}. \
+                 Model returned a {shape}; expected output conforming to the schema. \
+                 Run the skill locally with `skillrunner skill run` to inspect the raw output."
             )
         })?;
     }
