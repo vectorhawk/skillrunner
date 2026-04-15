@@ -136,10 +136,7 @@ pub(crate) fn load_from_skill_md_dir(root: Utf8PathBuf) -> Result<SkillPackage, 
     let id = to_skill_id(&frontmatter.name);
 
     // Version defaults to "0.1.0" if omitted.
-    let version_str = frontmatter
-        .vh_version
-        .as_deref()
-        .unwrap_or("0.1.0");
+    let version_str = frontmatter.vh_version.as_deref().unwrap_or("0.1.0");
     let version = semver::Version::parse(version_str)
         .map_err(|e| ManifestError::Invalid(format!("vh_version is not valid semver: {e}")))?;
 
@@ -262,7 +259,8 @@ fn validate_frontmatter_basics(fm: &SkillMdFrontmatter) -> Result<(), ManifestEr
     }
     if fm.vh_workflow.is_some() && fm.vh_workflow_ref.is_some() {
         return Err(ManifestError::Invalid(
-            "vh_workflow and vh_workflow_ref are mutually exclusive; use one or neither".to_string(),
+            "vh_workflow and vh_workflow_ref are mutually exclusive; use one or neither"
+                .to_string(),
         ));
     }
     Ok(())
@@ -369,10 +367,13 @@ fn build_workflow(
     }
 
     if let Some(inline_steps) = &fm.vh_workflow {
-        validate_workflow_prompt_refs(root, &Workflow {
-            name: to_skill_id(skill_name),
-            steps: inline_steps.clone(),
-        })?;
+        validate_workflow_prompt_refs(
+            root,
+            &Workflow {
+                name: to_skill_id(skill_name),
+                steps: inline_steps.clone(),
+            },
+        )?;
         return Ok(Workflow {
             name: to_skill_id(skill_name),
             steps: inline_steps.clone(),
@@ -395,7 +396,10 @@ fn build_workflow(
     })
 }
 
-fn validate_workflow_prompt_refs(root: &Utf8Path, workflow: &Workflow) -> Result<(), ManifestError> {
+fn validate_workflow_prompt_refs(
+    root: &Utf8Path,
+    workflow: &Workflow,
+) -> Result<(), ManifestError> {
     for step in &workflow.steps {
         if let WorkflowStep::Llm { prompt, .. } = step {
             match prompt {
@@ -458,9 +462,18 @@ mod tests {
         );
         let pkg = load_skill_md(&content).unwrap();
         assert_eq!(pkg.manifest.triggers.len(), 3);
-        assert!(pkg.manifest.triggers.contains(&"compare contracts".to_string()));
-        assert!(pkg.manifest.triggers.contains(&"diff legal documents".to_string()));
-        assert!(pkg.manifest.triggers.contains(&"review contract changes".to_string()));
+        assert!(pkg
+            .manifest
+            .triggers
+            .contains(&"compare contracts".to_string()));
+        assert!(pkg
+            .manifest
+            .triggers
+            .contains(&"diff legal documents".to_string()));
+        assert!(pkg
+            .manifest
+            .triggers
+            .contains(&"review contract changes".to_string()));
     }
 
     #[test]

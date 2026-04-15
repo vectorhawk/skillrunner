@@ -798,7 +798,9 @@ mod tests {
             &mock,
         );
         // Falls back to heuristic — should produce the rearranged name trigger.
-        assert!(triggers.iter().any(|t| t.contains("contract") || t.contains("compare")));
+        assert!(triggers
+            .iter()
+            .any(|t| t.contains("contract") || t.contains("compare")));
     }
 
     #[test]

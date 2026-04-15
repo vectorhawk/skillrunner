@@ -297,7 +297,10 @@ mod tests {
         // count (rating schedule) should still be 0 — failure does not trigger rating prompts
         // Verify by checking that increment_execution_count still starts at 1 for count
         let count = increment_execution_count(&conn, "test-skill", "0.1.0").unwrap();
-        assert_eq!(count, 1, "count starts at 1 for first success, not incremented by failures");
+        assert_eq!(
+            count, 1,
+            "count starts at 1 for first success, not incremented by failures"
+        );
 
         let stats = get_execution_stats(&conn).unwrap();
         assert_eq!(stats[0].total_runs, 2);

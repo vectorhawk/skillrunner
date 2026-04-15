@@ -599,9 +599,8 @@ mod tests {
         // Embed the input schema inline in the SKILL.md frontmatter as a JSON
         // string that serde_yaml will parse. For the simple cases the tests use
         // this is always a valid JSON object literal.
-        let input_schema_yaml = format!(
-            "  inputs: {input_schema_json}\n  outputs: {{\"type\": \"object\"}}"
-        );
+        let input_schema_yaml =
+            format!("  inputs: {input_schema_json}\n  outputs: {{\"type\": \"object\"}}");
         let skill_md = format!(
             "---\nname: Test Skill\ndescription: A test skill.\nlicense: MIT\nvh_version: 0.1.0\nvh_publisher: skillclub\nvh_permissions:\n  filesystem: none\n  network: none\n  clipboard: none\nvh_execution:\n  sandbox: strict\n  timeout_ms: 30000\n  memory_mb: 256\nvh_schemas:\n{input_schema_yaml}\nvh_workflow_ref: ./workflow.yaml\n---\n\nDo the thing.\n"
         );

@@ -815,10 +815,7 @@ mod tests {
         let install_path = state
             .root_dir
             .join("skills/test-skill/versions/2.0.0/SKILL.md");
-        assert!(
-            install_path.exists(),
-            "SKILL.md should exist for v2.0.0"
-        );
+        assert!(install_path.exists(), "SKILL.md should exist for v2.0.0");
 
         meta_mock.assert();
         dl_mock.assert();

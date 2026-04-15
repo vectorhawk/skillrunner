@@ -419,7 +419,11 @@ impl RegistryClient {
 
         let base = self.base_url.trim_end_matches('/');
         let url = format!("{base}/portal/skills/compile");
-        debug!(url, size_bytes = source_tar_gz_bytes.len(), "uploading SKILL.md tree to compile endpoint");
+        debug!(
+            url,
+            size_bytes = source_tar_gz_bytes.len(),
+            "uploading SKILL.md tree to compile endpoint"
+        );
 
         let file_part = reqwest::blocking::multipart::Part::bytes(source_tar_gz_bytes)
             .file_name("skill-source.tar.gz")
@@ -451,7 +455,9 @@ impl RegistryClient {
         if status == reqwest::StatusCode::ACCEPTED {
             // 202: queued for admin review (scan gate queue-for-review).
             // Parse as CompilePublishResponse — the payload shape is the same.
-            return resp.json().context("failed to deserialize 202 compile response");
+            return resp
+                .json()
+                .context("failed to deserialize 202 compile response");
         }
 
         if !status.is_success() {
@@ -650,10 +656,7 @@ impl RegistryClient {
     /// On success, callers should call
     /// [`ratings::mark_ratings_synced`](crate::ratings::mark_ratings_synced)
     /// with the uploaded IDs.
-    pub fn upload_skill_ratings(
-        &self,
-        ratings: &[crate::ratings::LocalRating],
-    ) -> Result<()> {
+    pub fn upload_skill_ratings(&self, ratings: &[crate::ratings::LocalRating]) -> Result<()> {
         if ratings.is_empty() {
             return Ok(());
         }
@@ -696,10 +699,7 @@ impl RegistryClient {
     ///
     /// Posts to `POST /api/runner/execution-stats`. Returns immediately if the
     /// slice is empty (no-op).
-    pub fn upload_execution_stats(
-        &self,
-        stats: &[crate::ratings::ExecutionStats],
-    ) -> Result<()> {
+    pub fn upload_execution_stats(&self, stats: &[crate::ratings::ExecutionStats]) -> Result<()> {
         if stats.is_empty() {
             return Ok(());
         }
@@ -904,17 +904,12 @@ fn parse_compile_errors(body: &str) -> String {
     };
 
     let detail = &val["detail"];
-    let top_msg = detail["message"]
-        .as_str()
-        .unwrap_or("validation failed");
+    let top_msg = detail["message"].as_str().unwrap_or("validation failed");
 
     let errors = detail["errors"].as_array();
     let Some(errors) = errors else {
         // No structured errors list — surface the raw detail string.
-        return detail
-            .as_str()
-            .unwrap_or(body)
-            .to_string();
+        return detail.as_str().unwrap_or(body).to_string();
     };
 
     if errors.is_empty() {
@@ -1369,7 +1364,8 @@ mod tests {
         let enc = GzEncoder::new(&mut out, Compression::default());
         let mut tar = tar::Builder::new(enc);
 
-        let skill_md = b"---\nname: test-skill\ndescription: A test.\nlicense: MIT\n---\n\nHello.\n";
+        let skill_md =
+            b"---\nname: test-skill\ndescription: A test.\nlicense: MIT\n---\n\nHello.\n";
         let mut header = tar::Header::new_gnu();
         header.set_size(skill_md.len() as u64);
         header.set_mode(0o644);
@@ -1411,9 +1407,7 @@ mod tests {
             .create();
 
         let client = RegistryClient::new(server.url()).with_auth("tok");
-        let resp = client
-            .compile_and_publish(minimal_skill_tar_gz())
-            .unwrap();
+        let resp = client.compile_and_publish(minimal_skill_tar_gz()).unwrap();
 
         assert_eq!(resp.content_hash, "sha256:abc123");
         assert_eq!(resp.frontmatter.name, "test-skill");
@@ -1498,9 +1492,7 @@ mod tests {
 
         let client = RegistryClient::new(server.url()).with_auth("tok");
         // 202 should succeed and parse the response body normally.
-        let resp = client
-            .compile_and_publish(minimal_skill_tar_gz())
-            .unwrap();
+        let resp = client.compile_and_publish(minimal_skill_tar_gz()).unwrap();
 
         assert_eq!(resp.frontmatter.name, "test-skill");
         mock.assert();

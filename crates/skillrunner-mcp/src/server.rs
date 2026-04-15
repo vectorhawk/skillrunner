@@ -491,7 +491,9 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
         if request.method == "tools/call" {
             if let Ok(params) = serde_json::from_value::<ToolCallParams>(request.params.clone()) {
                 if params.name == "skillclub_update" {
-                    if let Some(skill_id) = params.arguments.get("skill_id").and_then(|v| v.as_str()) {
+                    if let Some(skill_id) =
+                        params.arguments.get("skill_id").and_then(|v| v.as_str())
+                    {
                         server_state.invalidate_update_cache(skill_id);
                     }
                 }

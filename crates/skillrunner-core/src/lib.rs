@@ -13,10 +13,10 @@ pub mod plugin;
 pub mod plugin_export;
 pub mod plugin_import;
 pub mod policy;
-#[cfg(feature = "registry")]
-pub mod registry;
 pub mod ratings;
 pub mod recommend;
+#[cfg(feature = "registry")]
+pub mod registry;
 pub mod resolver;
 pub mod state;
 #[cfg(feature = "registry")]

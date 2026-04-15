@@ -86,16 +86,16 @@ pub struct Manifest {
 impl Manifest {
     /// Returns the inputs JSON Schema, or a pass-through schema if none is declared.
     pub fn inputs_schema_or_default(&self) -> serde_json::Value {
-        self.inputs_schema.clone().unwrap_or_else(|| {
-            serde_json::json!({"type": "object", "additionalProperties": true})
-        })
+        self.inputs_schema
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({"type": "object", "additionalProperties": true}))
     }
 
     /// Returns the outputs JSON Schema, or a pass-through schema if none is declared.
     pub fn outputs_schema_or_default(&self) -> serde_json::Value {
-        self.outputs_schema.clone().unwrap_or_else(|| {
-            serde_json::json!({"type": "object", "additionalProperties": true})
-        })
+        self.outputs_schema
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({"type": "object", "additionalProperties": true}))
     }
 }
 
@@ -207,15 +207,11 @@ impl<'de> Deserialize<'de> for PromptSource {
 
                 match kind.as_deref() {
                     Some("file") => {
-                        let p = path.ok_or_else(|| {
-                            de::Error::missing_field("path")
-                        })?;
+                        let p = path.ok_or_else(|| de::Error::missing_field("path"))?;
                         Ok(PromptSource::File(p))
                     }
                     Some("inline") => {
-                        let b = body.ok_or_else(|| {
-                            de::Error::missing_field("body")
-                        })?;
+                        let b = body.ok_or_else(|| de::Error::missing_field("body"))?;
                         Ok(PromptSource::Inline(b))
                     }
                     Some(other) => Err(de::Error::unknown_variant(other, &["file", "inline"])),
@@ -458,7 +454,13 @@ fn validate_plugin_manifest(
 pub fn to_skill_id(name: &str) -> String {
     name.to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .split('-')
         .filter(|s| !s.is_empty())
@@ -877,7 +879,10 @@ You are an expert text analyst.
             pkg.manifest.version,
             semver::Version::parse("0.1.0").unwrap()
         );
-        assert_eq!(pkg.manifest.description.as_deref(), Some("A greeter skill."));
+        assert_eq!(
+            pkg.manifest.description.as_deref(),
+            Some("A greeter skill.")
+        );
         assert_eq!(pkg.manifest.license.as_deref(), Some("MIT"));
         // No schemas declared — both should be None.
         assert!(pkg.manifest.inputs_schema.is_none());
@@ -897,7 +902,10 @@ You are an expert text analyst.
 
         assert_eq!(pkg.manifest.id, "passage-analyzer");
         assert_eq!(pkg.manifest.version.to_string(), "1.0.0");
-        assert_eq!(pkg.manifest.permissions.filesystem, FilesystemAccess::ReadOnly);
+        assert_eq!(
+            pkg.manifest.permissions.filesystem,
+            FilesystemAccess::ReadOnly
+        );
         assert_eq!(pkg.manifest.permissions.clipboard, ClipboardAccess::None);
         assert_eq!(pkg.manifest.execution.timeout_ms, 60000);
         assert_eq!(pkg.manifest.execution.memory_mb, 1024);
@@ -956,10 +964,7 @@ You are an expert text analyst.
 
         match err {
             ManifestError::Invalid(msg) => {
-                assert!(
-                    msg.contains("mutually exclusive"),
-                    "got: {msg}"
-                );
+                assert!(msg.contains("mutually exclusive"), "got: {msg}");
             }
             other => panic!("expected ManifestError::Invalid, got: {other:?}"),
         }
@@ -1002,7 +1007,9 @@ You are an expert text analyst.
         );
         let model = pkg.manifest.model_requirements.as_ref().unwrap();
         assert_eq!(model.fallback, Some(ModelFallback::McpSampling));
-        assert!(pkg.workflow.steps.len() > 1, "complex skill has multiple steps");
+        assert!(
+            pkg.workflow.steps.len() > 1,
+            "complex skill has multiple steps"
+        );
     }
-
 }

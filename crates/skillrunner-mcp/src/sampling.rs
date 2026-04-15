@@ -167,10 +167,7 @@ pub struct HybridModelClient<'a> {
 }
 
 impl<'a> HybridModelClient<'a> {
-    pub fn new(
-        ollama: Option<&'a dyn ModelClient>,
-        sampling: &'a McpSamplingClient,
-    ) -> Self {
+    pub fn new(ollama: Option<&'a dyn ModelClient>, sampling: &'a McpSamplingClient) -> Self {
         Self { ollama, sampling }
     }
 }

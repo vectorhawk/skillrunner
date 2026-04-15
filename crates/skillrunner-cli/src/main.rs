@@ -857,13 +857,15 @@ fn main() -> Result<()> {
                         };
 
                         if should_enrich {
-                            let description =
-                                pkg.manifest.description.as_deref().unwrap_or("").to_string();
+                            let description = pkg
+                                .manifest
+                                .description
+                                .as_deref()
+                                .unwrap_or("")
+                                .to_string();
                             let skill_md_path = bundle.output_dir.join("SKILL.md");
-                            let skill_md_content =
-                                std::fs::read_to_string(&skill_md_path).with_context(|| {
-                                    format!("failed to read {skill_md_path}")
-                                })?;
+                            let skill_md_content = std::fs::read_to_string(&skill_md_path)
+                                .with_context(|| format!("failed to read {skill_md_path}"))?;
                             let body = extract_skill_md_body(&skill_md_content);
 
                             let rec = skillrunner_core::recommend::recommend_from_prompt(
@@ -885,9 +887,8 @@ fn main() -> Result<()> {
                                 &body,
                                 &rec,
                             );
-                            std::fs::write(&skill_md_path, enriched).with_context(|| {
-                                format!("failed to write {skill_md_path}")
-                            })?;
+                            std::fs::write(&skill_md_path, enriched)
+                                .with_context(|| format!("failed to write {skill_md_path}"))?;
                             println!("\nUpdated SKILL.md with metadata recommendations.");
                         }
                     }
@@ -1012,8 +1013,7 @@ fn main() -> Result<()> {
             } => {
                 let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
                 let registry = RegistryClient::new(&url);
-                let installed_ver =
-                    install_from_registry(&app.state, &registry, &skill_id, None)?;
+                let installed_ver = install_from_registry(&app.state, &registry, &skill_id, None)?;
                 println!("Updated {} to v{}", skill_id, installed_ver);
             }
             SkillCommands::Install {

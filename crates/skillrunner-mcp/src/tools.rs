@@ -858,7 +858,9 @@ fn handle_list(
         match skillrunner_core::updater::check_skill_updates(state, &registry, &policy_client) {
             Ok(0) => {}
             Ok(n) => {
-                sync_msg = Some(format!("🔄 Synced with registry: {n} skill(s) updated.\n\n"));
+                sync_msg = Some(format!(
+                    "🔄 Synced with registry: {n} skill(s) updated.\n\n"
+                ));
                 // Any in-memory update-check results may now be stale (we just
                 // pulled changes). Clear the whole cache — next skill call
                 // repopulates on demand.
@@ -1244,8 +1246,8 @@ fn build_recommendations_from_args(
     args: &serde_json::Value,
 ) -> skillrunner_core::recommend::Recommendations {
     use skillrunner_core::recommend::{
-        RecommendationConfidence, RecommendedExecution, RecommendedModel, RecommendedPermissions,
-        Recommendations,
+        RecommendationConfidence, Recommendations, RecommendedExecution, RecommendedModel,
+        RecommendedPermissions,
     };
 
     let triggers = args
@@ -1357,9 +1359,8 @@ fn scaffold_skill_bundle(
     // the full-metadata version (import_skill_md generates defaults; we need
     // to inject the vh_* fields the user confirmed or we inferred).
     if let Some(rec) = recommendations {
-        let mut fm = format!(
-            "---\nname: {name}\ndescription: {description}\nlicense: Apache-2.0\n"
-        );
+        let mut fm =
+            format!("---\nname: {name}\ndescription: {description}\nlicense: Apache-2.0\n");
 
         if !rec.triggers.is_empty() {
             fm.push_str("vh_triggers:\n");
@@ -1478,11 +1479,7 @@ fn handle_publish(
     let result = match registry.compile_and_publish(source_bytes) {
         Ok(resp) => {
             let name = &resp.frontmatter.name;
-            let version = resp
-                .frontmatter
-                .vh_version
-                .as_deref()
-                .unwrap_or("unknown");
+            let version = resp.frontmatter.vh_version.as_deref().unwrap_or("unknown");
             let mut msg = format!("Published '{name}' v{version} to registry successfully.");
             for w in &resp.warnings {
                 msg.push_str(&format!("\nWarning: {w}"));
@@ -2628,7 +2625,11 @@ fn handle_rate(arguments: &serde_json::Value, state: &AppState) -> ToolCallResul
         Ok(conn) => {
             match skillrunner_core::ratings::record_rating(&conn, skill_id, &version, rating) {
                 Ok(()) => {
-                    let label = if rating == "up" { "Thumbs up" } else { "Thumbs down" };
+                    let label = if rating == "up" {
+                        "Thumbs up"
+                    } else {
+                        "Thumbs down"
+                    };
                     ToolCallResult::success(format!(
                         "{label} recorded for {skill_id}. Thanks for the feedback!"
                     ))
@@ -2785,15 +2786,14 @@ fn handle_skill_run(
             // Open a separate connection so failures here never block the response.
             if let Ok(conn) = Connection::open(&state.db_path) {
                 let version_str = result.version.clone();
-                let prompt_due =
-                    match skillrunner_core::ratings::increment_execution_count(
-                        &conn,
-                        &result.skill_id,
-                        &version_str,
-                    ) {
-                        Ok(count) => skillrunner_core::ratings::should_prompt_for_rating(count),
-                        Err(_) => false,
-                    };
+                let prompt_due = match skillrunner_core::ratings::increment_execution_count(
+                    &conn,
+                    &result.skill_id,
+                    &version_str,
+                ) {
+                    Ok(count) => skillrunner_core::ratings::should_prompt_for_rating(count),
+                    Err(_) => false,
+                };
 
                 if prompt_due {
                     let already_rated = skillrunner_core::ratings::has_existing_rating(
@@ -2820,9 +2820,8 @@ fn handle_skill_run(
                 // Extract skill_id+version from resolver or fall back to the name we were given.
                 // At this point we don't have a resolved version, so we record against the
                 // skill_id string with an empty version sentinel that the registry can ignore.
-                let _ = skillrunner_core::ratings::record_failed_execution(
-                    &conn, skill_id, "unknown",
-                );
+                let _ =
+                    skillrunner_core::ratings::record_failed_execution(&conn, skill_id, "unknown");
             }
 
             // Surface blocked/unpublished errors with a clear, actionable message
@@ -3003,7 +3002,11 @@ mod tests {
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
         install_unpacked_skill(&state, &pkg).unwrap();
 
-        let result = handle_list(&state, &None, &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())));
+        let result = handle_list(
+            &state,
+            &None,
+            &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        );
         assert!(result.is_error.is_none());
         let text = &result.content[0].text;
         assert!(
@@ -3020,7 +3023,11 @@ mod tests {
         let state_root = temp_root("handle-list-empty");
         let state = AppState::bootstrap_in(state_root.clone()).unwrap();
 
-        let result = handle_list(&state, &None, &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())));
+        let result = handle_list(
+            &state,
+            &None,
+            &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        );
         assert!(result.is_error.is_none());
         assert!(result.content[0].text.contains("No skills installed"));
 
@@ -3074,7 +3081,11 @@ mod tests {
         assert!(result.content[0].text.contains("0.1.0"));
 
         // Verify the skill appears in the list
-        let list_result = handle_list(&state, &None, &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())));
+        let list_result = handle_list(
+            &state,
+            &None,
+            &std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        );
         assert!(list_result.content[0].text.contains("test-skill"));
 
         let _ = fs::remove_dir_all(&state_root);
@@ -3199,7 +3210,10 @@ mod tests {
             "expected recommendations, got: {text}"
         );
         assert!(text.contains("vh_triggers"), "should include triggers");
-        assert!(text.contains("vh_permissions"), "should include permissions");
+        assert!(
+            text.contains("vh_permissions"),
+            "should include permissions"
+        );
         assert!(text.contains("vh_model"), "should include model");
         assert!(text.contains("vh_execution"), "should include execution");
     }
@@ -3233,10 +3247,7 @@ mod tests {
             skill_md.contains("vh_permissions"),
             "SKILL.md should have permissions"
         );
-        assert!(
-            skill_md.contains("vh_model"),
-            "SKILL.md should have model"
-        );
+        assert!(skill_md.contains("vh_model"), "SKILL.md should have model");
         assert!(
             skill_md.contains("vh_execution"),
             "SKILL.md should have execution"
@@ -4385,10 +4396,7 @@ mod tests {
         // Prefix must come before the skill output
         let prefix_pos = text.find("\u{25b6}").unwrap();
         let output_pos = text.find("skill output text").unwrap();
-        assert!(
-            prefix_pos < output_pos,
-            "prefix must appear before output"
-        );
+        assert!(prefix_pos < output_pos, "prefix must appear before output");
 
         let _ = fs::remove_dir_all(&state_root);
         let _ = fs::remove_dir_all(&skill_root);
@@ -4417,7 +4425,11 @@ mod tests {
             &cache,
         );
 
-        assert!(result.is_error.is_none(), "expected success, got: {:?}", result.content[0].text);
+        assert!(
+            result.is_error.is_none(),
+            "expected success, got: {:?}",
+            result.content[0].text
+        );
         let text = &result.content[0].text;
         assert!(
             !text.contains("\u{25b6}"),
