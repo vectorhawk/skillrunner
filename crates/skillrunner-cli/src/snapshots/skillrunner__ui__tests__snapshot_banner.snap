@@ -1,0 +1,7 @@
+---
+source: crates/skillrunner-cli/src/ui_tests.rs
+expression: output
+---
+
+  VectorHawk  0.1.2
+  Governed AI skills for your team

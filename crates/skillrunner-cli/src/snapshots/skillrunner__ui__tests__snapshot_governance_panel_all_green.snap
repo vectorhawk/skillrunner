@@ -1,0 +1,14 @@
+---
+source: crates/skillrunner-cli/src/ui_tests.rs
+expression: output
+---
+
+  ── Governance ──────────────────────────────────
+  Publisher : VectorHawk Official [✓ verified]
+  Policy    : approved (org context not yet enforced)
+  Scopes    :
+    • read:files [risk: low]
+    • llm:call [risk: medium]
+  Scan      : clean (0 findings)
+  Audit     : last audited 2025-11-01T00:00:00Z by security-team
+  ────────────────────────────────────────────────

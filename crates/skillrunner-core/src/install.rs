@@ -1,19 +1,33 @@
 use crate::state::AppState;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use skillrunner_manifest::SkillPackage;
 use std::fs;
 
-pub fn install_unpacked_skill(state: &AppState, skill: &SkillPackage) -> Result<()> {
+/// Controls how a skill source directory is placed into the versioned install layout.
+#[derive(Clone, Copy, Debug)]
+pub enum InstallMode {
+    /// Copy the source directory into `versions/{ver}/` (default, used by registry installs).
+    Copy,
+    /// Make `versions/{ver}/` itself a symlink pointing at the source directory.
+    /// Changes to the source directory are immediately visible through `active/`.
+    /// Only supported on Unix; returns an error on other platforms.
+    Symlink,
+}
+
+pub fn install_unpacked_skill(
+    state: &AppState,
+    skill: &SkillPackage,
+    mode: InstallMode,
+) -> Result<()> {
     let install_root = state.root_dir.join("skills").join(&skill.manifest.id);
     let versions_dir = install_root.join("versions");
     fs::create_dir_all(&versions_dir)?;
 
     let version_dir = versions_dir.join(skill.manifest.version.to_string());
-    if version_dir.exists() {
-        fs::remove_dir_all(&version_dir)?;
-    }
-    copy_dir_all::copy_dir_all(&skill.root, &version_dir)?;
+
+    // Place the skill content according to the requested mode.
+    let source_type = install_with_mode(&skill.root, &version_dir, mode)?;
 
     let active_dir = install_root.join("active");
     if active_dir.exists() {
@@ -35,15 +49,83 @@ pub fn install_unpacked_skill(state: &AppState, skill: &SkillPackage) -> Result<
         ],
     )?;
     conn.execute(
-        "INSERT OR REPLACE INTO skill_versions(skill_id, version, install_path, source_type) VALUES (?, ?, ?, 'local_dir')",
+        "INSERT OR REPLACE INTO skill_versions(skill_id, version, install_path, source_type) VALUES (?, ?, ?, ?)",
         params![
             skill.manifest.id,
             skill.manifest.version.to_string(),
             version_dir.as_str(),
+            source_type,
         ],
     )?;
 
     Ok(())
+}
+
+/// Perform the file-system placement for one version slot, returning the
+/// `source_type` string to record in `skill_versions`.
+fn install_with_mode(
+    source: &camino::Utf8Path,
+    version_dir: &camino::Utf8Path,
+    mode: InstallMode,
+) -> Result<&'static str> {
+    match mode {
+        InstallMode::Copy => {
+            if version_dir.exists() {
+                fs::remove_dir_all(version_dir)
+                    .with_context(|| format!("failed to remove existing {version_dir}"))?;
+            }
+            copy_dir_all::copy_dir_all(source, version_dir)
+                .with_context(|| format!("failed to copy skill into {version_dir}"))?;
+            Ok("local_dir")
+        }
+        InstallMode::Symlink => {
+            symlink_version_dir(source, version_dir)?;
+            Ok("local_symlink")
+        }
+    }
+}
+
+/// Create `version_dir` as a symlink pointing at the canonical (absolute) path
+/// of `source`.
+///
+/// Using an absolute target ensures the symlink remains valid regardless of
+/// the working directory at resolution time.
+///
+/// Only available on Unix. On other platforms this always returns an error.
+fn symlink_version_dir(
+    source: &camino::Utf8Path,
+    version_dir: &camino::Utf8Path,
+) -> Result<()> {
+    #[cfg(target_family = "unix")]
+    {
+        // Resolve to an absolute path so the symlink target is stable.
+        let abs_source = std::fs::canonicalize(source)
+            .with_context(|| format!("failed to canonicalize source path {source}"))?;
+
+        // Remove a pre-existing entry so the symlink placement is idempotent.
+        if version_dir.exists() || version_dir.is_symlink() {
+            fs::remove_file(version_dir)
+                .or_else(|_| fs::remove_dir_all(version_dir))
+                .with_context(|| format!("failed to remove existing {version_dir}"))?;
+        }
+        std::os::unix::fs::symlink(&abs_source, version_dir)
+            .with_context(|| {
+                format!(
+                    "failed to create symlink {} -> {}",
+                    version_dir,
+                    abs_source.display()
+                )
+            })?;
+        Ok(())
+    }
+    #[cfg(not(target_family = "unix"))]
+    {
+        let _ = (source, version_dir);
+        Err(anyhow::anyhow!(
+            "--link (Symlink install mode) is only supported on Unix; \
+             use the default copy mode on this platform"
+        ))
+    }
 }
 
 /// Uninstall a skill completely.
@@ -252,7 +334,8 @@ mod tests {
         .expect("example skill should load");
 
         let version = skill.manifest.version.to_string();
-        install_unpacked_skill(&state, &skill).expect("install should succeed");
+        install_unpacked_skill(&state, &skill, InstallMode::Copy)
+            .expect("install should succeed");
 
         let install_root = state.root_dir.join("skills").join("contract-compare");
         let version_dir = install_root.join("versions").join(&version);
@@ -303,15 +386,94 @@ mod tests {
         let _ = fs::remove_dir_all(&state.root_dir);
     }
 
-    /// Helper: load and install the contract-compare example skill into `state`.
+    /// Helper: load and install the contract-compare example skill into `state` using Copy mode.
     fn install_example_skill(state: &AppState) -> String {
         let skill = SkillPackage::load_from_dir(
             Utf8PathBuf::from("../..").join("examples/skills/contract-compare"),
         )
         .expect("example skill should load");
         let version = skill.manifest.version.to_string();
-        install_unpacked_skill(state, &skill).expect("install should succeed");
+        install_unpacked_skill(state, &skill, InstallMode::Copy).expect("install should succeed");
         version
+    }
+
+    /// Verify that Symlink mode makes `versions/{ver}/` itself a symlink to the
+    /// source dir, so edits to the source are visible through `active/`.
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn install_symlink_mode_links_source_dir() {
+        use std::io::Write;
+
+        let root = temp_root("symlink-install");
+        let state = AppState::bootstrap_in(root.clone()).expect("state bootstrap should succeed");
+
+        // Load the example skill so we have a valid SkillPackage.
+        let skill = SkillPackage::load_from_dir(
+            Utf8PathBuf::from("../..").join("examples/skills/contract-compare"),
+        )
+        .expect("example skill should load");
+        let version = skill.manifest.version.to_string();
+        let source_dir = skill.root.clone();
+
+        install_unpacked_skill(&state, &skill, InstallMode::Symlink)
+            .expect("symlink install should succeed");
+
+        let install_root = state.root_dir.join("skills").join("contract-compare");
+
+        // `versions/{ver}/` must be a symlink pointing at the source directory.
+        let version_dir = install_root.join("versions").join(&version);
+        assert!(
+            version_dir.is_symlink(),
+            "versions/{version} should be a symlink in Symlink mode"
+        );
+        let symlink_target =
+            fs::read_link(version_dir.as_std_path()).expect("symlink target should be readable");
+        let canonical_source = fs::canonicalize(source_dir.as_std_path())
+            .expect("source dir should canonicalize");
+        assert_eq!(
+            symlink_target,
+            canonical_source,
+            "symlink should point at the canonical skill source directory"
+        );
+
+        // `active/` points at `versions/{ver}/` as normal.
+        let active_dir = install_root.join("active");
+        assert!(active_dir.exists(), "active symlink should exist");
+
+        // Writes to a file in the source dir are visible through `active/`.
+        let probe_path = source_dir.join("__symlink_probe__.txt");
+        {
+            let mut f = std::fs::File::create(probe_path.as_std_path())
+                .expect("probe file creation should succeed");
+            f.write_all(b"hello symlink").expect("probe write should succeed");
+        }
+        let through_active = active_dir.join("__symlink_probe__.txt");
+        assert!(
+            through_active.exists(),
+            "file written into source dir should be visible through active/"
+        );
+        let content = fs::read_to_string(through_active.as_std_path())
+            .expect("reading through active/ should succeed");
+        assert_eq!(content, "hello symlink");
+
+        // Clean up probe file so we don't dirty the example skill.
+        let _ = fs::remove_file(probe_path.as_std_path());
+
+        // DB row must record source_type = 'local_symlink'.
+        let conn = Connection::open(&state.db_path).expect("db should open");
+        let source_type: String = conn
+            .query_row(
+                "SELECT source_type FROM skill_versions WHERE skill_id = ?1 AND version = ?2",
+                rusqlite::params!["contract-compare", &version],
+                |row| row.get(0),
+            )
+            .expect("skill_versions row should exist");
+        assert_eq!(
+            source_type, "local_symlink",
+            "skill_versions.source_type should be 'local_symlink'"
+        );
+
+        let _ = fs::remove_dir_all(&state.root_dir);
     }
 
     #[test]

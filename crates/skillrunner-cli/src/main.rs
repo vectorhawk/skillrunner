@@ -6,8 +6,8 @@ use skillrunner_core::{
     app::SkillRunnerApp,
     auth::{self, AuthClient},
     executor::run_skill,
-    import::import_skill_md,
-    install::{install_unpacked_skill, uninstall_skill},
+    import::import_local_skill_md,
+    install::{install_unpacked_skill, uninstall_skill, InstallMode},
     managed::load_managed_config,
     mcp_governance,
     ollama::{resolve_model, OllamaClient},
@@ -21,11 +21,14 @@ use skillrunner_core::{
     validator::validate_bundle,
 };
 use skillrunner_manifest::SkillPackage;
+
+mod ui;
 use skillrunner_mcp::{
     migration::{list_backups, migrate_existing_servers, restore_backup},
     server::{run_server, McpServerConfig},
     setup::{
-        configure_client, detect_ai_clients, install_claude_skills, install_npx_claude_hook,
+        client_skill_dir, configure_client, detect_ai_clients, fanout_skill_to_clients,
+        fanout_uninstall_skill, install_claude_skills, install_npx_claude_hook,
         install_npx_shell_wrapper, mark_first_run_offered,
     },
 };
@@ -163,15 +166,30 @@ enum AuthCommands {
 
 #[derive(Subcommand)]
 enum SkillCommands {
-    /// Import a SKILL.md file and scaffold a skill bundle
+    /// Import a SKILL.md file, GitHub URL, npx command, MCP JSON, or package
+    /// reference. Pass `-` to read from stdin.
     Import {
-        path: Utf8PathBuf,
+        /// Path to a SKILL.md file, `-` for stdin, or any importable reference
+        /// (GitHub URL, npx command, MCP JSON snippet, package name).
+        input: String,
+        /// Force local SKILL.md import even if the input looks non-local
+        #[arg(long)]
+        local: bool,
+        /// Route non-local input through the registry classifier (experimental)
+        #[arg(long)]
+        experimental_registry_import: bool,
+        /// Registry URL for registry-routed imports
+        #[arg(long)]
+        registry_url: Option<String>,
         /// Auto-accept metadata recommendations for missing fields
         #[arg(long)]
         accept_suggestions: bool,
         /// Skip metadata enrichment
         #[arg(long)]
         skip_metadata: bool,
+        /// Non-interactive: skip all confirms (treat as Yes)
+        #[arg(long)]
+        yes: bool,
     },
     /// Create a new skill with smart metadata recommendations
     Author {
@@ -190,6 +208,9 @@ enum SkillCommands {
         /// Output directory (default: current directory)
         #[arg(long, default_value = ".")]
         output_dir: Utf8PathBuf,
+        /// Non-interactive: skip all confirms (treat as Yes)
+        #[arg(long)]
+        yes: bool,
     },
     Search {
         query: String,
@@ -210,6 +231,32 @@ enum SkillCommands {
         /// VectorHawk registry URL (overrides VECTORHAWK_REGISTRY_URL)
         #[arg(long)]
         registry_url: Option<String>,
+        /// Symlink the skill source directory into the install layout instead of copying it.
+        /// Edits to the source directory are immediately visible through `active/`.
+        /// Only valid for local paths (not registry installs). Unix only.
+        #[arg(long)]
+        link: bool,
+        /// Bypass a blocked or pending policy check.
+        /// CLIENT-SIDE ONLY — the VectorHawk gateway still enforces policy
+        /// regardless of this flag. Use only for testing or override workflows
+        /// where your admin has explicitly approved the exception.
+        #[arg(long)]
+        force: bool,
+        /// Print the governance panel and exit without installing.
+        /// Non-TTY output is plain text, suitable for scripted use.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the multi-agent fan-out step after install.
+        #[arg(long)]
+        no_fanout: bool,
+        /// Comma-separated list of client names to fan out to (e.g. "claude,cursor").
+        /// When omitted, all detected clients with skill directories are included.
+        #[arg(long, value_name = "CLIENTS")]
+        clients: Option<String>,
+        /// Non-interactive: skip all confirms (treat as Yes).
+        /// In non-TTY mode confirms are always skipped regardless of this flag.
+        #[arg(long)]
+        yes: bool,
     },
     /// Publish a skill to the registry
     Publish {
@@ -328,6 +375,95 @@ enum PluginCommands {
     },
 }
 
+/// Drive the Phase-3 multi-agent fan-out after a successful skill install.
+///
+/// - `skill_id` — skill identifier (entry name under each client skill dir).
+/// - `active_path` — canonical `active/` path; symlinks auto-update on version change.
+/// - `no_fanout` — when `true`, skip entirely.
+/// - `clients_filter` — comma-separated allow-list (e.g. `"claude,cursor"`); `None` = all.
+fn run_fanout(
+    skill_id: &str,
+    active_path: &std::path::Path,
+    no_fanout: bool,
+    clients_filter: Option<&str>,
+) {
+    if no_fanout {
+        return;
+    }
+
+    let all_clients = detect_ai_clients("");
+
+    // Build the allow-list once (lowercased for case-insensitive compare).
+    let allow_set: Option<Vec<String>> = clients_filter.map(|s| {
+        s.split(',')
+            .map(|t| t.trim().to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect()
+    });
+
+    // Filter to clients that have a skill directory, then apply the allow-list.
+    let mut eligible: Vec<&skillrunner_mcp::setup::ClientConfig> = all_clients
+        .iter()
+        .filter(|c| client_skill_dir(c).is_some())
+        .collect();
+
+    if let Some(ref names) = allow_set {
+        eligible.retain(|c| names.contains(&c.name.to_lowercase()));
+    }
+
+    if eligible.is_empty() {
+        return;
+    }
+
+    // TTY: render a MultiSelect so the user can deselect clients.
+    let selected_indices: Vec<usize> = if ui::is_tty() {
+        let display_names: Vec<&str> = eligible.iter().map(|c| c.name.as_str()).collect();
+        let defaults: Vec<bool> = vec![true; display_names.len()];
+        match dialoguer::MultiSelect::with_theme(&ui::theme())
+            .with_prompt("Fan out skill to AI client skill directories")
+            .items(&display_names)
+            .defaults(&defaults)
+            .interact()
+        {
+            Ok(indices) => indices,
+            Err(_) => return, // Ctrl-C — abort silently
+        }
+    } else {
+        (0..eligible.len()).collect()
+    };
+
+    let selected: Vec<&skillrunner_mcp::setup::ClientConfig> = selected_indices
+        .iter()
+        .map(|&i| eligible[i])
+        .collect();
+
+    if selected.is_empty() {
+        return;
+    }
+
+    match fanout_skill_to_clients(skill_id, active_path, &selected) {
+        Ok(report) => {
+            if !report.installed.is_empty() {
+                let rows: Vec<(String, String)> = report
+                    .installed
+                    .iter()
+                    .map(|n| (n.clone(), "linked".to_string()))
+                    .chain(
+                        report
+                            .skipped
+                            .iter()
+                            .map(|(n, r)| (n.clone(), format!("skipped: {r}"))),
+                    )
+                    .collect();
+                ui::summary_box("Fan-out", &rows);
+            }
+        }
+        Err(e) => {
+            eprintln!("WARNING: fan-out failed: {e}");
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -339,6 +475,17 @@ fn main() -> Result<()> {
             command: McpCommands::Serve { .. }
         }
     );
+    // Propagate MCP-serve flag into the UI module so TTY helpers are suppressed
+    // for the lifetime of the stdio JSON-RPC transport.
+    ui::set_mcp_serve(is_mcp_serve);
+
+    // Emit the startup banner only on real terminals. The is_tty() guard inside
+    // banner() also checks IS_MCP_SERVE, so this is doubly protected against
+    // corrupting the stdio JSON-RPC transport.
+    if ui::is_tty() {
+        ui::banner();
+    }
+
     if is_mcp_serve {
         tracing_subscriber::fmt()
             .with_env_filter("info")
@@ -828,70 +975,154 @@ fn main() -> Result<()> {
         },
         Commands::Skill { command } => match command {
             SkillCommands::Import {
-                path,
+                input,
+                local,
+                experimental_registry_import,
+                registry_url,
                 accept_suggestions,
                 skip_metadata,
+                yes,
             } => {
-                let bundle = import_skill_md(&path)?;
-                println!("Imported skill: {}", bundle.id);
-                println!("Output:         {}", bundle.output_dir);
-                for f in &bundle.files {
-                    println!("  wrote {f}");
-                }
+                // Resolve the raw input string: `-` means read from stdin.
+                let raw_input = if input == "-" {
+                    use std::io::Read;
+                    let mut buf = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut buf)
+                        .context("failed to read from stdin")?;
+                    buf
+                } else {
+                    input.clone()
+                };
 
-                if !skip_metadata {
-                    let pkg = SkillPackage::load_from_dir(&bundle.output_dir)?;
-                    let missing = detect_missing_metadata(&pkg);
-                    if !missing.is_empty() {
-                        println!("\nMissing recommended metadata: {}", missing.join(", "));
+                // Routing decision:
+                //   1. --local flag        => always use local SKILL.md importer.
+                //   2. Path exists on disk => local SKILL.md importer.
+                //   3. --experimental-registry-import => registry classifier.
+                //   4. Otherwise => guide the user with a clear error.
+                let path_on_disk = camino::Utf8Path::new(raw_input.trim());
+                let is_local_path = local || path_on_disk.exists();
 
-                        let should_enrich = if accept_suggestions {
-                            true
-                        } else {
-                            print!("Run recommendation engine to fill these? [Y/n]: ");
-                            std::io::Write::flush(&mut std::io::stdout())?;
-                            let mut input = String::new();
-                            std::io::stdin().read_line(&mut input)?;
-                            let answer = input.trim().to_lowercase();
-                            answer.is_empty() || answer == "y" || answer == "yes"
-                        };
+                if is_local_path {
+                    let skill_md_path = camino::Utf8PathBuf::from(raw_input.trim());
+                    let bundle = import_local_skill_md(&skill_md_path)?;
+                    println!("Imported skill: {}", bundle.id);
+                    println!("Output:         {}", bundle.output_dir);
+                    for f in &bundle.files {
+                        println!("  wrote {f}");
+                    }
 
-                        if should_enrich {
-                            let description = pkg
-                                .manifest
-                                .description
-                                .as_deref()
-                                .unwrap_or("")
-                                .to_string();
-                            let skill_md_path = bundle.output_dir.join("SKILL.md");
-                            let skill_md_content = std::fs::read_to_string(&skill_md_path)
-                                .with_context(|| format!("failed to read {skill_md_path}"))?;
-                            let body = extract_skill_md_body(&skill_md_content);
+                    if !skip_metadata {
+                        let pkg = SkillPackage::load_from_dir(&bundle.output_dir)?;
+                        let missing = detect_missing_metadata(&pkg);
+                        if !missing.is_empty() {
+                            println!("\nMissing recommended metadata: {}", missing.join(", "));
 
-                            let rec = skillrunner_core::recommend::recommend_from_prompt(
-                                &pkg.manifest.name,
-                                &description,
-                                &body,
-                            );
-
-                            let rec = if accept_suggestions {
-                                println!("Applying recommended metadata...");
-                                rec
+                            let should_enrich = if accept_suggestions || yes {
+                                true
+                            } else if ui::is_tty() {
+                                dialoguer::Confirm::with_theme(&ui::theme())
+                                    .with_prompt("Run recommendation engine to fill these?")
+                                    .default(true)
+                                    .interact()
+                                    .unwrap_or(false)
                             } else {
-                                prompt_for_recommendations(rec)?
+                                // Non-TTY, non-yes: default to false (safe no-op).
+                                false
                             };
 
-                            let enriched = build_enriched_skill_md(
-                                &pkg.manifest.name,
-                                &description,
-                                &body,
-                                &rec,
-                            );
-                            std::fs::write(&skill_md_path, enriched)
-                                .with_context(|| format!("failed to write {skill_md_path}"))?;
-                            println!("\nUpdated SKILL.md with metadata recommendations.");
+                            if should_enrich {
+                                let description = pkg
+                                    .manifest
+                                    .description
+                                    .as_deref()
+                                    .unwrap_or("")
+                                    .to_string();
+                                let skill_md_path = bundle.output_dir.join("SKILL.md");
+                                let skill_md_content =
+                                    std::fs::read_to_string(&skill_md_path).with_context(
+                                        || format!("failed to read {skill_md_path}"),
+                                    )?;
+                                let body = extract_skill_md_body(&skill_md_content);
+
+                                let rec = skillrunner_core::recommend::recommend_from_prompt(
+                                    &pkg.manifest.name,
+                                    &description,
+                                    &body,
+                                );
+
+                                let rec = if accept_suggestions {
+                                    println!("Applying recommended metadata...");
+                                    rec
+                                } else {
+                                    prompt_for_recommendations(rec)?
+                                };
+
+                                let enriched = build_enriched_skill_md(
+                                    &pkg.manifest.name,
+                                    &description,
+                                    &body,
+                                    &rec,
+                                );
+                                std::fs::write(&skill_md_path, enriched)
+                                    .with_context(|| format!("failed to write {skill_md_path}"))?;
+                                println!("\nUpdated SKILL.md with metadata recommendations.");
+                            }
                         }
                     }
+                } else if experimental_registry_import {
+                    // Registry-routed import path (Phase 5b).
+                    let url = resolve_registry_url(registry_url, managed_registry_url.as_deref())
+                        .unwrap_or_else(|| DEFAULT_REGISTRY_URL.to_string());
+                    let mut reg = RegistryClient::new(&url);
+                    // Load auth token; the registry import endpoint requires a
+                    // valid Bearer token with org context.
+                    if let Ok(app_state) = SkillRunnerApp::bootstrap() {
+                        if let Ok(Some(tokens)) = auth::load_tokens(&app_state.state, &url) {
+                            reg.set_auth(tokens.access_token);
+                        }
+                    }
+
+                    let outcome =
+                        skillrunner_core::import::import_via_registry(&reg, &raw_input)
+                            .context("registry import failed")?;
+
+                    match outcome {
+                        skillrunner_core::import::ImportOutcome::SkillScaffolded { bundle } => {
+                            ui::summary_box(
+                                "Skill Scaffolded",
+                                &[("Bundle".to_string(), bundle.to_string())],
+                            );
+                        }
+                        skillrunner_core::import::ImportOutcome::McpServerRequested {
+                            server_name,
+                            status,
+                        } => {
+                            ui::summary_box(
+                                "MCP Server Requested",
+                                &[
+                                    ("Server".to_string(), server_name),
+                                    ("Status".to_string(), status),
+                                ],
+                            );
+                        }
+                        skillrunner_core::import::ImportOutcome::SkillSubmitted {
+                            submission_id,
+                            status,
+                        } => {
+                            ui::summary_box(
+                                "Skill Submitted",
+                                &[
+                                    ("Submission ID".to_string(), submission_id),
+                                    ("Status".to_string(), status),
+                                ],
+                            );
+                        }
+                    }
+                } else {
+                    anyhow::bail!(
+                        "Input does not look like a local file path.\n                         To import a GitHub URL, npx command, MCP JSON, or package reference,                          pass --experimental-registry-import (requires registry auth).\n                         To force local SKILL.md import, pass --local."
+                    );
                 }
             }
             SkillCommands::Author {
@@ -900,19 +1131,33 @@ fn main() -> Result<()> {
                 accept_suggestions,
                 skip_metadata,
                 output_dir,
+                yes,
             } => {
+                // --yes is a non-interactive alias: treat it as accept_suggestions
+                // so all recommendation confirms are skipped (treat as Yes).
+                let accept_suggestions = accept_suggestions || yes;
                 let skill_name = match name {
                     Some(n) => n,
                     None => {
-                        print!("Skill name: ");
-                        std::io::Write::flush(&mut std::io::stdout())?;
-                        let mut input = String::new();
-                        std::io::stdin().read_line(&mut input)?;
-                        let trimmed = input.trim().to_string();
-                        if trimmed.is_empty() {
-                            anyhow::bail!("Skill name cannot be empty");
+                        if ui::is_tty() {
+                            dialoguer::Input::<String>::with_theme(&ui::theme())
+                                .with_prompt("Skill name")
+                                .validate_with(|s: &String| {
+                                    if s.trim().is_empty() {
+                                        Err("Skill name cannot be empty")
+                                    } else {
+                                        Ok(())
+                                    }
+                                })
+                                .interact_text()
+                                .context("failed to read skill name")?
+                                .trim()
+                                .to_string()
+                        } else {
+                            anyhow::bail!(
+                                "Skill name is required; pass --name <name> in non-interactive mode"
+                            );
                         }
-                        trimmed
                     }
                 };
 
@@ -1003,7 +1248,21 @@ fn main() -> Result<()> {
             }
             SkillCommands::Uninstall { skill_id } => {
                 match uninstall_skill(&app.state, &skill_id)? {
-                    Some(version) => println!("Uninstalled {}@{}", skill_id, version),
+                    Some(version) => {
+                        println!("Uninstalled {}@{}", skill_id, version);
+                        let all_clients = detect_ai_clients("");
+                        let client_refs: Vec<&skillrunner_mcp::setup::ClientConfig> =
+                            all_clients.iter().collect();
+                        let report = fanout_uninstall_skill(&skill_id, &client_refs);
+                        if !report.installed.is_empty() {
+                            let rows: Vec<(String, String)> = report
+                                .installed
+                                .iter()
+                                .map(|n| (n.clone(), "removed".to_string()))
+                                .collect();
+                            ui::summary_box("Fan-out removed", &rows);
+                        }
+                    }
                     None => println!("Skill '{}' is not installed.", skill_id),
                 }
             }
@@ -1020,18 +1279,60 @@ fn main() -> Result<()> {
                 skill_ref,
                 version,
                 registry_url,
+                link,
+                force,
+                dry_run,
+                no_fanout,
+                clients: clients_filter,
+                yes,
             } => {
                 // Heuristic: if skill_ref looks like a path, install from local dir.
                 let is_local = skill_ref.contains('/')
                     || skill_ref.starts_with('.')
                     || std::path::Path::new(&skill_ref).exists();
 
+                if link && !is_local {
+                    anyhow::bail!(
+                        "--link requires a local path (not a registry skill ID); \
+                         pass a path like ./my-skill or /absolute/path/to/skill"
+                    );
+                }
+
                 if is_local {
                     let path = Utf8PathBuf::from(&skill_ref);
                     let skill = SkillPackage::load_from_dir(path)?;
-                    install_unpacked_skill(&app.state, &skill)?;
-                    println!("Installed {}@{}", skill.manifest.id, skill.manifest.version);
+                    let mode = if link {
+                        InstallMode::Symlink
+                    } else {
+                        InstallMode::Copy
+                    };
+                    install_unpacked_skill(&app.state, &skill, mode)?;
+                    let install_path = app
+                        .state
+                        .root_dir
+                        .join("skills")
+                        .join(&skill.manifest.id)
+                        .join("active");
+                    ui::summary_box(
+                        "Installed",
+                        &[
+                            ("ID".to_string(), skill.manifest.id.clone()),
+                            ("Version".to_string(), skill.manifest.version.to_string()),
+                            ("Path".to_string(), install_path.to_string()),
+                        ],
+                    );
+                    if !ui::is_tty() {
+                        println!("Installed {}@{}", skill.manifest.id, skill.manifest.version);
+                    }
+                    run_fanout(
+                        &skill.manifest.id,
+                        install_path.as_std_path(),
+                        no_fanout,
+                        clients_filter.as_deref(),
+                    );
                 } else {
+                    // ── REGISTRY BRANCH ──────────────────────────────────────
+
                     // Allow `id@version` shorthand in addition to the `--version` flag.
                     let (skill_id, parsed_version) = match skill_ref.split_once('@') {
                         Some((id, ver)) if !id.is_empty() && !ver.is_empty() => {
@@ -1043,13 +1344,133 @@ fn main() -> Result<()> {
 
                     let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
                     let registry = RegistryClient::new(&url);
+
+                    // Fetch and render governance panel before installing.
+                    // A fetch failure is non-fatal: warn and proceed.
+                    let gov_result = registry.fetch_preinstall_governance(&skill_id);
+                    match gov_result {
+                        Ok(ref gov) => {
+                            ui::governance_panel_tty(gov);
+
+                            // -- dry-run: show panel and exit --
+                            // governance_panel_tty already printed the panel (TTY with ANSI or
+                            // plain text for non-TTY), so just emit the status line and exit.
+                            if dry_run {
+                                println!("dry-run: governance panel printed, no install performed.");
+                                return Ok(());
+                            }
+
+                            // -- policy enforcement --
+                            match gov.policy.status.as_str() {
+                                "approved" => {
+                                    // Require confirmation in interactive mode unless --yes bypasses it.
+                                    if ui::is_tty() && !yes {
+                                        let confirmed = dialoguer::Confirm::with_theme(&ui::theme())
+                                            .with_prompt(format!(
+                                                "Install '{skill_id}' from registry?"
+                                            ))
+                                            .default(true)
+                                            .interact()
+                                            .unwrap_or(false);
+                                        if !confirmed {
+                                            println!("Install cancelled.");
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+                                "blocked" => {
+                                    if !force {
+                                        let msg = gov
+                                            .policy
+                                            .message
+                                            .as_deref()
+                                            .unwrap_or("no details provided");
+                                        anyhow::bail!(
+                                            "install refused: policy status is BLOCKED for \
+                                             '{skill_id}': {msg}\n\
+                                             Use --force to override client-side (gateway \
+                                             enforcement remains active)."
+                                        );
+                                    }
+                                    eprintln!(
+                                        "WARNING: policy for '{skill_id}' is BLOCKED. \
+                                         --force bypasses this check on the client only; \
+                                         the VectorHawk gateway still enforces policy and \
+                                         may reject execution."
+                                    );
+                                }
+                                "pending" => {
+                                    if !force {
+                                        let msg = gov
+                                            .policy
+                                            .message
+                                            .as_deref()
+                                            .unwrap_or("awaiting approval");
+                                        anyhow::bail!(
+                                            "install refused: policy status is PENDING for \
+                                             '{skill_id}': {msg}\n\
+                                             Use --force to override client-side (gateway \
+                                             enforcement remains active)."
+                                        );
+                                    }
+                                    eprintln!(
+                                        "WARNING: policy for '{skill_id}' is PENDING approval. \
+                                         --force bypasses this check on the client only; \
+                                         the VectorHawk gateway still enforces policy and \
+                                         may reject execution."
+                                    );
+                                }
+                                other => {
+                                    // Unknown status — warn and proceed.
+                                    eprintln!(
+                                        "WARNING: unrecognised policy status '{other}' for \
+                                         '{skill_id}'; proceeding anyway."
+                                    );
+                                }
+                            }
+                        }
+                        Err(ref e) => {
+                            eprintln!(
+                                "WARNING: could not fetch governance data for '{skill_id}': {e}\n\
+                                 Proceeding without governance check."
+                            );
+                            if dry_run {
+                                println!("dry-run: governance unavailable, no install performed.");
+                                return Ok(());
+                            }
+                        }
+                    }
+
                     let installed_ver = install_from_registry(
                         &app.state,
                         &registry,
                         &skill_id,
                         effective_version.as_deref(),
                     )?;
-                    println!("Installed {}@{} from registry", skill_id, installed_ver);
+                    let install_path = app
+                        .state
+                        .root_dir
+                        .join("skills")
+                        .join(&skill_id)
+                        .join("active");
+                    ui::summary_box(
+                        "Installed",
+                        &[
+                            ("ID".to_string(), skill_id.clone()),
+                            ("Version".to_string(), installed_ver.clone()),
+                            ("Source".to_string(), "registry".to_string()),
+                            ("Path".to_string(), install_path.to_string()),
+                        ],
+                    );
+                    if !ui::is_tty() {
+                        println!("Installed {}@{} from registry", skill_id, installed_ver);
+                    }
+                    run_fanout(
+                        &skill_id,
+                        install_path.as_std_path(),
+                        no_fanout,
+                        clients_filter.as_deref(),
+                    );
                 }
             }
             SkillCommands::Publish { path, registry_url } => {
@@ -1606,7 +2027,7 @@ fn build_enriched_skill_md(
     fm
 }
 
-/// Write a SKILL.md to the output directory and run import_skill_md.
+/// Write a SKILL.md to the output directory and scaffold a bundle.
 fn write_and_import_skill_md(
     output_dir: &Utf8PathBuf,
     skill_md_content: &str,
@@ -1616,7 +2037,7 @@ fn write_and_import_skill_md(
     let skill_md_path = output_dir.join("SKILL.md");
     std::fs::write(&skill_md_path, skill_md_content)
         .with_context(|| format!("failed to write {skill_md_path}"))?;
-    import_skill_md(&skill_md_path).context("Failed to scaffold skill bundle")
+    import_local_skill_md(&skill_md_path).context("Failed to scaffold skill bundle")
 }
 
 fn print_bundle_result(bundle: &skillrunner_core::import::ScaffoldedBundle) {
@@ -1671,21 +2092,29 @@ fn extract_skill_md_body(content: &str) -> String {
 }
 
 /// Interactive prompt loop: show each recommendation group and ask Y/n.
+///
+/// In non-TTY contexts (CI, scripted use, MCP serve) all prompts default to
+/// `true` (accept) so the function never blocks waiting for stdin.
 fn prompt_for_recommendations(
     mut rec: skillrunner_core::recommend::Recommendations,
 ) -> Result<skillrunner_core::recommend::Recommendations> {
-    use std::io::Write;
+    let theme = ui::theme();
 
     // Triggers
     println!("Recommended triggers:");
     for (i, t) in rec.triggers.iter().enumerate() {
         println!("  {}. {}", i + 1, t);
     }
-    print!("Accept triggers? [Y/n]: ");
-    std::io::stdout().flush()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    if input.trim().eq_ignore_ascii_case("n") {
+    let accept_triggers = if ui::is_tty() {
+        dialoguer::Confirm::with_theme(&theme)
+            .with_prompt("Accept triggers?")
+            .default(true)
+            .interact()
+            .unwrap_or(true)
+    } else {
+        true
+    };
+    if !accept_triggers {
         rec.triggers.clear();
         println!("  (triggers skipped)");
     }
@@ -1695,11 +2124,16 @@ fn prompt_for_recommendations(
     println!("  network: {}", rec.permissions.network);
     println!("  filesystem: {}", rec.permissions.filesystem);
     println!("  clipboard: {}", rec.permissions.clipboard);
-    print!("Accept permissions? [Y/n]: ");
-    std::io::stdout().flush()?;
-    input.clear();
-    std::io::stdin().read_line(&mut input)?;
-    if input.trim().eq_ignore_ascii_case("n") {
+    let accept_perms = if ui::is_tty() {
+        dialoguer::Confirm::with_theme(&theme)
+            .with_prompt("Accept permissions?")
+            .default(true)
+            .interact()
+            .unwrap_or(true)
+    } else {
+        true
+    };
+    if !accept_perms {
         rec.permissions.network = "none".to_string();
         rec.permissions.filesystem = "none".to_string();
         rec.permissions.clipboard = "none".to_string();
@@ -1711,11 +2145,16 @@ fn prompt_for_recommendations(
     println!("  min_params_b: {}", rec.model.min_params_b);
     println!("  recommended: {}", rec.model.recommended.join(", "));
     println!("  fallback: {}", rec.model.fallback);
-    print!("Accept model settings? [Y/n]: ");
-    std::io::stdout().flush()?;
-    input.clear();
-    std::io::stdin().read_line(&mut input)?;
-    if input.trim().eq_ignore_ascii_case("n") {
+    let accept_model = if ui::is_tty() {
+        dialoguer::Confirm::with_theme(&theme)
+            .with_prompt("Accept model settings?")
+            .default(true)
+            .interact()
+            .unwrap_or(true)
+    } else {
+        true
+    };
+    if !accept_model {
         rec.model.min_params_b = 1.0;
         rec.model.recommended = vec!["gemma3:4b".to_string()];
         rec.model.fallback = "error".to_string();
@@ -1727,11 +2166,16 @@ fn prompt_for_recommendations(
     println!("  timeout_ms: {}", rec.execution.timeout_ms);
     println!("  memory_mb: {}", rec.execution.memory_mb);
     println!("  sandbox: {}", rec.execution.sandbox);
-    print!("Accept execution settings? [Y/n]: ");
-    std::io::stdout().flush()?;
-    input.clear();
-    std::io::stdin().read_line(&mut input)?;
-    if input.trim().eq_ignore_ascii_case("n") {
+    let accept_exec = if ui::is_tty() {
+        dialoguer::Confirm::with_theme(&theme)
+            .with_prompt("Accept execution settings?")
+            .default(true)
+            .interact()
+            .unwrap_or(true)
+    } else {
+        true
+    };
+    if !accept_exec {
         rec.execution.timeout_ms = 30_000;
         rec.execution.memory_mb = 256;
         rec.execution.sandbox = "strict".to_string();

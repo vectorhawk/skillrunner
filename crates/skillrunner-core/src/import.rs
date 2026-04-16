@@ -12,6 +12,25 @@ pub struct ScaffoldedBundle {
     pub files: Vec<String>,
 }
 
+/// Outcome from a registry-routed import operation.
+#[derive(Debug)]
+pub enum ImportOutcome {
+    /// A SKILL.md was scaffolded locally into a bundle directory.
+    SkillScaffolded { bundle: Utf8PathBuf },
+    /// The input was classified as an MCP server reference; registration
+    /// was submitted and is pending IT review.
+    McpServerRequested {
+        server_name: String,
+        status: String,
+    },
+    /// The input was submitted to the registry as a skill import; the
+    /// registry has accepted it for review / processing.
+    SkillSubmitted {
+        submission_id: String,
+        status: String,
+    },
+}
+
 /// YAML frontmatter block parsed from the top of a SKILL.md file.
 #[derive(Debug, Deserialize)]
 struct SkillMdFrontmatter {
@@ -29,7 +48,10 @@ struct SkillMdFrontmatter {
 ///
 /// The SKILL.md body becomes `prompts/system.txt`. A single `llm` workflow
 /// step is generated that passes user requirements through the system prompt.
-pub fn import_skill_md(skill_md_path: &Utf8Path) -> Result<ScaffoldedBundle> {
+///
+/// This is the offline-only, local path. For registry-routed import of GitHub
+/// URLs, npx commands, MCP JSON, etc., use [`import_via_registry`].
+pub fn import_local_skill_md(skill_md_path: &Utf8Path) -> Result<ScaffoldedBundle> {
     let content = fs::read_to_string(skill_md_path)
         .with_context(|| format!("failed to read {skill_md_path}"))?;
 
@@ -65,6 +87,32 @@ pub fn import_skill_md(skill_md_path: &Utf8Path) -> Result<ScaffoldedBundle> {
         output_dir,
         files,
     })
+}
+
+/// Submit arbitrary raw input (GitHub URL, `npx` command, MCP JSON snippet,
+/// generic package reference, or raw SKILL.md text) to the registry classifier
+/// and return the resulting [`ImportOutcome`].
+///
+/// The registry preview endpoint classifies the input and returns a description
+/// of what it intends to do. This function then calls the submit endpoint and
+/// maps the response to an [`ImportOutcome`] variant.
+///
+/// Requires `registry` to have an auth token set via
+/// [`RegistryClient::with_auth`] / [`RegistryClient::set_auth`].
+#[cfg(feature = "registry")]
+pub fn import_via_registry(
+    registry: &crate::registry::RegistryClient,
+    raw_input: &str,
+) -> Result<ImportOutcome> {
+    let preview = registry
+        .runner_import_preview(raw_input)
+        .context("failed to get import preview from registry")?;
+
+    let outcome = registry
+        .runner_import_submit(&preview)
+        .context("failed to submit import to registry")?;
+
+    Ok(outcome)
 }
 
 // ---------------------------------------------------------------------------
@@ -258,7 +306,7 @@ It can span multiple lines.
         let dir = temp_dir("full");
         let path = write_skill_md(&dir, SAMPLE_SKILL_MD);
 
-        let result = import_skill_md(&path).expect("import should succeed");
+        let result = import_local_skill_md(&path).expect("import should succeed");
 
         assert_eq!(result.id, "my-skill");
         let out = &result.output_dir;
@@ -276,7 +324,7 @@ It can span multiple lines.
         let dir = temp_dir("prompt");
         let path = write_skill_md(&dir, SAMPLE_SKILL_MD);
 
-        let result = import_skill_md(&path).unwrap();
+        let result = import_local_skill_md(&path).unwrap();
 
         let body = fs::read_to_string(result.output_dir.join("prompts/system.txt")).unwrap();
         assert!(body.contains("This is the system prompt body."));
@@ -289,7 +337,7 @@ It can span multiple lines.
         let dir = temp_dir("metadata");
         let path = write_skill_md(&dir, SAMPLE_SKILL_MD);
 
-        let result = import_skill_md(&path).unwrap();
+        let result = import_local_skill_md(&path).unwrap();
 
         let skill_md_text = fs::read_to_string(result.output_dir.join("SKILL.md")).unwrap();
         assert!(skill_md_text.contains("name: my-skill"));
@@ -306,7 +354,7 @@ It can span multiple lines.
         let dir = temp_dir("roundtrip");
         let path = write_skill_md(&dir, SAMPLE_SKILL_MD);
 
-        let result = import_skill_md(&path).unwrap();
+        let result = import_local_skill_md(&path).unwrap();
 
         let pkg = SkillPackage::load_from_dir(&result.output_dir)
             .expect("generated bundle should pass SkillPackage validation");
@@ -329,7 +377,7 @@ It can span multiple lines.
         let dir = temp_dir("bad-frontmatter");
         let path = write_skill_md(&dir, "No frontmatter here.");
 
-        let err = import_skill_md(&path).expect_err("missing frontmatter should fail");
+        let err = import_local_skill_md(&path).expect_err("missing frontmatter should fail");
         assert!(err.to_string().contains("frontmatter"), "got: {err}");
 
         let _ = fs::remove_dir_all(&dir);

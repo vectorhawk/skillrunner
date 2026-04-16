@@ -1,0 +1,9 @@
+---
+source: crates/skillrunner-cli/src/ui_tests.rs
+expression: output
+---
+  ╭─ Governance ────────────────────────────────────────────
+  │ Publisher :     vectorhawk-official-long-publisher-name │
+  │ Scope     : read:files write:network execute:subprocess │
+  │ Risk      :                                      medium │
+  ╰─────────────────────────────────────────────────────────

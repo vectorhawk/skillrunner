@@ -6,8 +6,8 @@ use semver::Version;
 use skillrunner_core::{
     auth::{self, AuthClient},
     executor::{run_skill, RunResult},
-    import::import_skill_md,
-    install::{install_unpacked_skill, uninstall_skill},
+    import::import_local_skill_md,
+    install::{install_unpacked_skill, uninstall_skill, InstallMode},
     mcp_governance,
     model::{ModelClient, ModelSource},
     policy::PolicyClient,
@@ -1002,7 +1002,7 @@ fn handle_install(
             };
             let id = pkg.manifest.id.clone();
             let ver = pkg.manifest.version.to_string();
-            match install_unpacked_skill(state, &pkg) {
+            match install_unpacked_skill(state, &pkg, InstallMode::Copy) {
                 Ok(_) => ToolCallResult::success(format!(
                     "Successfully installed {id}@{ver} from local path."
                 )),
@@ -1340,7 +1340,7 @@ fn scaffold_skill_bundle(
         return ToolCallResult::error(format!("Failed to create directory {out}: {e}"));
     }
 
-    // Write a minimal SKILL.md so import_skill_md can derive the skill ID
+    // Write a minimal SKILL.md so import_local_skill_md can derive the skill ID
     // and scaffold the bundle directory structure (workflow, schemas, prompts).
     let minimal_md = format!(
         "---\nname: {name}\ndescription: {description}\nlicense: Apache-2.0\n---\n\n{system_prompt}\n"
@@ -1350,13 +1350,13 @@ fn scaffold_skill_bundle(
         return ToolCallResult::error(format!("Failed to write SKILL.md: {e}"));
     }
 
-    let bundle = match import_skill_md(&skill_md_path) {
+    let bundle = match import_local_skill_md(&skill_md_path) {
         Ok(b) => b,
         Err(e) => return ToolCallResult::error(format!("Failed to scaffold skill bundle: {e}")),
     };
 
     // When recommendations are provided, overwrite the bundle's SKILL.md with
-    // the full-metadata version (import_skill_md generates defaults; we need
+    // the full-metadata version (import_local_skill_md generates defaults; we need
     // to inject the vh_* fields the user confirmed or we inferred).
     if let Some(rec) = recommendations {
         let mut fm =
@@ -2965,7 +2965,7 @@ mod tests {
 
         write_test_skill(&skill_root);
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, skillrunner_core::install::InstallMode::Copy).unwrap();
 
         let tools = build_tool_list(&state, &None);
         let skill_tool = tools.iter().find(|t| t.name == "test-skill");
@@ -3000,7 +3000,7 @@ mod tests {
 
         write_test_skill(&skill_root);
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, skillrunner_core::install::InstallMode::Copy).unwrap();
 
         let result = handle_list(
             &state,
@@ -3128,7 +3128,7 @@ mod tests {
 
         write_test_skill(&skill_root);
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, skillrunner_core::install::InstallMode::Copy).unwrap();
 
         let result = handle_info(&serde_json::json!({"skill_id": "test-skill"}), &state);
         assert!(result.is_error.is_none());
@@ -3465,7 +3465,7 @@ mod tests {
 
         write_test_skill(&skill_root);
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, skillrunner_core::install::InstallMode::Copy).unwrap();
 
         let policy = MockPolicyClient::new();
         let cache = empty_update_cache();
@@ -3497,7 +3497,7 @@ mod tests {
 
         write_test_skill(&skill_root);
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, skillrunner_core::install::InstallMode::Copy).unwrap();
 
         // Pre-populate cache with an "update available" entry.
         let cache: UpdateCheckCache = Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -3543,7 +3543,7 @@ mod tests {
 
         write_test_skill(&skill_root);
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, skillrunner_core::install::InstallMode::Copy).unwrap();
 
         // Use a RegistryClient pointing at a mock server that returns a
         // higher version.  We bypass the network by pre-seeding the cache
@@ -4363,7 +4363,7 @@ mod tests {
 
         write_test_skill(&skill_root);
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, skillrunner_core::install::InstallMode::Copy).unwrap();
 
         let policy = MockPolicyClient::new();
         let cache = empty_update_cache();
@@ -4410,7 +4410,7 @@ mod tests {
 
         write_tool_only_skill(&skill_root);
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, skillrunner_core::install::InstallMode::Copy).unwrap();
 
         let policy = MockPolicyClient::new();
         let cache = empty_update_cache();
@@ -4452,7 +4452,7 @@ mod tests {
 
         write_test_skill(&skill_root);
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, skillrunner_core::install::InstallMode::Copy).unwrap();
 
         let policy = MockPolicyClient::new();
         let cache = empty_update_cache();

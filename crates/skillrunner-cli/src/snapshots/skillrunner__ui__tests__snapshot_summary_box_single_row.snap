@@ -1,0 +1,7 @@
+---
+source: crates/skillrunner-cli/src/ui_tests.rs
+expression: output
+---
+  ╭─ Info ───────────────────────────────────
+  │ Key :                              value │
+  ╰──────────────────────────────────────────

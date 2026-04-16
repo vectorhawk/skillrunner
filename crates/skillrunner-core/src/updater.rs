@@ -1,5 +1,7 @@
 use crate::{
-    install::{deactivate_skill, install_unpacked_skill, reactivate_skill, uninstall_skill},
+    install::{
+        deactivate_skill, install_unpacked_skill, reactivate_skill, uninstall_skill, InstallMode,
+    },
     plugin::{install_plugin_from_dir, InstalledPlugin},
     policy::Policy,
     registry::RegistryClient,
@@ -213,8 +215,9 @@ fn download_and_install(
     let pkg = SkillPackage::load_from_dir(&staging_path)
         .with_context(|| format!("downloaded bundle for {skill_id}@{version} failed validation"))?;
 
-    // 5. Install via the standard installer.
-    install_unpacked_skill(state, &pkg)
+    // 5. Install via the standard installer. Registry installs always copy; symlinks
+    //    are only for local developer workflows via --link.
+    install_unpacked_skill(state, &pkg, InstallMode::Copy)
         .with_context(|| format!("failed to install updated {skill_id}@{version}"))?;
 
     Ok(())
@@ -675,7 +678,7 @@ mod tests {
 
         write_skill_bundle(&skill_root, "1.0.0");
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, InstallMode::Copy).unwrap();
 
         let policy = Policy {
             skill_id: "test-skill".to_string(),
@@ -704,7 +707,7 @@ mod tests {
 
         write_skill_bundle(&skill_root, "1.1.0");
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, InstallMode::Copy).unwrap();
 
         let policy = Policy {
             skill_id: "test-skill".to_string(),
@@ -754,7 +757,7 @@ mod tests {
         // Install v1.0.0 (below minimum)
         write_skill_bundle(&skill_root, "1.0.0");
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, InstallMode::Copy).unwrap();
 
         // Create a v2.0.0 archive to serve
         let (_tmp, archive_path, sha) = create_skill_archive("2.0.0");
@@ -836,7 +839,7 @@ mod tests {
         // Install v0.1.0
         write_skill_bundle(&skill_root, "0.1.0");
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, InstallMode::Copy).unwrap();
 
         // Create a v0.2.0 archive to serve
         let (_tmp, archive_path, sha) = create_skill_archive("0.2.0");
@@ -910,7 +913,7 @@ mod tests {
         // Install v0.2.0 (already at latest)
         write_skill_bundle(&skill_root, "0.2.0");
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, InstallMode::Copy).unwrap();
 
         let mut server = Server::new();
         let detail_path = "/portal/skills/test-skill";
@@ -947,7 +950,7 @@ mod tests {
 
         write_skill_bundle(&skill_root, "0.1.0");
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, InstallMode::Copy).unwrap();
 
         let mut server = Server::new();
 
@@ -1005,7 +1008,7 @@ mod tests {
 
         write_skill_bundle(&skill_root, "0.1.0");
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, InstallMode::Copy).unwrap();
 
         let install_root = state.root_dir.join("skills/test-skill");
         assert!(install_root.exists(), "skill dir should exist before sync");
@@ -1067,7 +1070,7 @@ mod tests {
 
         write_skill_bundle(&skill_root, "0.1.0");
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, InstallMode::Copy).unwrap();
 
         // Deactivate the skill to set up the test scenario
         crate::install::deactivate_skill(&state, "test-skill").unwrap();

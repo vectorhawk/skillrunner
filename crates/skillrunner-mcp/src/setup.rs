@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
@@ -515,6 +515,310 @@ Show each plugin's name, version, status, and component breakdown (skills, MCP s
 "#,
         ),
     ]
+}
+
+// ── Phase 3: Multi-agent fan-out ────────────────────────────────────────────
+
+/// Report from a fan-out install or uninstall sweep.
+#[derive(Debug, Default)]
+pub struct FanoutReport {
+    /// Display names of clients where the skill was successfully linked.
+    pub installed: Vec<String>,
+    /// (display name, reason) for clients that were skipped.
+    pub skipped: Vec<(String, String)>,
+}
+
+/// Return the user-level skill directory for a client, or `None` if the
+/// client does not support a skill directory (MCP-config-only clients).
+///
+/// Claude Code  → `~/.claude/skills/`
+/// Cursor       → `~/.cursor/skills/`
+/// Windsurf     → `~/.codeium/windsurf/skills/`
+/// All others   → None
+pub fn client_skill_dir(client: &ClientConfig) -> Option<PathBuf> {
+    let home = dirs_home()?;
+    client_skill_dir_in(&home, client)
+}
+
+/// Inner implementation that accepts an explicit home directory.
+/// Used by the public API and by tests that supply a tempdir home.
+fn client_skill_dir_in(home: &std::path::Path, client: &ClientConfig) -> Option<PathBuf> {
+    match client.name.as_str() {
+        "Claude Code" => Some(home.join(".claude").join("skills")),
+        "Cursor" => Some(home.join(".cursor").join("skills")),
+        "Windsurf" => Some(home.join(".codeium").join("windsurf").join("skills")),
+        _ => None,
+    }
+}
+
+/// Like `fanout_skill_to_clients` but uses an explicit home for the skill dirs.
+/// Used in tests to avoid touching the global HOME env var.
+#[cfg(test)]
+fn fanout_skill_to_clients_in(
+    skill_id: &str,
+    source: &std::path::Path,
+    clients: &[&ClientConfig],
+    home: &std::path::Path,
+) -> Result<FanoutReport> {
+    let mut report = FanoutReport::default();
+
+    for client in clients {
+        let skill_dir = match client_skill_dir_in(home, client) {
+            Some(d) => d,
+            None => {
+                report
+                    .skipped
+                    .push((client.name.clone(), "MCP config only".to_string()));
+                continue;
+            }
+        };
+
+        let entry = skill_dir.join(skill_id);
+
+        let skip_reason = check_existing_entry(&entry, source)?;
+        if let Some(reason) = skip_reason {
+            report.skipped.push((client.name.clone(), reason));
+            continue;
+        }
+
+        fs::create_dir_all(&skill_dir).with_context(|| {
+            format!(
+                "could not create skill directory {} for {}",
+                skill_dir.display(),
+                client.name
+            )
+        })?;
+
+        create_skill_link(&entry, source).with_context(|| {
+            format!("could not link skill '{}' for {}", skill_id, client.name)
+        })?;
+
+        report.installed.push(client.name.clone());
+    }
+
+    Ok(report)
+}
+
+/// Like `fanout_uninstall_skill` but uses an explicit home for the skill dirs.
+#[cfg(test)]
+fn fanout_uninstall_skill_in(
+    skill_id: &str,
+    clients: &[&ClientConfig],
+    home: &std::path::Path,
+) -> FanoutReport {
+    let mut report = FanoutReport::default();
+
+    for client in clients {
+        let skill_dir = match client_skill_dir_in(home, client) {
+            Some(d) => d,
+            None => {
+                report
+                    .skipped
+                    .push((client.name.clone(), "MCP config only".to_string()));
+                continue;
+            }
+        };
+
+        let entry = skill_dir.join(skill_id);
+
+        match fs::symlink_metadata(&entry) {
+            Err(_) => {
+                report
+                    .skipped
+                    .push((client.name.clone(), "not present".to_string()));
+            }
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if let Err(e) = fs::remove_file(&entry) {
+                    report
+                        .skipped
+                        .push((client.name.clone(), format!("remove failed: {e}")));
+                } else {
+                    report.installed.push(client.name.clone());
+                }
+            }
+            Ok(_) => {
+                report.skipped.push((
+                    client.name.clone(),
+                    "not a symlink, leaving untouched".to_string(),
+                ));
+            }
+        }
+    }
+
+    report
+}
+
+/// Symlink (Unix) or copy (Windows) the canonical `active/` directory into
+/// each client's skill directory as `{client_skill_dir}/{skill_id}`.
+///
+/// Idempotency rules:
+/// - If the entry already is a symlink pointing at `source`, count as installed.
+/// - If the entry is a symlink pointing elsewhere, or a real directory/file,
+///   skip with reason "conflicting entry exists".
+/// - Clients without a `client_skill_dir` are skipped with "MCP config only".
+pub fn fanout_skill_to_clients(
+    skill_id: &str,
+    source: &std::path::Path,
+    clients: &[&ClientConfig],
+) -> Result<FanoutReport> {
+    let mut report = FanoutReport::default();
+
+    for client in clients {
+        let skill_dir = match client_skill_dir(client) {
+            Some(d) => d,
+            None => {
+                report
+                    .skipped
+                    .push((client.name.clone(), "MCP config only".to_string()));
+                continue;
+            }
+        };
+
+        let entry = skill_dir.join(skill_id);
+
+        // Resolve whether the entry already exists and what it is.
+        let skip_reason = check_existing_entry(&entry, source)?;
+        if let Some(reason) = skip_reason {
+            report.skipped.push((client.name.clone(), reason));
+            continue;
+        }
+
+        // Create the parent directory and the symlink/copy.
+        fs::create_dir_all(&skill_dir).with_context(|| {
+            format!(
+                "could not create skill directory {} for {}",
+                skill_dir.display(),
+                client.name
+            )
+        })?;
+
+        create_skill_link(&entry, source).with_context(|| {
+            format!(
+                "could not link skill '{}' for {}",
+                skill_id, client.name
+            )
+        })?;
+
+        report.installed.push(client.name.clone());
+    }
+
+    Ok(report)
+}
+
+/// Sweep `{client_skill_dir}/{skill_id}` from each client.
+///
+/// Only removes entries that are symlinks (dangling or pointing anywhere).
+/// Leaves real directories untouched (user-created content, skipped with reason).
+/// Returns a `FanoutReport` describing what was removed vs skipped.
+pub fn fanout_uninstall_skill(skill_id: &str, clients: &[&ClientConfig]) -> FanoutReport {
+    let mut report = FanoutReport::default();
+
+    for client in clients {
+        let skill_dir = match client_skill_dir(client) {
+            Some(d) => d,
+            None => {
+                report
+                    .skipped
+                    .push((client.name.clone(), "MCP config only".to_string()));
+                continue;
+            }
+        };
+
+        let entry = skill_dir.join(skill_id);
+
+        // Use symlink_metadata so we can inspect the link itself, not its target.
+        match fs::symlink_metadata(&entry) {
+            Err(_) => {
+                // Entry does not exist — nothing to do.
+                report
+                    .skipped
+                    .push((client.name.clone(), "not present".to_string()));
+            }
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if let Err(e) = fs::remove_file(&entry) {
+                    report
+                        .skipped
+                        .push((client.name.clone(), format!("remove failed: {e}")));
+                } else {
+                    report.installed.push(client.name.clone());
+                }
+            }
+            Ok(_) => {
+                report
+                    .skipped
+                    .push((client.name.clone(), "not a symlink, leaving untouched".to_string()));
+            }
+        }
+    }
+
+    report
+}
+
+/// Check whether `entry` already exists and decide what to do.
+///
+/// Returns `None` if the path is clear (no action needed).
+/// Returns `Some(reason)` if the caller should skip creating the link.
+fn check_existing_entry(
+    entry: &std::path::Path,
+    source: &std::path::Path,
+) -> Result<Option<String>> {
+    // Use symlink_metadata so we inspect the link, not its target.
+    let meta = match fs::symlink_metadata(entry) {
+        Err(_) => return Ok(None), // does not exist — proceed
+        Ok(m) => m,
+    };
+
+    if meta.file_type().is_symlink() {
+        match fs::read_link(entry) {
+            Ok(target) if target == source => {
+                // Already points at the right place — idempotent success.
+                return Ok(Some("already linked".to_string()));
+            }
+            _ => {
+                // Dangling symlink or points elsewhere.
+                return Ok(Some("conflicting entry exists".to_string()));
+            }
+        }
+    }
+
+    // Real file or directory — do not touch.
+    Ok(Some("conflicting entry exists".to_string()))
+}
+
+/// Create a symlink on Unix or copy the directory on Windows.
+fn create_skill_link(entry: &std::path::Path, source: &std::path::Path) -> Result<()> {
+    #[cfg(target_family = "unix")]
+    {
+        std::os::unix::fs::symlink(source, entry)
+            .with_context(|| format!("symlink {} -> {}", entry.display(), source.display()))?;
+    }
+    #[cfg(target_family = "windows")]
+    {
+        copy_dir_recursive(source, entry).with_context(|| {
+            format!(
+                "copy {} -> {}",
+                source.display(),
+                entry.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Recursively copy a directory tree (Windows fallback for symlinks).
+#[cfg(target_family = "windows")]
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry_res in fs::read_dir(src)? {
+        let entry = entry_res?;
+        let target = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 /// Install SkillClub slash command skills to `~/.claude/skills/`.
@@ -1347,5 +1651,188 @@ mod tests {
         assert!(result2.is_none(), "second install should be no-op");
 
         let _ = fs::remove_dir_all(state_root.as_str());
+    }
+
+    // ── Phase 3 fan-out tests ───────────────────────────────────────────────
+
+    /// Build a ClientConfig with the given display name pointing at an
+    /// arbitrary (non-existent) config path — enough for skill-dir mapping tests.
+    fn make_client(name: &str, config_path: &std::path::Path) -> ClientConfig {
+        ClientConfig {
+            name: name.to_string(),
+            config_path: config_path.to_path_buf(),
+            mcp_key: "mcpServers".to_string(),
+            already_configured: false,
+        }
+    }
+
+    #[test]
+    fn client_skill_dir_in_returns_correct_paths() {
+        let tmp = temp_root("skill-dir-paths");
+        let dummy = tmp.join("dummy.json").into_std_path_buf();
+        let home = tmp.as_std_path();
+
+        let cc = make_client("Claude Code", &dummy);
+        let cursor = make_client("Cursor", &dummy);
+        let ws = make_client("Windsurf", &dummy);
+        let cd = make_client("Claude Desktop", &dummy);
+        let vsc = make_client("VS Code", &dummy);
+
+        assert_eq!(
+            client_skill_dir_in(home, &cc).unwrap(),
+            home.join(".claude").join("skills")
+        );
+        assert_eq!(
+            client_skill_dir_in(home, &cursor).unwrap(),
+            home.join(".cursor").join("skills")
+        );
+        assert_eq!(
+            client_skill_dir_in(home, &ws).unwrap(),
+            home.join(".codeium").join("windsurf").join("skills")
+        );
+        assert!(
+            client_skill_dir_in(home, &cd).is_none(),
+            "Claude Desktop is MCP-only"
+        );
+        assert!(
+            client_skill_dir_in(home, &vsc).is_none(),
+            "VS Code is MCP-only"
+        );
+
+        let _ = fs::remove_dir_all(tmp.as_str());
+    }
+
+    #[test]
+    #[cfg(target_family = "unix")]
+    fn fanout_skill_to_clients_creates_symlinks() {
+        let tmp = temp_root("fanout-install");
+        fs::create_dir_all(&tmp).unwrap();
+
+        let source = tmp.join("active").into_std_path_buf();
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("manifest.json"), r#"{"id":"my-skill"}"#).unwrap();
+
+        let dummy = tmp.join("dummy.json").into_std_path_buf();
+        let cc = make_client("Claude Code", &dummy);
+        let cursor = make_client("Cursor", &dummy);
+        let ws = make_client("Windsurf", &dummy);
+        let cd = make_client("Claude Desktop", &dummy);
+
+        let clients: Vec<&ClientConfig> = vec![&cc, &cursor, &ws, &cd];
+        let home = tmp.as_std_path();
+        let report = fanout_skill_to_clients_in("my-skill", &source, &clients, home).unwrap();
+
+        assert_eq!(
+            report.installed.len(),
+            3,
+            "should install to all three skill-dir clients"
+        );
+        assert!(report.installed.contains(&"Claude Code".to_string()));
+        assert!(report.installed.contains(&"Cursor".to_string()));
+        assert!(report.installed.contains(&"Windsurf".to_string()));
+
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].0, "Claude Desktop");
+        assert_eq!(report.skipped[0].1, "MCP config only");
+
+        let cc_link = home.join(".claude").join("skills").join("my-skill");
+        let cursor_link = home.join(".cursor").join("skills").join("my-skill");
+        let ws_link = home
+            .join(".codeium")
+            .join("windsurf")
+            .join("skills")
+            .join("my-skill");
+
+        assert_eq!(fs::read_link(&cc_link).unwrap(), source);
+        assert_eq!(fs::read_link(&cursor_link).unwrap(), source);
+        assert_eq!(fs::read_link(&ws_link).unwrap(), source);
+
+        let _ = fs::remove_dir_all(tmp.as_str());
+    }
+
+    #[test]
+    #[cfg(target_family = "unix")]
+    fn fanout_skill_to_clients_is_idempotent() {
+        let tmp = temp_root("fanout-idem");
+        fs::create_dir_all(&tmp).unwrap();
+
+        let source = tmp.join("active").into_std_path_buf();
+        fs::create_dir_all(&source).unwrap();
+
+        let dummy = tmp.join("dummy.json").into_std_path_buf();
+        let cc = make_client("Claude Code", &dummy);
+        let clients: Vec<&ClientConfig> = vec![&cc];
+        let home = tmp.as_std_path();
+
+        let r1 = fanout_skill_to_clients_in("test-skill", &source, &clients, home).unwrap();
+        assert_eq!(r1.installed, vec!["Claude Code".to_string()]);
+
+        // Second call: already linked — no error, not re-installed.
+        let r2 = fanout_skill_to_clients_in("test-skill", &source, &clients, home).unwrap();
+        assert!(r2.installed.is_empty(), "should not re-install");
+        assert_eq!(r2.skipped.len(), 1);
+        assert_eq!(r2.skipped[0].1, "already linked");
+
+        let _ = fs::remove_dir_all(tmp.as_str());
+    }
+
+    #[test]
+    #[cfg(target_family = "unix")]
+    fn fanout_uninstall_skill_removes_symlinks_and_skips_real_dirs() {
+        let tmp = temp_root("fanout-uninstall");
+        fs::create_dir_all(&tmp).unwrap();
+
+        let source = tmp.join("active").into_std_path_buf();
+        fs::create_dir_all(&source).unwrap();
+
+        // Claude Code — symlink we own.
+        let cc_skills = tmp.join(".claude").join("skills");
+        fs::create_dir_all(&cc_skills).unwrap();
+        let cc_entry = cc_skills.join("my-skill");
+        std::os::unix::fs::symlink(&source, &cc_entry).unwrap();
+
+        // Cursor — a real directory (user content, must not be removed).
+        let cursor_skills = tmp.join(".cursor").join("skills");
+        fs::create_dir_all(&cursor_skills).unwrap();
+        let cursor_entry = cursor_skills.join("my-skill");
+        fs::create_dir_all(&cursor_entry).unwrap();
+
+        // Windsurf — skill entry not present (skills dir also absent is fine).
+
+        let dummy = tmp.join("dummy.json").into_std_path_buf();
+        let cc = make_client("Claude Code", &dummy);
+        let cursor = make_client("Cursor", &dummy);
+        let ws = make_client("Windsurf", &dummy);
+        let clients: Vec<&ClientConfig> = vec![&cc, &cursor, &ws];
+        let home = tmp.as_std_path();
+
+        let report = fanout_uninstall_skill_in("my-skill", &clients, home);
+
+        assert!(
+            report.installed.contains(&"Claude Code".to_string()),
+            "symlink should be removed"
+        );
+        assert!(!cc_entry.exists(), "symlink should no longer exist");
+
+        let cursor_skip = report
+            .skipped
+            .iter()
+            .find(|(n, _)| n == "Cursor")
+            .expect("Cursor should be in skipped");
+        assert!(
+            cursor_skip.1.contains("not a symlink"),
+            "real dir should be skipped: {}",
+            cursor_skip.1
+        );
+        assert!(cursor_entry.exists(), "real dir must not be removed");
+
+        let ws_skip = report
+            .skipped
+            .iter()
+            .find(|(n, _)| n == "Windsurf")
+            .expect("Windsurf should be in skipped");
+        assert_eq!(ws_skip.1, "not present");
+
+        let _ = fs::remove_dir_all(tmp.as_str());
     }
 }

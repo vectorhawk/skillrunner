@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use rusqlite::Connection;
 use skillrunner_core::{
-    executor::run_skill, import::import_skill_md, install::install_unpacked_skill,
+    executor::run_skill, import::import_local_skill_md, install::install_unpacked_skill,
     model::ModelClient, policy::MockPolicyClient, state::AppState, validator::validate_bundle,
 };
 use skillrunner_manifest::SkillPackage;
@@ -180,7 +180,7 @@ fn handle_import(args: &serde_json::Value, state: &AppState) -> ToolCallResult {
         None => return ToolCallResult::error("Missing required parameter: path"),
     };
     let md_path = Utf8PathBuf::from(path);
-    match import_skill_md(&md_path) {
+    match import_local_skill_md(&md_path) {
         Ok(scaffolded) => {
             // Load the scaffolded bundle and install it
             let bundle_path = scaffolded.output_dir.clone();

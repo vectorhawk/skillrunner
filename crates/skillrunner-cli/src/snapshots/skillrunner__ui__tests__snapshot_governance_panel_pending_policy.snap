@@ -1,0 +1,14 @@
+---
+source: crates/skillrunner-cli/src/ui_tests.rs
+expression: output
+---
+
+  ── Governance ──────────────────────────────────
+  Publisher : Community Publisher [⚠ unverified]
+  Policy    : pending (org context not yet enforced)
+              Awaiting org approval
+  Scopes    :
+    • write:network [risk: high]
+  Scan      : not yet completed
+  Audit     : no audit on record
+  ────────────────────────────────────────────────

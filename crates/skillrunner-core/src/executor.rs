@@ -574,7 +574,7 @@ fn check_model_requirements(
 mod tests {
     use super::*;
     use crate::{
-        install::install_unpacked_skill, model::MockModelClient, policy::MockPolicyClient,
+        install::{install_unpacked_skill, InstallMode}, model::MockModelClient, policy::MockPolicyClient,
         state::AppState,
     };
     use camino::Utf8PathBuf;
@@ -621,7 +621,7 @@ mod tests {
 
         write_skill_bundle(&skill_root, "{}");
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, InstallMode::Copy).unwrap();
 
         let client = MockPolicyClient::new();
         let result = run_skill(
@@ -685,7 +685,7 @@ mod tests {
         fs::write(skill_root.join("prompts/system.txt"), "Summarise.").unwrap();
 
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, InstallMode::Copy).unwrap();
 
         let client = MockPolicyClient::new();
         let result = run_skill(
@@ -722,7 +722,7 @@ mod tests {
             r#"{"type":"object","required":["query"],"properties":{"query":{"type":"string"}}}"#,
         );
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, InstallMode::Copy).unwrap();
 
         let client = MockPolicyClient::new();
         let err = run_skill(
@@ -751,7 +751,7 @@ mod tests {
 
         write_skill_bundle(&skill_root, "{}");
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, InstallMode::Copy).unwrap();
 
         let mock_model = MockModelClient::new("mock response text").with_tokens(20, 15);
         let policy = MockPolicyClient::new();
@@ -809,7 +809,7 @@ mod tests {
         .unwrap();
 
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, InstallMode::Copy).unwrap();
 
         // Mock returns valid JSON matching the schema.
         let mock_model = MockModelClient::new(r#"{"summary":"all good"}"#);
@@ -865,7 +865,7 @@ mod tests {
         fs::write(skill_root.join("prompts/system.txt"), "Analyze the text.").unwrap();
 
         let pkg = SkillPackage::load_from_dir(&skill_root).unwrap();
-        install_unpacked_skill(&state, &pkg).unwrap();
+        install_unpacked_skill(&state, &pkg, InstallMode::Copy).unwrap();
 
         let mock_model = MockModelClient::new("analysis result").with_tokens(30, 20);
         let policy = MockPolicyClient::new();

@@ -1,0 +1,9 @@
+---
+source: crates/skillrunner-cli/src/ui_tests.rs
+expression: output
+---
+  ╭─ Installed ──────────────────────────────
+  │ ID      :               contract-compare │
+  │ Version :                          0.2.0 │
+  │ Status  :                      installed │
+  ╰──────────────────────────────────────────

@@ -1,0 +1,13 @@
+---
+source: crates/skillrunner-cli/src/ui_tests.rs
+expression: output
+---
+
+  ── Governance ──────────────────────────────────
+  Publisher : Untrusted Publisher [⚠ unverified]
+  Policy    : BLOCKED (org: org-acme)
+              Security policy violation detected
+  Scopes    : none requested
+  Scan      : FLAGGED (3 findings)
+  Audit     : no audit on record
+  ────────────────────────────────────────────────

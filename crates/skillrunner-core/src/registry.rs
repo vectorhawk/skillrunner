@@ -136,6 +136,107 @@ pub struct PluginDetail {
     pub description: Option<String>,
 }
 
+// ── Preinstall governance wire types ─────────────────────────────────────────
+
+/// Publisher identity returned inside `PreinstallGovernance`.
+///
+/// `verified` is derived from `trust_level == "trusted"` on the registry side.
+/// `verified_at` is `None` when the publisher has not completed verification.
+#[derive(Debug, Deserialize)]
+pub struct PreinstallPublisher {
+    pub id: String,
+    pub name: String,
+    pub verified: bool,
+    pub verified_at: Option<String>,
+}
+
+/// Org-scoped policy status for the skill.
+///
+/// `org_id` is always `None` today (org enforcement not yet live).
+/// When `None`, render as "org context not yet enforced".
+#[derive(Debug, Deserialize)]
+pub struct PreinstallPolicy {
+    pub status: String, // "approved" | "pending" | "blocked"
+    pub org_id: Option<String>,
+    pub message: Option<String>,
+}
+
+/// A single scope (permission) the skill requests.
+#[derive(Debug, Deserialize)]
+pub struct PreinstallScope {
+    pub name: String,
+    pub description: Option<String>,
+    pub risk_level: Option<String>,
+}
+
+/// Static-analysis scan result.
+///
+/// `verdict` is `"unknown"` when the async scan has not yet completed —
+/// the endpoint never blocks waiting for a scan result.
+#[derive(Debug, Deserialize)]
+pub struct PreinstallScan {
+    pub verdict: String, // "clean" | "flagged" | "unknown"
+    pub scanner: Option<String>,
+    pub scanned_at: Option<String>,
+    pub findings_count: Option<u32>,
+}
+
+/// Last-audit metadata.
+#[derive(Debug, Deserialize)]
+pub struct PreinstallAudit {
+    pub last_audited_at: Option<String>,
+    pub auditor: Option<String>,
+}
+
+/// Aggregated pre-install governance data returned by
+/// `GET /skills/{id}/preinstall`.
+#[derive(Debug, Deserialize)]
+pub struct PreinstallGovernance {
+    pub publisher: PreinstallPublisher,
+    pub policy: PreinstallPolicy,
+    #[serde(default)]
+    pub scopes_requested: Vec<PreinstallScope>,
+    pub scan: Option<PreinstallScan>,
+    pub audit: Option<PreinstallAudit>,
+}
+
+// ── Import preview / submit wire types (Phase 5b) ────────────────────────────
+
+/// Classification result from `POST /api/runner/import/preview`.
+///
+/// The registry classifier inspects `raw_input` and describes what it will do.
+/// The client presents this to the user, then calls `import_submit` with the
+/// same token to proceed.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ImportPreview {
+    /// Classifier label: "github_url", "raw_skill_md", "npx_command",
+    /// "mcp_json", or "generic_ref".
+    pub input_type: String,
+    /// Human-readable description of the detected intent.
+    pub description: String,
+    /// Original raw input echoed back (used as the submit body key).
+    pub raw_input: String,
+    /// For MCP-type inputs: the server name to register.
+    pub server_name: Option<String>,
+    /// For skill-type inputs: a proposed skill display name.
+    pub proposed_name: Option<String>,
+}
+
+/// Wire response from `POST /api/runner/import/submit`.
+#[derive(Debug, Deserialize, Serialize)]
+struct ImportSubmitResponse {
+    /// "skill_scaffolded" | "mcp_server_requested" | "skill_submitted"
+    pub outcome_type: String,
+    /// Local bundle path (skill_scaffolded outcome).
+    pub bundle_path: Option<String>,
+    /// Server name (mcp_server_requested outcome).
+    pub server_name: Option<String>,
+    /// Submission ID (skill_submitted outcome).
+    pub submission_id: Option<String>,
+    /// Human-readable status string ("pending", "approved", etc.).
+    pub status: Option<String>,
+}
+
 /// Download info returned by `GET /api/runner/plugins/{slug}/latest`.
 #[derive(Debug, Deserialize)]
 pub struct PluginDownloadInfo {
@@ -736,6 +837,203 @@ impl RegistryClient {
         }
 
         Ok(())
+    }
+
+    /// Fetch aggregated pre-install governance data for a skill.
+    ///
+    /// Calls `GET /skills/{id}/preinstall` with the Bearer token if set.
+    /// Returns a 404 error when the skill is not found in the registry.
+    ///
+    /// The returned `PreinstallGovernance` may have `scan = None` when the
+    /// async scan has not yet run, and `policy.org_id = None` when org
+    /// enforcement is not yet live on the registry.
+    pub fn fetch_preinstall_governance(&self, skill_id: &str) -> Result<PreinstallGovernance> {
+        let url = format!(
+            "{}/skills/{}/preinstall",
+            self.base_url.trim_end_matches('/'),
+            skill_id
+        );
+        debug!(url, "fetching preinstall governance");
+
+        let mut req = self.http.get(&url);
+        if let Some(token) = &self.auth_token {
+            req = req.bearer_auth(token);
+        }
+
+        let resp = req
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            anyhow::bail!("skill '{skill_id}' not found in registry");
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().unwrap_or_default();
+            anyhow::bail!(
+                "registry returned HTTP {status} for preinstall governance of '{skill_id}': {body}"
+            );
+        }
+
+        resp.json()
+            .context("failed to deserialize preinstall governance response")
+    }
+
+    // ── Phase 5b: universal paste-to-import ──────────────────────────────────
+
+    /// Ask the registry to classify `raw_input` and return a preview of what
+    /// it will do.
+    ///
+    /// Calls `POST /api/runner/import/preview` with Bearer auth. The five
+    /// input types the classifier recognises are: `github_url`, `raw_skill_md`,
+    /// `npx_command`, `mcp_json`, and `generic_ref`.
+    ///
+    /// Requires that `auth_token` be set (via [`with_auth`] / [`set_auth`]).
+    pub fn runner_import_preview(&self, raw_input: &str) -> Result<ImportPreview> {
+        let token = self.auth_token.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "not authenticated; run `vectorhawk auth login` before using registry import"
+            )
+        })?;
+
+        let base = self.base_url.trim_end_matches('/');
+        let url = format!("{base}/api/runner/import/preview");
+        debug!(url, "requesting import preview from registry");
+
+        let body = serde_json::json!({ "raw_input": raw_input });
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        let status = resp.status();
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            anyhow::bail!(
+                "registry returned 401 Unauthorized — your session has expired; \
+                 run `vectorhawk auth login` to refresh"
+            );
+        }
+        if status == reqwest::StatusCode::FORBIDDEN {
+            anyhow::bail!(
+                "registry returned 403 Forbidden — your account may be inactive or \
+                 lack permission for import; contact your IT administrator"
+            );
+        }
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            let body_text = resp.text().unwrap_or_default();
+            anyhow::bail!(
+                "registry could not classify input (422): {body_text}"
+            );
+        }
+        if !status.is_success() {
+            let body_text = resp.text().unwrap_or_default();
+            anyhow::bail!("registry returned HTTP {status} for import preview: {body_text}");
+        }
+
+        resp.json()
+            .context("failed to deserialize import preview response")
+    }
+
+    /// Submit a previously-previewed import to the registry.
+    ///
+    /// Calls `POST /api/runner/import/submit` with Bearer auth, forwarding the
+    /// `raw_input` from the preview. Returns an [`ImportOutcome`] variant
+    /// matching the registry's `outcome_type` field.
+    ///
+    /// Requires that `auth_token` be set (via [`with_auth`] / [`set_auth`]).
+    pub fn runner_import_submit(
+        &self,
+        preview: &ImportPreview,
+    ) -> Result<crate::import::ImportOutcome> {
+        let token = self.auth_token.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "not authenticated; run `vectorhawk auth login` before using registry import"
+            )
+        })?;
+
+        let base = self.base_url.trim_end_matches('/');
+        let url = format!("{base}/api/runner/import/submit");
+        debug!(url, input_type = %preview.input_type, "submitting import to registry");
+
+        let body = serde_json::json!({ "raw_input": preview.raw_input });
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .with_context(|| format!("failed to reach registry at {url}"))?;
+
+        let status = resp.status();
+
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            anyhow::bail!(
+                "registry returned 401 Unauthorized — your session has expired; \
+                 run `vectorhawk auth login` to refresh"
+            );
+        }
+        if status == reqwest::StatusCode::FORBIDDEN {
+            anyhow::bail!(
+                "registry returned 403 Forbidden — your account may be inactive or \
+                 lack permission for import; contact your IT administrator"
+            );
+        }
+        if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            let body_text = resp.text().unwrap_or_default();
+            anyhow::bail!("registry rejected import submission (422): {body_text}");
+        }
+        if !status.is_success() {
+            let body_text = resp.text().unwrap_or_default();
+            anyhow::bail!("registry returned HTTP {status} for import submit: {body_text}");
+        }
+
+        let wire: ImportSubmitResponse = resp
+            .json()
+            .context("failed to deserialize import submit response")?;
+
+        map_submit_response_to_outcome(wire)
+    }
+}
+
+/// Map the registry submit wire response to a typed [`ImportOutcome`].
+fn map_submit_response_to_outcome(
+    wire: ImportSubmitResponse,
+) -> Result<crate::import::ImportOutcome> {
+    match wire.outcome_type.as_str() {
+        "skill_scaffolded" => {
+            let path = wire.bundle_path.ok_or_else(|| {
+                anyhow::anyhow!("skill_scaffolded outcome missing bundle_path")
+            })?;
+            Ok(crate::import::ImportOutcome::SkillScaffolded {
+                bundle: camino::Utf8PathBuf::from(path),
+            })
+        }
+        "mcp_server_requested" => {
+            let server_name = wire.server_name.ok_or_else(|| {
+                anyhow::anyhow!("mcp_server_requested outcome missing server_name")
+            })?;
+            Ok(crate::import::ImportOutcome::McpServerRequested {
+                server_name,
+                status: wire.status.unwrap_or_else(|| "pending".to_string()),
+            })
+        }
+        "skill_submitted" => {
+            let submission_id = wire.submission_id.ok_or_else(|| {
+                anyhow::anyhow!("skill_submitted outcome missing submission_id")
+            })?;
+            Ok(crate::import::ImportOutcome::SkillSubmitted {
+                submission_id,
+                status: wire.status.unwrap_or_else(|| "pending".to_string()),
+            })
+        }
+        other => anyhow::bail!("unknown import outcome type from registry: '{other}'"),
     }
 }
 
@@ -1495,6 +1793,407 @@ mod tests {
         let resp = client.compile_and_publish(minimal_skill_tar_gz()).unwrap();
 
         assert_eq!(resp.frontmatter.name, "test-skill");
+        mock.assert();
+    }
+
+    // ── RegistryClient: fetch_preinstall_governance ────────────────────────
+
+    #[test]
+    fn fetch_preinstall_governance_happy_path_with_scan() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/skills/contract-compare/preinstall")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "publisher": {
+                        "id": "pub-001",
+                        "name": "VectorHawk Official",
+                        "verified": true,
+                        "verified_at": "2025-01-15T10:00:00Z"
+                    },
+                    "policy": {
+                        "status": "approved",
+                        "org_id": null,
+                        "message": null
+                    },
+                    "scopes_requested": [
+                        {
+                            "name": "read:files",
+                            "description": "Read input documents",
+                            "risk_level": "low"
+                        },
+                        {
+                            "name": "llm:call",
+                            "description": "Invoke a language model",
+                            "risk_level": "medium"
+                        }
+                    ],
+                    "scan": {
+                        "verdict": "clean",
+                        "scanner": "vectorhawk-scanner",
+                        "scanned_at": "2025-12-01T08:00:00Z",
+                        "findings_count": 0
+                    },
+                    "audit": {
+                        "last_audited_at": "2025-11-01T00:00:00Z",
+                        "auditor": "security-team"
+                    }
+                }"#,
+            )
+            .create();
+
+        let client = RegistryClient::new(server.url()).with_auth("test-token");
+        let gov = client
+            .fetch_preinstall_governance("contract-compare")
+            .unwrap();
+
+        assert_eq!(gov.publisher.name, "VectorHawk Official");
+        assert!(gov.publisher.verified);
+        assert_eq!(gov.policy.status, "approved");
+        assert!(gov.policy.org_id.is_none());
+        assert_eq!(gov.scopes_requested.len(), 2);
+        assert_eq!(gov.scopes_requested[0].name, "read:files");
+
+        let scan = gov.scan.expect("scan should be present");
+        assert_eq!(scan.verdict, "clean");
+        assert_eq!(scan.findings_count, Some(0));
+
+        let audit = gov.audit.expect("audit should be present");
+        assert_eq!(audit.auditor.as_deref(), Some("security-team"));
+
+        mock.assert();
+    }
+
+    #[test]
+    fn fetch_preinstall_governance_happy_path_without_scan() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/skills/new-skill/preinstall")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "publisher": {
+                        "id": "pub-002",
+                        "name": "Community Publisher",
+                        "verified": false,
+                        "verified_at": null
+                    },
+                    "policy": {
+                        "status": "pending",
+                        "org_id": null,
+                        "message": "Awaiting org approval"
+                    },
+                    "scopes_requested": [],
+                    "scan": null,
+                    "audit": null
+                }"#,
+            )
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        let gov = client
+            .fetch_preinstall_governance("new-skill")
+            .unwrap();
+
+        assert!(!gov.publisher.verified);
+        assert!(gov.publisher.verified_at.is_none());
+        assert_eq!(gov.policy.status, "pending");
+        assert_eq!(
+            gov.policy.message.as_deref(),
+            Some("Awaiting org approval")
+        );
+        assert!(gov.scopes_requested.is_empty());
+        assert!(gov.scan.is_none());
+        assert!(gov.audit.is_none());
+
+        mock.assert();
+    }
+
+    #[test]
+    fn fetch_preinstall_governance_returns_error_on_404() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("GET", "/skills/missing-skill/preinstall")
+            .with_status(404)
+            .with_body(r#"{"detail": "skill not found"}"#)
+            .create();
+
+        let client = RegistryClient::new(server.url());
+        let err = client
+            .fetch_preinstall_governance("missing-skill")
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("not found"),
+            "error should mention not found: {err}"
+        );
+        mock.assert();
+    }
+
+    // ── import_preview / import_submit ────────────────────────────────────────
+
+    fn make_authed_client(server: &mockito::Server) -> RegistryClient {
+        RegistryClient::new(server.url()).with_auth("test-token")
+    }
+
+    #[test]
+    fn import_preview_github_url_happy_path() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/api/runner/import/preview")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "input_type": "github_url",
+                "description": "GitHub repository containing a SKILL.md",
+                "raw_input": "https://github.com/example/skill",
+                "server_name": null,
+                "proposed_name": "example-skill"
+            }"#)
+            .create();
+
+        let client = make_authed_client(&server);
+        let preview = client
+            .runner_import_preview("https://github.com/example/skill")
+            .unwrap();
+
+        assert_eq!(preview.input_type, "github_url");
+        assert_eq!(preview.proposed_name.as_deref(), Some("example-skill"));
+        mock.assert();
+    }
+
+    #[test]
+    fn import_preview_raw_skill_md_happy_path() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/api/runner/import/preview")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "input_type": "raw_skill_md",
+                "description": "Raw SKILL.md frontmatter+body",
+                "raw_input": "---\nname: test\n---\nHello",
+                "server_name": null,
+                "proposed_name": "test"
+            }"#)
+            .create();
+
+        let client = make_authed_client(&server);
+        let preview = client
+            .runner_import_preview("---\nname: test\n---\nHello")
+            .unwrap();
+
+        assert_eq!(preview.input_type, "raw_skill_md");
+        mock.assert();
+    }
+
+    #[test]
+    fn import_preview_npx_command_happy_path() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/api/runner/import/preview")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "input_type": "npx_command",
+                "description": "npx-launched MCP server",
+                "raw_input": "npx -y @example/mcp-server",
+                "server_name": "example-mcp-server",
+                "proposed_name": null
+            }"#)
+            .create();
+
+        let client = make_authed_client(&server);
+        let preview = client.runner_import_preview("npx -y @example/mcp-server").unwrap();
+
+        assert_eq!(preview.input_type, "npx_command");
+        assert_eq!(preview.server_name.as_deref(), Some("example-mcp-server"));
+        mock.assert();
+    }
+
+    #[test]
+    fn import_preview_mcp_json_happy_path() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/api/runner/import/preview")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "input_type": "mcp_json",
+                "description": "MCP server JSON configuration",
+                "raw_input": "{\"command\": \"npx\", \"args\": [\"-y\", \"mcp-server\"]}",
+                "server_name": "mcp-server",
+                "proposed_name": null
+            }"#)
+            .create();
+
+        let client = make_authed_client(&server);
+        let preview = client
+            .runner_import_preview(r#"{"command": "npx", "args": ["-y", "mcp-server"]}"#)
+            .unwrap();
+
+        assert_eq!(preview.input_type, "mcp_json");
+        mock.assert();
+    }
+
+    #[test]
+    fn import_preview_generic_ref_happy_path() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/api/runner/import/preview")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "input_type": "generic_ref",
+                "description": "Generic package or skill reference",
+                "raw_input": "some-skill-package",
+                "server_name": null,
+                "proposed_name": "some-skill-package"
+            }"#)
+            .create();
+
+        let client = make_authed_client(&server);
+        let preview = client.runner_import_preview("some-skill-package").unwrap();
+
+        assert_eq!(preview.input_type, "generic_ref");
+        mock.assert();
+    }
+
+    #[test]
+    fn import_preview_returns_clear_error_on_401() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/api/runner/import/preview")
+            .with_status(401)
+            .with_body(r#"{"detail": "unauthorized"}"#)
+            .create();
+
+        let client = make_authed_client(&server);
+        let err = client.runner_import_preview("anything").unwrap_err();
+
+        assert!(
+            err.to_string().contains("401") || err.to_string().contains("expired"),
+            "error should mention 401 or expiry: {err}"
+        );
+        mock.assert();
+    }
+
+    #[test]
+    fn import_preview_returns_clear_error_on_403() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/api/runner/import/preview")
+            .with_status(403)
+            .with_body(r#"{"detail": "inactive key"}"#)
+            .create();
+
+        let client = make_authed_client(&server);
+        let err = client.runner_import_preview("anything").unwrap_err();
+
+        assert!(
+            err.to_string().contains("403") || err.to_string().contains("inactive"),
+            "error should mention 403 or inactive: {err}"
+        );
+        mock.assert();
+    }
+
+    #[test]
+    fn import_preview_returns_clear_error_on_422() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/api/runner/import/preview")
+            .with_status(422)
+            .with_body(r#"{"detail": "could not classify input"}"#)
+            .create();
+
+        let client = make_authed_client(&server);
+        let err = client.runner_import_preview("???").unwrap_err();
+
+        assert!(
+            err.to_string().contains("422"),
+            "error should mention 422: {err}"
+        );
+        mock.assert();
+    }
+
+    #[test]
+    fn import_submit_maps_skill_submitted_outcome() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/api/runner/import/submit")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "outcome_type": "skill_submitted",
+                "submission_id": "sub-abc-123",
+                "status": "pending",
+                "bundle_path": null,
+                "server_name": null
+            }"#)
+            .create();
+
+        let client = make_authed_client(&server);
+        let preview = ImportPreview {
+            input_type: "github_url".to_string(),
+            description: "test".to_string(),
+            raw_input: "https://github.com/example/skill".to_string(),
+            server_name: None,
+            proposed_name: Some("skill".to_string()),
+        };
+
+        let outcome = client.runner_import_submit(&preview).unwrap();
+        match outcome {
+            crate::import::ImportOutcome::SkillSubmitted {
+                submission_id,
+                status,
+            } => {
+                assert_eq!(submission_id, "sub-abc-123");
+                assert_eq!(status, "pending");
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+        mock.assert();
+    }
+
+    #[test]
+    fn import_submit_maps_mcp_server_requested_outcome() {
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/api/runner/import/submit")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "outcome_type": "mcp_server_requested",
+                "server_name": "my-mcp-server",
+                "status": "pending",
+                "bundle_path": null,
+                "submission_id": null
+            }"#)
+            .create();
+
+        let client = make_authed_client(&server);
+        let preview = ImportPreview {
+            input_type: "npx_command".to_string(),
+            description: "test".to_string(),
+            raw_input: "npx -y my-mcp-server".to_string(),
+            server_name: Some("my-mcp-server".to_string()),
+            proposed_name: None,
+        };
+
+        let outcome = client.runner_import_submit(&preview).unwrap();
+        match outcome {
+            crate::import::ImportOutcome::McpServerRequested {
+                server_name,
+                status,
+            } => {
+                assert_eq!(server_name, "my-mcp-server");
+                assert_eq!(status, "pending");
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
         mock.assert();
     }
 }

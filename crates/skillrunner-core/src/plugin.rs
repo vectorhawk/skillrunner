@@ -1,4 +1,4 @@
-use crate::install::{install_unpacked_skill, uninstall_skill};
+use crate::install::{install_unpacked_skill, uninstall_skill, InstallMode};
 use crate::state::AppState;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
@@ -55,7 +55,7 @@ pub fn install_plugin_from_dir(
             let skill_pkg = SkillPackage::load_from_dir(&skill_dir)
                 .with_context(|| format!("failed to load embedded skill at {path}"))?;
             let skill_id = skill_pkg.manifest.id.clone();
-            install_unpacked_skill(state, &skill_pkg)
+            install_unpacked_skill(state, &skill_pkg, InstallMode::Copy)
                 .with_context(|| format!("failed to install embedded skill '{skill_id}'"))?;
             info!(skill_id, "installed embedded skill");
             components.skill_ids.push(skill_id);
