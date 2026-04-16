@@ -202,7 +202,7 @@ pub struct PreinstallGovernance {
 
 // ── Import preview / submit wire types (Phase 5b) ────────────────────────────
 
-/// Classification result from `POST /api/runner/import/preview`.
+/// Classification result from `POST /runner/import/preview`.
 ///
 /// The registry classifier inspects `raw_input` and describes what it will do.
 /// The client presents this to the user, then calls `import_submit` with the
@@ -222,7 +222,7 @@ pub struct ImportPreview {
     pub proposed_name: Option<String>,
 }
 
-/// Wire response from `POST /api/runner/import/submit`.
+/// Wire response from `POST /runner/import/submit`.
 #[derive(Debug, Deserialize, Serialize)]
 struct ImportSubmitResponse {
     /// "skill_scaffolded" | "mcp_server_requested" | "skill_submitted"
@@ -885,7 +885,7 @@ impl RegistryClient {
     /// Ask the registry to classify `raw_input` and return a preview of what
     /// it will do.
     ///
-    /// Calls `POST /api/runner/import/preview` with Bearer auth. The five
+    /// Calls `POST /runner/import/preview` with Bearer auth. The five
     /// input types the classifier recognises are: `github_url`, `raw_skill_md`,
     /// `npx_command`, `mcp_json`, and `generic_ref`.
     ///
@@ -898,7 +898,7 @@ impl RegistryClient {
         })?;
 
         let base = self.base_url.trim_end_matches('/');
-        let url = format!("{base}/api/runner/import/preview");
+        let url = format!("{base}/runner/import/preview");
         debug!(url, "requesting import preview from registry");
 
         let body = serde_json::json!({ "raw_input": raw_input });
@@ -942,7 +942,7 @@ impl RegistryClient {
 
     /// Submit a previously-previewed import to the registry.
     ///
-    /// Calls `POST /api/runner/import/submit` with Bearer auth, forwarding the
+    /// Calls `POST /runner/import/submit` with Bearer auth, forwarding the
     /// `raw_input` from the preview. Returns an [`ImportOutcome`] variant
     /// matching the registry's `outcome_type` field.
     ///
@@ -958,7 +958,7 @@ impl RegistryClient {
         })?;
 
         let base = self.base_url.trim_end_matches('/');
-        let url = format!("{base}/api/runner/import/submit");
+        let url = format!("{base}/runner/import/submit");
         debug!(url, input_type = %preview.input_type, "submitting import to registry");
 
         let body = serde_json::json!({ "raw_input": preview.raw_input });
@@ -1943,7 +1943,7 @@ mod tests {
     fn import_preview_github_url_happy_path() {
         let mut server = Server::new();
         let mock = server
-            .mock("POST", "/api/runner/import/preview")
+            .mock("POST", "/runner/import/preview")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{
@@ -1969,7 +1969,7 @@ mod tests {
     fn import_preview_raw_skill_md_happy_path() {
         let mut server = Server::new();
         let mock = server
-            .mock("POST", "/api/runner/import/preview")
+            .mock("POST", "/runner/import/preview")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{
@@ -1994,7 +1994,7 @@ mod tests {
     fn import_preview_npx_command_happy_path() {
         let mut server = Server::new();
         let mock = server
-            .mock("POST", "/api/runner/import/preview")
+            .mock("POST", "/runner/import/preview")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{
@@ -2018,7 +2018,7 @@ mod tests {
     fn import_preview_mcp_json_happy_path() {
         let mut server = Server::new();
         let mock = server
-            .mock("POST", "/api/runner/import/preview")
+            .mock("POST", "/runner/import/preview")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{
@@ -2043,7 +2043,7 @@ mod tests {
     fn import_preview_generic_ref_happy_path() {
         let mut server = Server::new();
         let mock = server
-            .mock("POST", "/api/runner/import/preview")
+            .mock("POST", "/runner/import/preview")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{
@@ -2066,7 +2066,7 @@ mod tests {
     fn import_preview_returns_clear_error_on_401() {
         let mut server = Server::new();
         let mock = server
-            .mock("POST", "/api/runner/import/preview")
+            .mock("POST", "/runner/import/preview")
             .with_status(401)
             .with_body(r#"{"detail": "unauthorized"}"#)
             .create();
@@ -2085,7 +2085,7 @@ mod tests {
     fn import_preview_returns_clear_error_on_403() {
         let mut server = Server::new();
         let mock = server
-            .mock("POST", "/api/runner/import/preview")
+            .mock("POST", "/runner/import/preview")
             .with_status(403)
             .with_body(r#"{"detail": "inactive key"}"#)
             .create();
@@ -2104,7 +2104,7 @@ mod tests {
     fn import_preview_returns_clear_error_on_422() {
         let mut server = Server::new();
         let mock = server
-            .mock("POST", "/api/runner/import/preview")
+            .mock("POST", "/runner/import/preview")
             .with_status(422)
             .with_body(r#"{"detail": "could not classify input"}"#)
             .create();
@@ -2123,7 +2123,7 @@ mod tests {
     fn import_submit_maps_skill_submitted_outcome() {
         let mut server = Server::new();
         let mock = server
-            .mock("POST", "/api/runner/import/submit")
+            .mock("POST", "/runner/import/submit")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{
@@ -2162,7 +2162,7 @@ mod tests {
     fn import_submit_maps_mcp_server_requested_outcome() {
         let mut server = Server::new();
         let mock = server
-            .mock("POST", "/api/runner/import/submit")
+            .mock("POST", "/runner/import/submit")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{
