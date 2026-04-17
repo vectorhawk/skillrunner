@@ -1,19 +1,21 @@
 use anyhow::{Context, Result};
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Parser, Subcommand};
 use rusqlite::Connection;
 use skillrunner_core::{
     app::SkillRunnerApp,
     auth::{self, AuthClient},
-    executor::run_skill,
+    executor::run_skill_with_scope,
     import::import_local_skill_md,
-    install::{install_unpacked_skill, uninstall_skill, InstallMode},
+    install::{install_project_skill, install_unpacked_skill, uninstall_skill, InstallMode, InstallScope},
+    lockfile::Lockfile,
     managed::load_managed_config,
     mcp_governance,
     ollama::{resolve_model, OllamaClient},
     policy::MockPolicyClient,
     registry::{HttpPolicyClient, RegistryClient},
     resolver::{resolve_skill, ResolveOutcome},
+    restore::restore_project_skills,
     updater::{
         check_skill_updates, install_from_registry, install_plugin_from_registry, package_plugin,
         tar_gz_skill_source,
@@ -23,6 +25,9 @@ use skillrunner_core::{
 use skillrunner_manifest::SkillPackage;
 
 mod ui;
+#[cfg(test)]
+#[path = "scope_tests.rs"]
+mod scope_tests;
 use skillrunner_mcp::{
     migration::{list_backups, migrate_existing_servers, restore_backup},
     server::{run_server, McpServerConfig},
@@ -68,6 +73,23 @@ enum Commands {
     Plugin {
         #[command(subcommand)]
         command: PluginCommands,
+    },
+    /// Restore all project-scoped skills from the nearest .vectorhawk/skills.lock.json.
+    ///
+    /// Walks ancestor directories from the current working directory to find a
+    /// lockfile. Each skill is checked against the project cache; missing skills
+    /// are downloaded (registry) or compiled (local SKILL.md). Already-cached
+    /// skills are skipped. Partial failures are reported but do not abort the run.
+    Install {
+        /// VectorHawk registry URL for downloading registry-sourced skills.
+        /// Optional — only needed when the lockfile contains Registry entries
+        /// that are not already cached locally.
+        #[arg(long)]
+        registry_url: Option<String>,
+        /// Disallow network downloads. If a cached skill fails its integrity check,
+        /// treat it as a hard error rather than re-downloading from the registry.
+        #[arg(long)]
+        offline: bool,
     },
 }
 
@@ -235,7 +257,8 @@ enum SkillCommands {
         /// Symlink the skill source directory into the install layout instead of copying it.
         /// Edits to the source directory are immediately visible through `active/`.
         /// Only valid for local paths (not registry installs). Unix only.
-        #[arg(long)]
+        /// Cannot be combined with --project.
+        #[arg(long, conflicts_with = "project")]
         link: bool,
         /// Bypass a blocked or pending policy check.
         /// CLIENT-SIDE ONLY — the VectorHawk gateway still enforces policy
@@ -258,6 +281,16 @@ enum SkillCommands {
         /// In non-TTY mode confirms are always skipped regardless of this flag.
         #[arg(long)]
         yes: bool,
+        /// Force user (global) scope install.
+        /// Cannot be combined with --project.
+        #[arg(long, conflicts_with = "project")]
+        user: bool,
+        /// Install into project scope. Optional PATH is the project root; if
+        /// omitted, the nearest ancestor directory containing `.git` is used,
+        /// falling back to the current working directory.
+        /// Cannot be combined with --user or --link.
+        #[arg(long, value_name = "PATH", conflicts_with = "user", conflicts_with = "link")]
+        project: Option<Option<String>>,
     },
     /// Publish a skill to the registry
     Publish {
@@ -270,6 +303,9 @@ enum SkillCommands {
     /// Uninstall an installed skill
     Uninstall {
         skill_id: String,
+        /// Remove from project scope (lockfile + cache) instead of user scope.
+        #[arg(long)]
+        project: bool,
     },
     /// Update an installed skill to the latest version from the registry
     Update {
@@ -1247,24 +1283,80 @@ fn main() -> Result<()> {
                 println!("entrypoint: {}", skill.manifest.entrypoint);
                 println!("steps: {}", skill.workflow.steps.len());
             }
-            SkillCommands::Uninstall { skill_id } => {
-                match uninstall_skill(&app.state, &skill_id)? {
-                    Some(version) => {
-                        println!("Uninstalled {}@{}", skill_id, version);
-                        let all_clients = detect_ai_clients("");
-                        let client_refs: Vec<&skillrunner_mcp::setup::ClientConfig> =
-                            all_clients.iter().collect();
-                        let report = fanout_uninstall_skill(&skill_id, &client_refs);
-                        if !report.installed.is_empty() {
-                            let rows: Vec<(String, String)> = report
-                                .installed
-                                .iter()
-                                .map(|n| (n.clone(), "removed".to_string()))
-                                .collect();
-                            ui::summary_box("Fan-out removed", &rows);
-                        }
+            SkillCommands::Uninstall {
+                skill_id,
+                project: uninstall_project,
+            } => {
+                if uninstall_project {
+                    // Project-scope uninstall: find the nearest lockfile, remove the
+                    // entry, delete the cache dir, and sweep fan-out symlinks.
+                    let cwd = std::env::current_dir()
+                        .context("failed to get current working directory")?;
+                    let cwd_utf8 = Utf8PathBuf::from_path_buf(cwd)
+                        .map_err(|_| anyhow::anyhow!("current directory path is not valid UTF-8"))?;
+                    let lockfile_path = Lockfile::discover(&cwd_utf8).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no .vectorhawk/skills.lock.json found in this directory or any parent"
+                        )
+                    })?;
+                    let project_root = lockfile_path
+                        .parent()
+                        .and_then(|p| p.parent())
+                        .ok_or_else(|| anyhow::anyhow!("could not determine project root from lockfile path {lockfile_path}"))?
+                        .to_owned();
+
+                    let mut lockfile = Lockfile::load(&lockfile_path)?;
+                    let removed_entry = lockfile.remove(&skill_id);
+                    if removed_entry.is_none() {
+                        println!(
+                            "Skill '{}' is not in the project lockfile.",
+                            skill_id
+                        );
+                        return Ok(());
                     }
-                    None => println!("Skill '{}' is not installed.", skill_id),
+                    lockfile.save(&lockfile_path)?;
+
+                    // Delete the cache directory.
+                    let cache_dir = project_root.join(".vectorhawk").join("skills").join(&skill_id);
+                    if cache_dir.exists() {
+                        std::fs::remove_dir_all(cache_dir.as_std_path()).with_context(|| {
+                            format!("failed to remove project skill cache at {cache_dir}")
+                        })?;
+                    }
+
+                    // Sweep fan-out symlinks.
+                    let all_clients = detect_ai_clients("");
+                    let client_refs: Vec<&skillrunner_mcp::setup::ClientConfig> =
+                        all_clients.iter().collect();
+                    let report = fanout_uninstall_skill(&skill_id, &client_refs);
+                    println!("Uninstalled '{}' from project scope.", skill_id);
+                    if !report.installed.is_empty() {
+                        let rows: Vec<(String, String)> = report
+                            .installed
+                            .iter()
+                            .map(|n| (n.clone(), "removed".to_string()))
+                            .collect();
+                        ui::summary_box("Fan-out removed", &rows);
+                    }
+                } else {
+                    match uninstall_skill(&app.state, &skill_id)? {
+                        Some(version) => {
+                            println!("Uninstalled {}@{}", skill_id, version);
+                            let all_clients = detect_ai_clients("");
+                            let client_refs: Vec<&skillrunner_mcp::setup::ClientConfig> =
+                                all_clients.iter().collect();
+                            let report = fanout_uninstall_skill(&skill_id, &client_refs);
+                            if !report.installed.is_empty() {
+                                let rows: Vec<(String, String)> = report
+                                    .installed
+                                    .iter()
+                                    .map(|n| (n.clone(), "removed".to_string()))
+                                    .collect();
+                                ui::summary_box("Fan-out removed", &rows);
+                            }
+                        }
+                        None => println!("Skill '{}' is not installed.", skill_id),
+                    }
                 }
             }
             SkillCommands::Update {
@@ -1286,6 +1378,8 @@ fn main() -> Result<()> {
                 no_fanout,
                 clients: clients_filter,
                 yes,
+                user: scope_user,
+                project: scope_project,
             } => {
                 let skill_ref = match skill_ref {
                     Some(r) => r,
@@ -1378,6 +1472,9 @@ fn main() -> Result<()> {
                     }
                 };
 
+                // Resolve the install scope from flags or an interactive TTY picker.
+                let scope = resolve_install_scope(scope_user, scope_project)?;
+
                 // Heuristic: if skill_ref looks like a path, install from local dir.
                 let is_local = skill_ref.contains('/')
                     || skill_ref.starts_with('.')
@@ -1393,35 +1490,69 @@ fn main() -> Result<()> {
                 if is_local {
                     let path = Utf8PathBuf::from(&skill_ref);
                     let skill = SkillPackage::load_from_dir(path)?;
-                    let mode = if link {
-                        InstallMode::Symlink
-                    } else {
-                        InstallMode::Copy
-                    };
-                    install_unpacked_skill(&app.state, &skill, mode)?;
-                    let install_path = app
-                        .state
-                        .root_dir
-                        .join("skills")
-                        .join(&skill.manifest.id)
-                        .join("active");
-                    ui::summary_box(
-                        "Installed",
-                        &[
-                            ("ID".to_string(), skill.manifest.id.clone()),
-                            ("Version".to_string(), skill.manifest.version.to_string()),
-                            ("Path".to_string(), install_path.to_string()),
-                        ],
-                    );
-                    if !ui::is_tty() {
-                        println!("Installed {}@{}", skill.manifest.id, skill.manifest.version);
+
+                    match &scope {
+                        InstallScope::Project(project_root) => {
+                            // Project scope: copy into .vectorhawk/skills/{id}/ and upsert lockfile.
+                            let project_skill_dir =
+                                install_project_skill(project_root, &skill, None, None)?;
+                            ui::summary_box(
+                                "Installed (project)",
+                                &[
+                                    ("ID".to_string(), skill.manifest.id.clone()),
+                                    ("Version".to_string(), skill.manifest.version.to_string()),
+                                    ("Scope".to_string(), format!("project ({})", project_root)),
+                                    ("Path".to_string(), project_skill_dir.to_string()),
+                                ],
+                            );
+                            if !ui::is_tty() {
+                                println!(
+                                    "Installed {}@{} (project scope)",
+                                    skill.manifest.id, skill.manifest.version
+                                );
+                            }
+                            run_fanout(
+                                &skill.manifest.id,
+                                project_skill_dir.as_std_path(),
+                                no_fanout,
+                                clients_filter.as_deref(),
+                            );
+                        }
+                        InstallScope::User => {
+                            let mode = if link {
+                                InstallMode::Symlink
+                            } else {
+                                InstallMode::Copy
+                            };
+                            install_unpacked_skill(&app.state, &skill, mode)?;
+                            let install_path = app
+                                .state
+                                .root_dir
+                                .join("skills")
+                                .join(&skill.manifest.id)
+                                .join("active");
+                            ui::summary_box(
+                                "Installed",
+                                &[
+                                    ("ID".to_string(), skill.manifest.id.clone()),
+                                    ("Version".to_string(), skill.manifest.version.to_string()),
+                                    ("Path".to_string(), install_path.to_string()),
+                                ],
+                            );
+                            if !ui::is_tty() {
+                                println!(
+                                    "Installed {}@{}",
+                                    skill.manifest.id, skill.manifest.version
+                                );
+                            }
+                            run_fanout(
+                                &skill.manifest.id,
+                                install_path.as_std_path(),
+                                no_fanout,
+                                clients_filter.as_deref(),
+                            );
+                        }
                     }
-                    run_fanout(
-                        &skill.manifest.id,
-                        install_path.as_std_path(),
-                        no_fanout,
-                        clients_filter.as_deref(),
-                    );
                 } else {
                     // ── REGISTRY BRANCH ──────────────────────────────────────
 
@@ -1533,36 +1664,87 @@ fn main() -> Result<()> {
                         }
                     }
 
-                    let installed_ver = install_from_registry(
-                        &app.state,
-                        &registry,
-                        &skill_id,
-                        effective_version.as_deref(),
-                    )?;
-                    let install_path = app
-                        .state
-                        .root_dir
-                        .join("skills")
-                        .join(&skill_id)
-                        .join("active");
-                    ui::summary_box(
-                        "Installed",
-                        &[
-                            ("ID".to_string(), skill_id.clone()),
-                            ("Version".to_string(), installed_ver.clone()),
-                            ("Source".to_string(), "registry".to_string()),
-                            ("Path".to_string(), install_path.to_string()),
-                        ],
-                    );
-                    if !ui::is_tty() {
-                        println!("Installed {}@{} from registry", skill_id, installed_ver);
+                    match &scope {
+                        InstallScope::Project(project_root) => {
+                            // For project-scope registry installs we download via install_from_registry
+                            // (to the user store as a staging area), then copy into the project cache.
+                            // This reuses the existing download + extraction logic without duplicating it.
+                            let installed_ver = install_from_registry(
+                                &app.state,
+                                &registry,
+                                &skill_id,
+                                effective_version.as_deref(),
+                            )?;
+                            // Load the just-installed skill bundle from the user store staging path.
+                            let staged_path = app
+                                .state
+                                .root_dir
+                                .join("skills")
+                                .join(&skill_id)
+                                .join("active");
+                            let staged_skill = SkillPackage::load_from_dir(staged_path.clone())?;
+                            let project_skill_dir = install_project_skill(
+                                project_root,
+                                &staged_skill,
+                                Some(&url),
+                                None,
+                            )?;
+                            ui::summary_box(
+                                "Installed (project)",
+                                &[
+                                    ("ID".to_string(), skill_id.clone()),
+                                    ("Version".to_string(), installed_ver.clone()),
+                                    ("Scope".to_string(), format!("project ({})", project_root)),
+                                    ("Source".to_string(), "registry".to_string()),
+                                    ("Path".to_string(), project_skill_dir.to_string()),
+                                ],
+                            );
+                            if !ui::is_tty() {
+                                println!(
+                                    "Installed {}@{} from registry (project scope)",
+                                    skill_id, installed_ver
+                                );
+                            }
+                            run_fanout(
+                                &skill_id,
+                                project_skill_dir.as_std_path(),
+                                no_fanout,
+                                clients_filter.as_deref(),
+                            );
+                        }
+                        InstallScope::User => {
+                            let installed_ver = install_from_registry(
+                                &app.state,
+                                &registry,
+                                &skill_id,
+                                effective_version.as_deref(),
+                            )?;
+                            let install_path = app
+                                .state
+                                .root_dir
+                                .join("skills")
+                                .join(&skill_id)
+                                .join("active");
+                            ui::summary_box(
+                                "Installed",
+                                &[
+                                    ("ID".to_string(), skill_id.clone()),
+                                    ("Version".to_string(), installed_ver.clone()),
+                                    ("Source".to_string(), "registry".to_string()),
+                                    ("Path".to_string(), install_path.to_string()),
+                                ],
+                            );
+                            if !ui::is_tty() {
+                                println!("Installed {}@{} from registry", skill_id, installed_ver);
+                            }
+                            run_fanout(
+                                &skill_id,
+                                install_path.as_std_path(),
+                                no_fanout,
+                                clients_filter.as_deref(),
+                            );
+                        }
                     }
-                    run_fanout(
-                        &skill_id,
-                        install_path.as_std_path(),
-                        no_fanout,
-                        clients_filter.as_deref(),
-                    );
                 }
             }
             SkillCommands::Publish { path, registry_url } => {
@@ -1619,43 +1801,131 @@ fn main() -> Result<()> {
                 }
             }
             SkillCommands::List => {
+                // Collect user-scope skills from SQLite.
                 let conn = Connection::open(&app.state.db_path)?;
                 let mut stmt = conn.prepare(
                     "SELECT skill_id, active_version, current_status FROM installed_skills ORDER BY skill_id",
                 )?;
-                let rows = stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?;
-                for row in rows {
-                    let (skill_id, version, status) = row?;
-                    println!("{} {} [{}]", skill_id, version, status);
+                let user_rows: Vec<(String, String, String)> = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                // Collect project-scope skills from the nearest lockfile (if any).
+                let cwd = std::env::current_dir()
+                    .context("failed to get current working directory")?;
+                let cwd_utf8 = Utf8PathBuf::from_path_buf(cwd)
+                    .map_err(|_| anyhow::anyhow!("current directory path is not valid UTF-8"))?;
+                let project_skills: Vec<(String, String)> =
+                    if let Some(lockfile_path) = Lockfile::discover(&cwd_utf8) {
+                        match Lockfile::load(&lockfile_path) {
+                            Ok(lf) => {
+                                let project_root = lockfile_path
+                                    .parent()
+                                    .and_then(|p| p.parent())
+                                    .unwrap_or(&cwd_utf8);
+                                lf.skills
+                                    .into_iter()
+                                    .map(|(id, entry)| {
+                                        let ver = match &entry {
+                                            skillrunner_core::lockfile::LockedSkill::Registry {
+                                                version,
+                                                ..
+                                            } => version.clone(),
+                                            skillrunner_core::lockfile::LockedSkill::Local { .. } => {
+                                                let cache_dir = project_root.join(".vectorhawk").join("skills").join(&id);
+                                                SkillPackage::load_from_dir(cache_dir)
+                                                    .map(|pkg| pkg.manifest.version.to_string())
+                                                    .unwrap_or_else(|_| "local".to_string())
+                                            }
+                                        };
+                                        (id, ver)
+                                    })
+                                    .collect()
+                            }
+                            Err(_) => Vec::new(),
+                        }
+                    } else {
+                        Vec::new()
+                    };
+
+                // Build a set of IDs that appear in the project scope, for shadowing detection.
+                let project_ids: std::collections::HashSet<String> =
+                    project_skills.iter().map(|(id, _)| id.clone()).collect();
+
+                // Print header.
+                println!("{:<30} {:<12} {:<10} STATUS", "ID", "VERSION", "SCOPE");
+                println!("{}", "-".repeat(68));
+
+                // Print project-scope skills first.
+                for (skill_id, version) in &project_skills {
+                    println!("{:<30} {:<12} {:<10} active", skill_id, version, "project");
+                }
+
+                // Print user-scope skills; mark as "shadowed" if the project scope has the same ID.
+                for (skill_id, version, status) in &user_rows {
+                    let display_status = if project_ids.contains(skill_id.as_str()) {
+                        "shadowed".to_string()
+                    } else {
+                        status.clone()
+                    };
+                    println!(
+                        "{:<30} {:<12} {:<10} {}",
+                        skill_id, version, "user", display_status
+                    );
                 }
             }
             SkillCommands::Resolve { skill_id } => {
+                let cwd = std::env::current_dir()
+                    .context("failed to get current working directory")?;
+                let cwd_utf8 = Utf8PathBuf::from_path_buf(cwd)
+                    .map_err(|_| anyhow::anyhow!("current directory path is not valid UTF-8"))?;
+                let resolve_project_root: Option<Utf8PathBuf> =
+                    Lockfile::discover(&cwd_utf8).and_then(|p| {
+                        p.parent().and_then(|vh| vh.parent()).map(|r| r.to_owned())
+                    });
                 let outcome = if let Some(url) =
                     resolve_registry_url(None, managed_registry_url.as_deref())
                 {
                     let policy_client =
                         HttpPolicyClient::new(RegistryClient::new(&url), &app.state);
-                    resolve_skill(&app.state, &policy_client, &skill_id)?
+                    resolve_skill(
+                        &app.state,
+                        &policy_client,
+                        &skill_id,
+                        resolve_project_root.as_deref(),
+                    )?
                 } else {
                     let policy_client = MockPolicyClient::new();
-                    resolve_skill(&app.state, &policy_client, &skill_id)?
+                    resolve_skill(
+                        &app.state,
+                        &policy_client,
+                        &skill_id,
+                        resolve_project_root.as_deref(),
+                    )?
                 };
                 match outcome {
                     ResolveOutcome::Active {
                         skill_id,
                         version,
                         install_path,
+                        scope,
                     } => {
+                        let scope_str = match scope {
+                            InstallScope::User => "user".to_string(),
+                            InstallScope::Project(ref root) => format!("project ({})", root),
+                        };
                         println!("status: active");
                         println!("skill_id: {}", skill_id);
                         println!("version: {}", version);
                         println!("install_path: {}", install_path);
+                        println!("scope: {}", scope_str);
                     }
                     ResolveOutcome::Blocked { skill_id, reason } => {
                         println!("status: blocked");
@@ -1699,6 +1969,17 @@ fn main() -> Result<()> {
                 let model_client: Option<&dyn skillrunner_core::model::ModelClient> =
                     if stub { None } else { Some(&ollama) };
 
+                // Detect project root so `run` respects project-scope installs.
+                let run_cwd = std::env::current_dir()
+                    .context("failed to get current working directory")?;
+                let run_cwd_utf8 = Utf8PathBuf::from_path_buf(run_cwd).map_err(|_| {
+                    anyhow::anyhow!("current directory path is not valid UTF-8")
+                })?;
+                let run_project_root: Option<Utf8PathBuf> =
+                    Lockfile::discover(&run_cwd_utf8).and_then(|p| {
+                        p.parent().and_then(|vh| vh.parent()).map(|r| r.to_owned())
+                    });
+
                 let effective_url =
                     resolve_registry_url(registry_url, managed_registry_url.as_deref());
                 let result = if !stub {
@@ -1706,35 +1987,38 @@ fn main() -> Result<()> {
                         let registry = RegistryClient::new(&url);
                         let http_policy =
                             HttpPolicyClient::new(RegistryClient::new(&url), &app.state);
-                        run_skill(
+                        run_skill_with_scope(
                             &app.state,
                             &http_policy,
                             &skill_id,
                             &input_json,
                             model_client,
                             Some(&registry),
+                            run_project_root.as_deref(),
                         )?
                     } else {
                         let policy_client = MockPolicyClient::new();
-                        run_skill(
+                        run_skill_with_scope(
                             &app.state,
                             &policy_client,
                             &skill_id,
                             &input_json,
                             model_client,
                             None,
+                            run_project_root.as_deref(),
                         )?
                     }
                 } else {
                     // Stub mode: skip registry policy, use allow-all mock
                     let policy_client = MockPolicyClient::new();
-                    run_skill(
+                    run_skill_with_scope(
                         &app.state,
                         &policy_client,
                         &skill_id,
                         &input_json,
                         model_client,
                         None,
+                        run_project_root.as_deref(),
                     )?
                 };
                 println!("Running {}@{}", result.skill_id, result.version);
@@ -2068,6 +2352,99 @@ fn main() -> Result<()> {
                 println!("      Then run: skillrunner plugin validate {plugin_dir}");
             }
         },
+
+        Commands::Install { registry_url, offline } => {
+            // Discover the nearest lockfile walking up from cwd.
+            let cwd = std::env::current_dir().context("failed to get current directory")?;
+            let cwd_utf8 = camino::Utf8PathBuf::from_path_buf(cwd)
+                .map_err(|p| anyhow::anyhow!("current directory path is not valid UTF-8: {}", p.display()))?;
+
+            let lockfile_path = Lockfile::discover(&cwd_utf8).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no .vectorhawk/skills.lock.json found in this directory or any ancestor.\n\
+                     Run `skillrunner skill install <ref>` to install a skill first."
+                )
+            })?;
+
+            let lockfile = Lockfile::load(&lockfile_path)
+                .with_context(|| format!("failed to load lockfile at {lockfile_path}"))?;
+
+            // The project root is the parent of the .vectorhawk/ directory.
+            let project_root = lockfile_path
+                .parent()  // .vectorhawk/
+                .and_then(|p| p.parent()) // project root
+                .ok_or_else(|| anyhow::anyhow!("could not determine project root from lockfile path {lockfile_path}"))?;
+
+            let skill_count = lockfile.skills.len();
+            if skill_count == 0 {
+                println!("Lockfile is empty — nothing to restore.");
+                return Ok(());
+            }
+
+            println!(
+                "Restoring {} skill{} from {}",
+                skill_count,
+                if skill_count == 1 { "" } else { "s" },
+                lockfile_path
+            );
+
+            // Build optional registry client.
+            let effective_url = resolve_registry_url(registry_url, managed_registry_url.as_deref());
+            let registry_client = effective_url.as_deref().map(RegistryClient::new);
+
+            // Restore each skill, showing a spinner per skill.
+            let mut installed_rows: Vec<(String, String)> = Vec::new();
+            let mut failed_rows: Vec<(String, String)> = Vec::new();
+            let mut cached_count: usize = 0;
+
+            for (skill_id, entry) in &lockfile.skills {
+                let sp = ui::spinner(&format!("Restoring {skill_id}..."));
+
+                // Restore a single skill by constructing a one-entry lockfile.
+                let mut single = Lockfile::new();
+                single.upsert(skill_id.clone(), entry.clone());
+
+                let result = restore_project_skills(
+                    project_root,
+                    &single,
+                    registry_client.as_ref(),
+                    offline,
+                );
+
+                sp.finish_and_clear();
+
+                for id in result.installed {
+                    installed_rows.push((id, "installed".to_string()));
+                }
+                for id in result.cached {
+                    cached_count += 1;
+                    let _ = id; // counted but not shown in summary box
+                }
+                for (id, reason) in result.failed {
+                    failed_rows.push((id, reason));
+                }
+            }
+
+            // Render summary.
+            if !installed_rows.is_empty() || cached_count > 0 || !failed_rows.is_empty() {
+                let mut summary_rows: Vec<(String, String)> = installed_rows.clone();
+                if cached_count > 0 {
+                    summary_rows.push((
+                        format!("{cached_count} skill(s)"),
+                        "already cached".to_string(),
+                    ));
+                }
+                ui::summary_box("Restored", &summary_rows);
+            }
+
+            if !failed_rows.is_empty() {
+                eprintln!("\nFailed to restore {} skill(s):", failed_rows.len());
+                for (id, reason) in &failed_rows {
+                    eprintln!("  {id}: {reason}");
+                }
+                anyhow::bail!("restore completed with {} failure(s)", failed_rows.len());
+            }
+        }
     }
 
     Ok(())
@@ -2403,4 +2780,95 @@ fn run_migration_step(
         }
     }
     Ok(())
+}
+
+// ── Scope helpers ──────────────────────────────────────────────────────────────
+
+/// Resolve which `InstallScope` to use for a skill install.
+///
+/// Priority:
+/// 1. `--user` flag → `InstallScope::User`
+/// 2. `--project [PATH]` flag → `InstallScope::Project(resolve_path())`
+/// 3. Interactive TTY picker (shown only when a `.git` root is detectable)
+/// 4. Non-TTY fallback → `InstallScope::User` (backwards compat)
+fn resolve_install_scope(
+    force_user: bool,
+    force_project: Option<Option<String>>,
+) -> Result<InstallScope> {
+    if force_user {
+        return Ok(InstallScope::User);
+    }
+
+    if let Some(explicit_path) = force_project {
+        let root = match explicit_path {
+            Some(p) => Utf8PathBuf::from(p),
+            None => {
+                // Walk up from cwd looking for .git; fall back to cwd.
+                find_project_root()?
+            }
+        };
+        return Ok(InstallScope::Project(root));
+    }
+
+    // Neither flag was given.
+    if !ui::is_tty() {
+        // Non-interactive: default to user scope for backwards compat.
+        return Ok(InstallScope::User);
+    }
+
+    // TTY: offer a scope picker, but only if we can find a project root.
+    let cwd = std::env::current_dir().context("failed to get current working directory")?;
+    let cwd_utf8 = Utf8PathBuf::from_path_buf(cwd)
+        .map_err(|_| anyhow::anyhow!("current directory path is not valid UTF-8"))?;
+
+    let detected_root = find_git_root(&cwd_utf8);
+
+    let mut items: Vec<String> = Vec::new();
+    if let Some(ref root) = detected_root {
+        items.push(format!("This project (.vectorhawk/ in {})", root));
+    }
+    items.push("User (global)".to_string());
+
+    // If there is only one option (no project root detected), skip the picker.
+    if detected_root.is_none() {
+        return Ok(InstallScope::User);
+    }
+
+    let selection = dialoguer::Select::with_theme(&ui::theme())
+        .with_prompt("Install scope")
+        .items(&items)
+        .default(0)
+        .interact()?;
+
+    match (detected_root, selection) {
+        (Some(root), 0) => Ok(InstallScope::Project(root)),
+        _ => Ok(InstallScope::User),
+    }
+}
+
+/// Walk ancestor directories from `start` looking for a `.git` directory.
+///
+/// Returns the path to the directory that contains `.git` (i.e. the project
+/// root), or `None` if we reach the filesystem root without finding one.
+fn find_git_root(start: &Utf8Path) -> Option<Utf8PathBuf> {
+    let mut current: &Utf8Path = start;
+    loop {
+        if current.join(".git").exists() {
+            return Some(current.to_owned());
+        }
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => return None,
+        }
+    }
+}
+
+/// Resolve the project root for scope operations.
+///
+/// Walks up from cwd looking for `.git`; falls back to cwd if not found.
+fn find_project_root() -> Result<Utf8PathBuf> {
+    let cwd = std::env::current_dir().context("failed to get current working directory")?;
+    let cwd_utf8 = Utf8PathBuf::from_path_buf(cwd)
+        .map_err(|_| anyhow::anyhow!("current directory path is not valid UTF-8"))?;
+    Ok(find_git_root(&cwd_utf8).unwrap_or(cwd_utf8))
 }

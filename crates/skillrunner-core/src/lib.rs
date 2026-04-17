@@ -1,6 +1,8 @@
 pub mod app;
 #[cfg(feature = "registry")]
 pub mod auth;
+pub mod lockfile;
+pub mod restore;
 pub mod executor;
 pub mod import;
 pub mod install;

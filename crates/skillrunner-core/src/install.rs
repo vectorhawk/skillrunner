@@ -1,5 +1,7 @@
+use crate::lockfile::{compute_integrity, LockedSkill, Lockfile};
 use crate::state::AppState;
 use anyhow::{Context, Result};
+use camino::{Utf8Path, Utf8PathBuf};
 use rusqlite::{params, Connection, OptionalExtension};
 use skillrunner_manifest::SkillPackage;
 use std::fs;
@@ -286,6 +288,175 @@ pub fn reactivate_skill(state: &AppState, skill_id: &str) -> Result<bool> {
     )?;
 
     Ok(true)
+}
+
+// ── Project-scope install ─────────────────────────────────────────────────────
+
+/// Where an installed skill lives: in the global user store, or local to a project.
+///
+/// `Project` carries the path to the project root — the directory that contains
+/// (or will contain) `.vectorhawk/`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum InstallScope {
+    /// Global user install: `~/Library/Application Support/SkillClub/SkillRunner/skills/…`
+    User,
+    /// Project-local install: `{project_root}/.vectorhawk/skills/{id}/`
+    Project(Utf8PathBuf),
+}
+
+/// The hidden directory name inside a project root.
+const VH_DIR: &str = ".vectorhawk";
+
+/// Install a skill bundle into the **project** scope.
+///
+/// Creates `.vectorhawk/skills/{id}/` under `project_root`, copies the bundle,
+/// upserts the lockfile, and auto-generates `.vectorhawk/.gitignore` on first use.
+///
+/// # Arguments
+///
+/// - `project_root` — directory that owns (or will own) `.vectorhawk/`
+/// - `skill` — the loaded, validated skill package to install
+/// - `registry_url` — if `Some`, records a `Registry` lockfile entry; if `None`,
+///   records a `Local` entry with a path relative to `project_root`
+/// - `integrity` — SHA-256 integrity string (e.g. `"sha256-abc123"`); only used
+///   when `registry_url` is `Some`
+///
+/// Returns the path to the installed skill directory.
+pub fn install_project_skill(
+    project_root: &Utf8Path,
+    skill: &SkillPackage,
+    registry_url: Option<&str>,
+    // The caller-supplied integrity is superseded: we always compute a fresh
+    // hash from the files written to disk and record that in the lockfile.
+    // This parameter is retained for API stability.
+    _integrity: Option<&str>,
+) -> Result<Utf8PathBuf> {
+    let vh_dir = project_root.join(VH_DIR);
+    let skills_cache = vh_dir.join("skills");
+    let skill_dir = skills_cache.join(&skill.manifest.id);
+
+    // 1. Create the skill directory under the project cache.
+    fs::create_dir_all(skill_dir.as_std_path())
+        .with_context(|| format!("failed to create project skill dir at {skill_dir}"))?;
+
+    // 2. Copy the bundle into the skill directory (always Copy, never Symlink).
+    //    Remove any pre-existing content so re-installs are idempotent.
+    if skill_dir.exists() {
+        fs::remove_dir_all(skill_dir.as_std_path())
+            .with_context(|| format!("failed to clear existing project skill dir at {skill_dir}"))?;
+    }
+    copy_dir_all::copy_dir_all(skill.root.as_std_path(), skill_dir.as_std_path())
+        .with_context(|| {
+            format!(
+                "failed to copy skill '{}' into project cache at {skill_dir}",
+                skill.manifest.id
+            )
+        })?;
+
+    // 3. Compute the integrity hash from the files that were just written to disk.
+    //    This overrides any caller-supplied `integrity` so the lockfile always
+    //    records the hash of what is actually present in the cache.
+    let computed_integrity = compute_integrity(&skill_dir)
+        .with_context(|| {
+            format!(
+                "failed to compute integrity for skill '{}' at {skill_dir}",
+                skill.manifest.id
+            )
+        })?;
+
+    // 4. Load or create the lockfile.
+    let lockfile_path = vh_dir.join("skills.lock.json");
+    let mut lockfile = if lockfile_path.exists() {
+        Lockfile::load(&lockfile_path)
+            .with_context(|| format!("failed to load lockfile at {lockfile_path}"))?
+    } else {
+        Lockfile::new()
+    };
+
+    // 5. Build the lockfile entry using the freshly computed integrity.
+    let locked_entry = build_locked_skill(project_root, skill, registry_url, Some(&computed_integrity))?;
+
+    // 6. Upsert and save atomically.
+    lockfile.upsert(skill.manifest.id.clone(), locked_entry);
+    lockfile
+        .save(&lockfile_path)
+        .with_context(|| format!("failed to save lockfile at {lockfile_path}"))?;
+
+    // 7. Auto-generate `.vectorhawk/.gitignore` on first project install.
+    ensure_gitignore(&vh_dir)?;
+
+    Ok(skill_dir)
+}
+
+/// Compute a relative path from `base` to `target`, returning a forward-slash
+/// string suitable for cross-platform lockfile storage.
+///
+/// Returns `None` if the paths share no common prefix (e.g. different Windows
+/// drive letters), in which case the caller should fall back to the absolute path.
+fn relative_utf8_path(base: &Utf8Path, target: &Utf8Path) -> Option<String> {
+    // Walk both paths to find the common prefix length.
+    let base_comps: Vec<_> = base.components().collect();
+    let target_comps: Vec<_> = target.components().collect();
+
+    // If no common prefix at all, relativisation is not possible.
+    let common_len = base_comps
+        .iter()
+        .zip(target_comps.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    if common_len == 0 {
+        return None;
+    }
+
+    // Number of `..` steps needed to back up from `base` to the common ancestor.
+    let up_steps = base_comps.len() - common_len;
+    // Remaining components of `target` after the common prefix.
+    let down_comps = &target_comps[common_len..];
+
+    let mut parts: Vec<String> = Vec::new();
+    for _ in 0..up_steps {
+        parts.push("..".to_string());
+    }
+    for comp in down_comps {
+        parts.push(comp.as_str().replace('\\', "/"));
+    }
+
+    Some(parts.join("/"))
+}
+
+/// Build the `LockedSkill` entry for a skill install.
+fn build_locked_skill(
+    project_root: &Utf8Path,
+    skill: &SkillPackage,
+    registry_url: Option<&str>,
+    integrity: Option<&str>,
+) -> Result<LockedSkill> {
+    match registry_url {
+        Some(url) => Ok(LockedSkill::Registry {
+            version: skill.manifest.version.to_string(),
+            registry_url: url.to_string(),
+            integrity: integrity.unwrap_or("").to_string(),
+        }),
+        None => {
+            // Compute a path relative from the project root to the skill source.
+            // Fall back to the absolute source path string if relativisation
+            // is not possible (e.g. different Windows drive letters).
+            let local_path = relative_utf8_path(project_root, &skill.root)
+                .unwrap_or_else(|| skill.root.as_str().replace('\\', "/"));
+            Ok(LockedSkill::Local { local_path })
+        }
+    }
+}
+
+/// Write `.vectorhawk/.gitignore` with a `skills/` entry if it doesn't exist.
+fn ensure_gitignore(vh_dir: &Utf8Path) -> Result<()> {
+    let gitignore_path = vh_dir.join(".gitignore");
+    if !gitignore_path.exists() {
+        fs::write(gitignore_path.as_std_path(), "skills/\n")
+            .with_context(|| format!("failed to write .gitignore at {gitignore_path}"))?;
+    }
+    Ok(())
 }
 
 mod copy_dir_all {
@@ -630,5 +801,173 @@ mod tests {
         assert!(!changed, "should return false for non-existent skill");
 
         let _ = fs::remove_dir_all(&state.root_dir);
+    }
+
+    // ── install_project_skill tests ───────────────────────────────────────────
+
+    fn load_example_package() -> SkillPackage {
+        SkillPackage::load_from_dir(
+            Utf8PathBuf::from("../..").join("examples/skills/contract-compare"),
+        )
+        .expect("example skill should load")
+    }
+
+    #[test]
+    fn install_project_skill_creates_bundle_and_lockfile() {
+        let project_root = temp_root("proj-install-basic");
+        let skill = load_example_package();
+        let skill_id = skill.manifest.id.clone();
+
+        install_project_skill(&project_root, &skill, None, None)
+            .expect("project install should succeed");
+
+        // Bundle must be present under .vectorhawk/skills/{id}/
+        // The example skill uses SKILL.md as its root file.
+        let skill_dir = project_root.join(".vectorhawk/skills").join(&skill_id);
+        assert!(
+            skill_dir.join("SKILL.md").exists() || skill_dir.join("manifest.json").exists(),
+            "skill bundle root file should be in the project cache (SKILL.md or manifest.json)"
+        );
+
+        // Lockfile must exist.
+        let lockfile_path = project_root.join(".vectorhawk/skills.lock.json");
+        assert!(lockfile_path.exists(), "lockfile must be created");
+        let lf = Lockfile::load(&lockfile_path).expect("lockfile must be valid");
+        assert!(
+            lf.skills.contains_key(&skill_id),
+            "lockfile must contain the installed skill"
+        );
+
+        // .gitignore must exist with skills/ entry.
+        let gitignore_path = project_root.join(".vectorhawk/.gitignore");
+        assert!(gitignore_path.exists(), ".gitignore must be created");
+        let contents =
+            fs::read_to_string(gitignore_path.as_std_path()).expect("read .gitignore");
+        assert!(
+            contents.contains("skills/"),
+            ".gitignore must contain skills/ entry"
+        );
+
+        let _ = fs::remove_dir_all(project_root.as_std_path());
+    }
+
+    #[test]
+    fn install_project_skill_upserts_lockfile() {
+        let project_root = temp_root("proj-install-upsert");
+
+        // Install first skill (contract-compare).
+        let skill_a = load_example_package();
+        let id_a = skill_a.manifest.id.clone();
+        install_project_skill(&project_root, &skill_a, None, None)
+            .expect("first project install should succeed");
+
+        // Build a second minimal SkillPackage by pointing at the same bundle
+        // but under a different id — we do this by cloning and patching.
+        // For this test we load the same package a second time; the lockfile
+        // upsert test just needs two keys so we install the same skill twice
+        // with different registry_url values to distinguish them.
+        //
+        // Actually: install skill_a again with registry_url to change the entry,
+        // then verify the lockfile has exactly one key (upserted, not duplicated).
+        install_project_skill(
+            &project_root,
+            &skill_a,
+            Some("https://app.vectorhawk.ai"),
+            Some("sha256-abc"),
+        )
+        .expect("second project install should succeed");
+
+        let lockfile_path = project_root.join(".vectorhawk/skills.lock.json");
+        let lf = Lockfile::load(&lockfile_path).expect("lockfile must load");
+        assert_eq!(
+            lf.skills.len(),
+            1,
+            "upsert should leave exactly one entry, not duplicate"
+        );
+        // The entry must now be a Registry entry (the second install).
+        match lf.skills.get(&id_a) {
+            Some(LockedSkill::Registry { registry_url, .. }) => {
+                assert_eq!(registry_url, "https://app.vectorhawk.ai");
+            }
+            other => panic!("expected Registry entry, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(project_root.as_std_path());
+    }
+
+    #[test]
+    fn install_project_skill_registry_entry() {
+        let project_root = temp_root("proj-install-registry");
+        let skill = load_example_package();
+        let skill_id = skill.manifest.id.clone();
+
+        install_project_skill(
+            &project_root,
+            &skill,
+            Some("https://app.vectorhawk.ai"),
+            // Caller-supplied integrity is ignored; the fresh hash is computed
+            // from what was actually written to disk.
+            Some("sha256-deadbeef"),
+        )
+        .expect("registry project install should succeed");
+
+        let lockfile_path = project_root.join(".vectorhawk/skills.lock.json");
+        let lf = Lockfile::load(&lockfile_path).expect("lockfile must load");
+        match lf.skills.get(&skill_id) {
+            Some(LockedSkill::Registry {
+                version,
+                registry_url,
+                integrity,
+            }) => {
+                assert_eq!(version, &skill.manifest.version.to_string());
+                assert_eq!(registry_url, "https://app.vectorhawk.ai");
+                // Integrity is computed from the files on disk, not the
+                // caller-supplied value. Verify it is a valid sha256 string
+                // and matches the actual installed directory.
+                assert!(
+                    integrity.starts_with("sha256-"),
+                    "integrity should start with 'sha256-': {integrity}"
+                );
+                let cache_dir = project_root
+                    .join(".vectorhawk")
+                    .join("skills")
+                    .join(&skill_id);
+                let matches = crate::lockfile::verify_integrity(&cache_dir, integrity)
+                    .expect("verify_integrity should not error");
+                assert!(
+                    matches,
+                    "recorded integrity should verify against the installed cache"
+                );
+            }
+            other => panic!("expected Registry variant, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(project_root.as_std_path());
+    }
+
+    #[test]
+    fn install_project_skill_local_entry() {
+        let project_root = temp_root("proj-install-local");
+        let skill = load_example_package();
+        let skill_id = skill.manifest.id.clone();
+
+        install_project_skill(&project_root, &skill, None, None)
+            .expect("local project install should succeed");
+
+        let lockfile_path = project_root.join(".vectorhawk/skills.lock.json");
+        let lf = Lockfile::load(&lockfile_path).expect("lockfile must load");
+        match lf.skills.get(&skill_id) {
+            Some(LockedSkill::Local { local_path }) => {
+                // Must be a relative or absolute path pointing at the skill source.
+                // At minimum it should not be empty.
+                assert!(
+                    !local_path.is_empty(),
+                    "local_path must not be empty"
+                );
+            }
+            other => panic!("expected Local variant, got {other:?}"),
+        }
+
+        let _ = fs::remove_dir_all(project_root.as_std_path());
     }
 }

@@ -64,6 +64,22 @@ pub fn run_skill(
     model_client: Option<&dyn ModelClient>,
     registry_client: Option<&RegistryClient>,
 ) -> Result<RunResult> {
+    run_skill_with_scope(state, policy_client, skill_id, input, model_client, registry_client, None)
+}
+
+/// Like `run_skill` but accepts an optional project root for scope-aware resolution.
+///
+/// When `project_root` is `Some`, the resolver checks the project cache first,
+/// allowing a project-scoped install to shadow a user-scoped one of the same ID.
+pub fn run_skill_with_scope(
+    state: &AppState,
+    policy_client: &dyn PolicyClient,
+    skill_id: &str,
+    input: &serde_json::Value,
+    model_client: Option<&dyn ModelClient>,
+    registry_client: Option<&RegistryClient>,
+    project_root: Option<&camino::Utf8Path>,
+) -> Result<RunResult> {
     let wall_start = std::time::Instant::now();
 
     // 0. Silent auto-update if registry is available and version is stale.
@@ -75,8 +91,8 @@ pub fn run_skill(
     #[cfg(not(feature = "registry"))]
     let _ = registry_client;
 
-    // 1. Resolve → get version and install path.
-    let outcome = resolve_skill(state, policy_client, skill_id)?;
+    // 1. Resolve → get version and install path (project scope shadows user scope).
+    let outcome = resolve_skill(state, policy_client, skill_id, project_root)?;
     let (version, install_path) = match outcome {
         ResolveOutcome::Active {
             version,
