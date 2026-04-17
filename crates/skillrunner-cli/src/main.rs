@@ -223,8 +223,9 @@ enum SkillCommands {
     },
     /// Install a skill from a local path or from the registry by ID
     Install {
-        /// Skill ID (for registry install) or local path to a skill directory
-        skill_ref: String,
+        /// Skill ID (for registry install) or local path to a skill directory.
+        /// Omit to interactively pick from installed skills or search the registry.
+        skill_ref: Option<String>,
         /// Specific version to install from registry (default: latest)
         #[arg(long)]
         version: Option<String>,
@@ -1286,6 +1287,97 @@ fn main() -> Result<()> {
                 clients: clients_filter,
                 yes,
             } => {
+                let skill_ref = match skill_ref {
+                    Some(r) => r,
+                    None => {
+                        if !ui::is_tty() {
+                            anyhow::bail!(
+                                "No skill specified. Usage: skillrunner skill install <SKILL_REF>\n\n\
+                                 SKILL_REF can be:\n  \
+                                 - A local path:    ./my-skill or /path/to/skill\n  \
+                                 - A registry ID:   contract-compare\n  \
+                                 - ID with version: contract-compare@0.3.0\n\n\
+                                 Run `skillrunner skill list` to see installed skills.\n\
+                                 Run `skillrunner skill search <query>` to find skills in the registry."
+                            );
+                        }
+                        // Interactive picker: show installed skills + option to search registry
+                        let conn = Connection::open(&app.state.db_path)?;
+                        let mut stmt = conn.prepare(
+                            "SELECT skill_id, active_version FROM installed_skills ORDER BY skill_id",
+                        )?;
+                        let rows: Vec<(String, String)> = stmt
+                            .query_map([], |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                            })?
+                            .filter_map(|r| r.ok())
+                            .collect();
+
+                        let mut items: Vec<String> = rows
+                            .iter()
+                            .map(|(id, ver)| format!("{id}@{ver} (reinstall)"))
+                            .collect();
+                        items.push("Search the registry...".to_string());
+                        items.push("Enter a path or skill ID...".to_string());
+
+                        let selection = dialoguer::Select::with_theme(&ui::theme())
+                            .with_prompt("Select a skill to install")
+                            .items(&items)
+                            .default(0)
+                            .interact()?;
+
+                        if selection < rows.len() {
+                            // Reinstall selected skill
+                            rows[selection].0.clone()
+                        } else if selection == rows.len() {
+                            // Search the registry
+                            let query: String = dialoguer::Input::with_theme(&ui::theme())
+                                .with_prompt("Search query")
+                                .interact_text()?;
+
+                            if let Some(url) = resolve_registry_url(
+                                registry_url.clone(),
+                                managed_registry_url.as_deref(),
+                            ) {
+                                let reg = RegistryClient::new(&url);
+                                let sp = ui::spinner(&format!("Searching for '{query}'..."));
+                                let results = reg.search_skills(&query);
+                                sp.finish_and_clear();
+                                let results = results?;
+                                if results.is_empty() {
+                                    anyhow::bail!("No skills found matching '{query}'.");
+                                }
+                                let result_items: Vec<String> = results
+                                    .iter()
+                                    .map(|r| {
+                                        format!(
+                                            "{} — {} ({})",
+                                            r.skill_id,
+                                            r.name,
+                                            r.latest_version.as_deref().unwrap_or("?")
+                                        )
+                                    })
+                                    .collect();
+                                let pick = dialoguer::Select::with_theme(&ui::theme())
+                                    .with_prompt("Select a skill")
+                                    .items(&result_items)
+                                    .default(0)
+                                    .interact()?;
+                                results[pick].skill_id.clone()
+                            } else {
+                                anyhow::bail!(
+                                    "No registry URL configured. Use --registry-url or set VECTORHAWK_REGISTRY_URL."
+                                );
+                            }
+                        } else {
+                            // Manual input
+                            dialoguer::Input::with_theme(&ui::theme())
+                                .with_prompt("Skill ID or path")
+                                .interact_text()?
+                        }
+                    }
+                };
+
                 // Heuristic: if skill_ref looks like a path, install from local dir.
                 let is_local = skill_ref.contains('/')
                     || skill_ref.starts_with('.')
