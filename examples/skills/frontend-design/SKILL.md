@@ -2,6 +2,47 @@
 name: frontend-design
 description: Create distinctive, production-grade frontend interfaces with high design quality. Use this skill when the user asks to build web components, pages, or applications. Generates creative, polished code that avoids generic AI aesthetics.
 license: Complete terms in LICENSE.txt
+vh_version: 0.1.0
+vh_publisher: skillclub
+vh_permissions:
+  clipboard: false
+  filesystem: none
+  network: none
+vh_execution:
+  memory_mb: 512
+  sandbox_profile: strict
+  timeout_seconds: 120
+vh_schemas:
+  inputs:
+    $schema: http://json-schema.org/draft-07/schema#
+    additionalProperties: false
+    properties:
+      requirements:
+        description: Description of the frontend component, page, or application to build.
+        type: string
+    required:
+    - requirements
+    type: object
+  outputs:
+    $schema: http://json-schema.org/draft-07/schema#
+    additionalProperties: false
+    properties:
+      code:
+        description: Generated frontend code.
+        type: string
+      notes:
+        description: Optional design rationale or implementation notes.
+        type: string
+    required:
+    - code
+    type: object
+vh_workflow:
+- id: generate
+  type: llm
+  prompt: prompts/system.txt
+  inputs:
+    requirements: input.requirements
+  output_schema: schemas/output.schema.json
 ---
 
 This skill guides creation of distinctive, production-grade frontend interfaces that avoid generic "AI slop" aesthetics. Implement real working code with exceptional attention to aesthetic details and creative choices.

@@ -1,11 +1,53 @@
 ---
 name: Security Scan
 description: Scan code for security vulnerabilities, compliance issues, and secrets exposure. Enforces organizational security policies.
-triggers:
-  - scan for vulnerabilities
-  - security audit
-  - check for secrets
-  - compliance check
+license: MIT
+vh_version: 0.1.0
+vh_publisher: skillclub
+vh_permissions:
+  clipboard: false
+  filesystem: none
+  network: none
+vh_execution:
+  memory_mb: 512
+  sandbox_profile: strict
+  timeout_seconds: 120
+vh_schemas:
+  inputs:
+    $schema: http://json-schema.org/draft-07/schema#
+    additionalProperties: false
+    properties:
+      requirements:
+        description: Description of the frontend component, page, or application to build.
+        type: string
+    required:
+    - requirements
+    type: object
+  outputs:
+    $schema: http://json-schema.org/draft-07/schema#
+    additionalProperties: false
+    properties:
+      code:
+        description: Generated frontend code.
+        type: string
+      notes:
+        description: Optional design rationale or implementation notes.
+        type: string
+    required:
+    - code
+    type: object
+vh_workflow:
+- id: generate
+  type: llm
+  prompt: prompts/system.txt
+  inputs:
+    requirements: input.requirements
+  output_schema: schemas/output.schema.json
+vh_triggers:
+- scan for vulnerabilities
+- security audit
+- check for secrets
+- compliance check
 ---
 
 You are an application security engineer. The user provides code or configuration to scan. Perform a thorough security assessment:

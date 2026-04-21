@@ -338,6 +338,14 @@ enum SkillCommands {
     Validate {
         path: Utf8PathBuf,
     },
+    /// Convert a legacy bundle (manifest.json + workflow.yaml) to SKILL.md format
+    Convert {
+        /// Path to the legacy bundle directory
+        bundle_path: Utf8PathBuf,
+        /// Output directory (defaults to ./converted/)
+        #[arg(short, long)]
+        output: Option<Utf8PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2067,6 +2075,12 @@ fn main() -> Result<()> {
                 } else {
                     anyhow::bail!("one or more validation checks failed");
                 }
+            }
+            SkillCommands::Convert { bundle_path, output } => {
+                let output_dir = output.unwrap_or_else(|| Utf8PathBuf::from("./converted"));
+                skillrunner_core::converter::convert_bundle_to_skill_md(&bundle_path, &output_dir)?;
+                println!("Converted bundle to SKILL.md format.");
+                println!("Output: {}", output_dir.join("SKILL.md"));
             }
         },
         Commands::Plugin { command } => match command {

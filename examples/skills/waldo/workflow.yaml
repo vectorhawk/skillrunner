@@ -1,8 +1,0 @@
-name: waldo
-steps:
-  - id: generate
-    type: llm
-    prompt: prompts/system.txt
-    inputs:
-      requirements: input.requirements
-    output_schema: schemas/output.schema.json
