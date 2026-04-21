@@ -652,6 +652,12 @@ fn main() -> Result<()> {
             } => {
                 let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
 
+                if !ui::is_tty() && (email.is_none() || password.is_none()) {
+                    anyhow::bail!(
+                        "non-interactive environment detected; provide --email and --password flags"
+                    );
+                }
+
                 let email = match email {
                     Some(e) => e,
                     None => {

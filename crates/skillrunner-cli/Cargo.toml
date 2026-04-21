@@ -24,7 +24,6 @@ rpassword.workspace = true
 dialoguer.workspace = true
 console.workspace = true
 indicatif.workspace = true
-atty.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

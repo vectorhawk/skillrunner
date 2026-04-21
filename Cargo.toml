@@ -38,7 +38,6 @@ rpassword = "5"
 dialoguer = { version = "0.11", features = ["fuzzy-select"] }
 console = "0.15"
 indicatif = "0.17"
-atty = "0.2"
 insta = "1"
 
 [profile.release]

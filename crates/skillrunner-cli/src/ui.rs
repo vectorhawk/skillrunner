@@ -16,6 +16,7 @@ use console::style;
 use dialoguer::{theme::ColorfulTheme, Confirm};
 use indicatif::{ProgressBar, ProgressStyle};
 use skillrunner_core::registry::PreinstallGovernance;
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Set to `true` by `main()` when running as `mcp serve`.
@@ -32,7 +33,7 @@ pub fn set_mcp_serve(val: bool) {
 /// - stdout is not a TTY (piped, redirected, etc.)
 /// - the process is running as `mcp serve` (stdio JSON-RPC transport)
 pub fn is_tty() -> bool {
-    !IS_MCP_SERVE.load(Ordering::Relaxed) && atty::is(atty::Stream::Stdout)
+    !IS_MCP_SERVE.load(Ordering::Relaxed) && std::io::stdout().is_terminal()
 }
 
 /// Returns the shared `ColorfulTheme` used for all `dialoguer` prompts.
