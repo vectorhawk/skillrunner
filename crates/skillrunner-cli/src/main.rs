@@ -673,7 +673,13 @@ fn main() -> Result<()> {
             } => {
                 let url = require_registry_url(registry_url, managed_registry_url.as_deref())?;
 
-                if !ui::is_tty() && (email.is_none() || password.is_none()) {
+                // Guard against hangs in non-interactive environments (ssh
+                // without -t, container runs, CI). We require BOTH stdin and
+                // stdout to be TTYs before prompting — otherwise read_line
+                // blocks forever waiting on an empty pipe, or succeeds with
+                // empty input and produces a confusing "invalid credentials"
+                // error later.
+                if !ui::is_interactive() && (email.is_none() || password.is_none()) {
                     anyhow::bail!(
                         "non-interactive environment detected; provide --email and --password flags"
                     );
@@ -2822,9 +2828,10 @@ fn run_migration_step(
     let should_migrate = if migrate_all {
         // Non-interactive path: always migrate.
         true
-    } else if auto {
-        // --auto without --migrate-all: skip migration to avoid surprises in
-        // non-interactive environments where we can't read stdin safely.
+    } else if auto || !ui::is_interactive() {
+        // --auto without --migrate-all, OR stdin/stdout isn't a TTY: skip
+        // migration to avoid hanging on read_line in non-interactive
+        // environments (ssh without -t, containers, CI).
         false
     } else {
         // Interactive path: prompt the user.

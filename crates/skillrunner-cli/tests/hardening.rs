@@ -210,6 +210,35 @@ fn install_local_yes_no_fanout_does_not_hang_in_non_tty() {
     );
 }
 
+#[test]
+fn auth_login_bails_in_non_tty_without_credential_flags() {
+    // Without --email/--password flags AND piped stdin, `auth login` must
+    // bail with a clear error instead of hanging on read_line. Followup #12.
+    let tmp = TempDir::new().unwrap();
+    let skillhome = tmp.path().join("skillhome");
+
+    let out = Command::new(skillrunner_bin())
+        .args([
+            "auth",
+            "login",
+            "--registry-url",
+            "http://127.0.0.1:65530",
+        ])
+        .env("SKILLCLUB_HOME", skillhome.to_str().unwrap())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to launch skillrunner");
+
+    assert!(!out.status.success(), "expected non-zero exit");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("non-interactive"),
+        "expected non-interactive error message, got: {stderr}"
+    );
+}
+
 // ── (b) mcp serve stdio purity ────────────────────────────────────────────────
 
 /// Start `mcp serve`, send an `initialize` JSON-RPC request on stdin, read the

@@ -36,6 +36,15 @@ pub fn is_tty() -> bool {
     !IS_MCP_SERVE.load(Ordering::Relaxed) && std::io::stdout().is_terminal()
 }
 
+/// Returns `true` only when BOTH stdout and stdin are TTYs (and we're not in
+/// `mcp serve` mode). Use this to gate interactive prompts that `read_line`
+/// or `read_password` from stdin — otherwise a piped/redirected stdin will
+/// hang waiting for EOF, or succeed with empty input and produce a confusing
+/// "invalid credentials" error downstream.
+pub fn is_interactive() -> bool {
+    is_tty() && std::io::stdin().is_terminal()
+}
+
 /// Returns the shared `ColorfulTheme` used for all `dialoguer` prompts.
 pub fn theme() -> ColorfulTheme {
     ColorfulTheme::default()
