@@ -21,6 +21,8 @@ pub mod recommend;
 #[cfg(feature = "registry")]
 pub mod registry;
 pub mod resolver;
+#[cfg(feature = "registry")]
+pub mod scan;
 pub mod state;
 #[cfg(feature = "registry")]
 pub mod updater;

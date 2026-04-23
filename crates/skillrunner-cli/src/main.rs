@@ -14,6 +14,7 @@ use skillrunner_core::{
     ollama::{resolve_model, OllamaClient},
     policy::MockPolicyClient,
     registry::{HttpPolicyClient, RegistryClient},
+    scan::{self, HttpScanClient, ScanClient},
     resolver::{resolve_skill, ResolveOutcome},
     restore::restore_project_skills,
     updater::{
@@ -212,6 +213,9 @@ enum SkillCommands {
         /// Non-interactive: skip all confirms (treat as Yes)
         #[arg(long)]
         yes: bool,
+        /// Skip scan verdict confirmation for risky imports
+        #[arg(long)]
+        confirm_risky: bool,
     },
     /// Create a new skill with smart metadata recommendations
     Author {
@@ -291,6 +295,9 @@ enum SkillCommands {
         /// Cannot be combined with --user or --link.
         #[arg(long, value_name = "PATH", conflicts_with = "user", conflicts_with = "link")]
         project: Option<Option<String>>,
+        /// Skip scan verdict confirmation for risky installs
+        #[arg(long)]
+        confirm_risky: bool,
     },
     /// Publish a skill to the registry
     Publish {
@@ -594,6 +601,12 @@ fn main() -> Result<()> {
                             }
                         }
                         _ => println!("Auth:             not logged in"),
+                    }
+                    // Scan endpoint reachability
+                    if scan::check_scan_reachability(&url) {
+                        println!("Scan endpoint:    reachable");
+                    } else {
+                        println!("Scan endpoint:    unreachable");
                     }
                 }
                 None => {
@@ -1033,6 +1046,7 @@ fn main() -> Result<()> {
                 accept_suggestions,
                 skip_metadata,
                 yes,
+                confirm_risky,
             } => {
                 // Resolve the raw input string: `-` means read from stdin.
                 let raw_input = if input == "-" {
@@ -1061,6 +1075,48 @@ fn main() -> Result<()> {
                     println!("Output:         {}", bundle.output_dir);
                     for f in &bundle.files {
                         println!("  wrote {f}");
+                    }
+
+                    // ── Scan verdict check ──────────────────────────────
+                    {
+                        let content_bytes = std::fs::read(raw_input.trim()).unwrap_or_default();
+                        let hash = scan::content_hash(&content_bytes);
+                        let effective_url = resolve_registry_url(
+                            registry_url.clone(),
+                            managed_registry_url.as_deref(),
+                        );
+                        if let Some(url) = effective_url {
+                            let mut scan_client = HttpScanClient::new(&url);
+                            if let Ok(Some(tokens)) = auth::load_tokens(&app.state, &url) {
+                                scan_client = scan_client.with_auth(tokens.access_token);
+                            }
+                            match scan_client.check_verdict(&hash) {
+                                Ok(Some(verdict)) if scan::is_risky(&verdict) => {
+                                    ui::scan_warning(&verdict);
+                                    if scan::requires_confirmation(&verdict)
+                                        && !ui::confirm_risky_scan(&verdict, confirm_risky)
+                                    {
+                                        anyhow::bail!(
+                                            "Import aborted due to scan verdict: {}. \
+                                             Pass --confirm-risky to override.",
+                                            verdict.verdict
+                                        );
+                                    }
+                                }
+                                Ok(Some(verdict)) => {
+                                    // low/info/clean — no action needed, but show for info
+                                    if verdict.verdict != "clean" {
+                                        ui::scan_warning(&verdict);
+                                    }
+                                }
+                                Ok(None) => {
+                                    ui::scan_unknown_warning();
+                                }
+                                Err(_) => {
+                                    ui::scan_unknown_warning();
+                                }
+                            }
+                        }
                     }
 
                     if !skip_metadata {
@@ -1394,6 +1450,7 @@ fn main() -> Result<()> {
                 yes,
                 user: scope_user,
                 project: scope_project,
+                confirm_risky,
             } => {
                 let skill_ref = match skill_ref {
                     Some(r) => r,
@@ -1674,6 +1731,40 @@ fn main() -> Result<()> {
                             if dry_run {
                                 println!("dry-run: governance unavailable, no install performed.");
                                 return Ok(());
+                            }
+                        }
+                    }
+
+                    // ── Scan verdict check for registry install ─────────
+                    {
+                        let scan_hash = scan::content_hash(skill_id.as_bytes());
+                        let mut scan_client = HttpScanClient::new(&url);
+                        if let Ok(Some(tokens)) = auth::load_tokens(&app.state, &url) {
+                            scan_client = scan_client.with_auth(tokens.access_token);
+                        }
+                        match scan_client.check_verdict(&scan_hash) {
+                            Ok(Some(verdict)) if scan::is_risky(&verdict) => {
+                                ui::scan_warning(&verdict);
+                                if scan::requires_confirmation(&verdict)
+                                    && !ui::confirm_risky_scan(&verdict, confirm_risky)
+                                {
+                                    anyhow::bail!(
+                                        "Install aborted due to scan verdict: {}. \
+                                         Pass --confirm-risky to override.",
+                                        verdict.verdict
+                                    );
+                                }
+                            }
+                            Ok(Some(verdict)) => {
+                                if verdict.verdict != "clean" {
+                                    ui::scan_warning(&verdict);
+                                }
+                            }
+                            Ok(None) => {
+                                ui::scan_unknown_warning();
+                            }
+                            Err(_) => {
+                                ui::scan_unknown_warning();
                             }
                         }
                     }

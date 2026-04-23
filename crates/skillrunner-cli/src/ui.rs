@@ -350,6 +350,113 @@ pub fn governance_panel_tty(gov: &PreinstallGovernance) {
     println!();
 }
 
+// ─── Scan verdict warning ─────────────────────────────────────────────────────
+
+/// Renders a scan verdict warning to stderr.
+///
+/// Severity coloring:
+/// - critical / high → red
+/// - medium → yellow
+/// - low / info → dim
+/// - unknown → yellow (amber)
+///
+/// Individual findings are listed below the summary line.
+pub fn scan_warning(verdict: &skillrunner_core::scan::ScanVerdict) {
+    if !is_tty() {
+        // Plain-text fallback for non-TTY.
+        eprintln!(
+            "  Scan verdict: {} — {} finding(s)",
+            verdict.verdict.to_uppercase(),
+            verdict.findings.len()
+        );
+        for f in &verdict.findings {
+            eprintln!("    [{}/{}] {}", f.severity, f.rule_id, f.message);
+            if let Some(loc) = &f.location {
+                eprintln!("      at {loc}");
+            }
+        }
+        return;
+    }
+
+    let severity_styled = match verdict.verdict.as_str() {
+        "critical" | "high" => style(format!("\u{26a0} Scan verdict: {}", verdict.verdict.to_uppercase()))
+            .red()
+            .bold()
+            .to_string(),
+        "medium" => style(format!("\u{26a0} Scan verdict: {}", verdict.verdict.to_uppercase()))
+            .yellow()
+            .bold()
+            .to_string(),
+        "low" | "info" => style(format!("Scan verdict: {}", verdict.verdict.to_uppercase()))
+            .dim()
+            .to_string(),
+        _ => style(format!("\u{26a0} Scan verdict: {}", verdict.verdict.to_uppercase()))
+            .yellow()
+            .to_string(),
+    };
+
+    eprintln!(
+        "  {} — {} finding(s)",
+        severity_styled,
+        verdict.findings.len()
+    );
+
+    for f in &verdict.findings {
+        let sev_color = match f.severity.as_str() {
+            "critical" | "high" => style(&f.severity).red().to_string(),
+            "medium" => style(&f.severity).yellow().to_string(),
+            _ => style(&f.severity).dim().to_string(),
+        };
+        eprintln!(
+            "    [{}/{}] {}",
+            sev_color, f.rule_id, f.message
+        );
+        if let Some(loc) = &f.location {
+            eprintln!("      at {}", style(loc).dim());
+        }
+    }
+    eprintln!();
+}
+
+/// Renders the "scan verdict unknown" amber warning for unreachable/missing verdicts.
+pub fn scan_unknown_warning() {
+    if is_tty() {
+        eprintln!(
+            "  {}",
+            style("\u{26a0} Scan verdict unknown \u{2014} proceed at your own risk").yellow()
+        );
+    } else {
+        eprintln!("  Scan verdict unknown — proceed at your own risk");
+    }
+    eprintln!();
+}
+
+/// Prompts for confirmation when a risky scan verdict is detected.
+///
+/// Returns `true` if the user confirms or if running in non-TTY mode (fail-open).
+/// When `confirm_risky` is `true`, the prompt is skipped (flag overrides).
+pub fn confirm_risky_scan(verdict: &skillrunner_core::scan::ScanVerdict, confirm_risky: bool) -> bool {
+    if confirm_risky {
+        return true;
+    }
+    if !is_tty() {
+        // Non-TTY without --confirm-risky: refuse.
+        eprintln!(
+            "Risky scan verdict ({}) detected. Pass --confirm-risky to proceed in non-interactive mode.",
+            verdict.verdict
+        );
+        return false;
+    }
+    Confirm::with_theme(&theme())
+        .with_prompt(format!(
+            "Scan verdict is {} — proceed anyway?",
+            verdict.verdict.to_uppercase()
+        ))
+        .default(false)
+        .interact()
+        .unwrap_or(false)
+}
+
 // ─── Internal helpers exposed for testing ─────────────────────────────────────
 
 /// Pure-string version of [`summary_box`] used by snapshot tests.

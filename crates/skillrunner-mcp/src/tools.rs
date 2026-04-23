@@ -12,6 +12,7 @@ use skillrunner_core::{
     model::{ModelClient, ModelSource},
     policy::PolicyClient,
     registry::RegistryClient,
+    scan::{self, HttpScanClient, ScanClient},
     state::AppState,
     updater::{
         check_for_update, install_from_registry, install_plugin_from_registry, package_plugin,
@@ -1899,10 +1900,40 @@ fn handle_import(
 
     let preview_text = format_import_preview(&preview);
 
+    // ── Scan verdict check ──────────────────────────────────────────
+    let scan_text = {
+        let content_hash = scan::content_hash(input.as_bytes());
+        let mut scan_client = HttpScanClient::new(url);
+        if let Ok(Some(tokens)) = auth::load_tokens(state, url) {
+            scan_client = scan_client.with_auth(tokens.access_token);
+        }
+        match scan_client.check_verdict(&content_hash) {
+            Ok(Some(verdict)) => {
+                let mut text = format!(
+                    "\n\nScan verdict: {} ({} finding(s))",
+                    verdict.verdict.to_uppercase(),
+                    verdict.findings.len()
+                );
+                for f in &verdict.findings {
+                    text.push_str(&format!("\n  [{}/{}] {}", f.severity, f.rule_id, f.message));
+                }
+                if scan::is_risky(&verdict) {
+                    text.push_str(&format!(
+                        "\n\nWARNING: scan verdict is {} — review findings before proceeding.",
+                        verdict.verdict.to_uppercase()
+                    ));
+                }
+                text
+            }
+            Ok(None) => "\n\nScan verdict: unknown (no verdict on file)".to_string(),
+            Err(_) => "\n\nScan verdict: unknown (scan endpoint unreachable)".to_string(),
+        }
+    };
+
     if !confirm {
         return ToolCallResult::success(format!(
-            "{}\n\nSet confirm=true to submit this import.",
-            preview_text
+            "{}{}\n\nSet confirm=true to submit this import.",
+            preview_text, scan_text
         ));
     }
 
@@ -1915,7 +1946,7 @@ fn handle_import(
     match registry.import_submit(input, &submit_token) {
         Ok(result) => {
             let result_text = format_import_result(&result);
-            ToolCallResult::success(result_text)
+            ToolCallResult::success(format!("{}{}", result_text, scan_text))
         }
         Err(e) => {
             let err_str = e.to_string();
