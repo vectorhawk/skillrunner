@@ -63,6 +63,18 @@ struct ServerState {
     /// The cache is shared via Arc so `dispatch_request` can hand a
     /// reference to `handle_tool_call` without passing `ServerState` itself.
     update_check_cache: UpdateCheckCache,
+    /// When the previous skill execution appended a rating prompt, this holds
+    /// the skill+version so the next tool call can auto-capture a "thumbs up"
+    /// or "thumbs down" reply from the arguments.  Cleared on every request.
+    pending_rating_prompt: Option<PendingRating>,
+}
+
+/// Tracks which skill a rating prompt was shown for so the next tool call
+/// can capture the user's reply.
+#[derive(Debug, Clone)]
+struct PendingRating {
+    skill_id: String,
+    version: String,
 }
 
 impl ServerState {
@@ -79,6 +91,7 @@ impl ServerState {
             last_unmanaged_scan: None,
             machine_id: crate::setup::get_machine_id(),
             update_check_cache: Arc::new(Mutex::new(HashMap::new())),
+            pending_rating_prompt: None,
         }
     }
 
@@ -473,6 +486,35 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
             (false, false)
         };
 
+        // Auto-capture rating reply: if the previous execution appended a
+        // rating prompt, check this tool call's arguments for "thumbs up" or
+        // "thumbs down" (case-insensitive).  Always clear pending state afterward.
+        if request.method == "tools/call" {
+            if let Some(pending) = server_state.pending_rating_prompt.take() {
+                if let Ok(params) =
+                    serde_json::from_value::<ToolCallParams>(request.params.clone())
+                {
+                    let rating_signal = detect_rating_signal(&params.arguments);
+                    if let Some(rating) = rating_signal {
+                        if let Ok(conn) = rusqlite::Connection::open(&state.db_path) {
+                            let _ = skillrunner_core::ratings::record_rating(
+                                &conn,
+                                &pending.skill_id,
+                                &pending.version,
+                                rating,
+                            );
+                            info!(
+                                skill_id = %pending.skill_id,
+                                version = %pending.version,
+                                rating,
+                                "auto-captured rating from tool call arguments"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // Dispatch the request — during tools/call, this may trigger
         // sampling requests through the shared_io (the lock is not held here)
         let response = dispatch_request(
@@ -488,6 +530,7 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
 
         // After a successful skillclub_update, clear the cache entry so the
         // next run no longer shows a stale "update available" prompt.
+        // Also detect if the response includes a rating prompt and set pending state.
         if request.method == "tools/call" {
             if let Ok(params) = serde_json::from_value::<ToolCallParams>(request.params.clone()) {
                 if params.name == "skillclub_update" {
@@ -495,6 +538,33 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
                         params.arguments.get("skill_id").and_then(|v| v.as_str())
                     {
                         server_state.invalidate_update_cache(skill_id);
+                    }
+                }
+
+                // Check if this response includes a rating prompt so we can
+                // auto-capture a thumbs up/down reply on the next tool call.
+                if !params.name.starts_with("skillclub_") {
+                    if let Some(result_val) = &response.result {
+                        if let Some(text) = extract_response_text(result_val) {
+                            if text.contains("Was this skill helpful? Reply 'thumbs up' or 'thumbs down'.") {
+                                // Look up the active version for this skill
+                                if let Ok(conn) = rusqlite::Connection::open(&state.db_path) {
+                                    let version: Option<String> = conn
+                                        .query_row(
+                                            "SELECT active_version FROM installed_skills WHERE skill_id = ?1",
+                                            rusqlite::params![&params.name],
+                                            |row| row.get(0),
+                                        )
+                                        .ok();
+                                    if let Some(ver) = version {
+                                        server_state.pending_rating_prompt = Some(PendingRating {
+                                            skill_id: params.name.clone(),
+                                            version: ver,
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -535,6 +605,51 @@ pub fn run_server(state: AppState, config: McpServerConfig) -> Result<()> {
     info!("MCP server shutting down");
     server_state.aggregator.shutdown();
     Ok(())
+}
+
+/// Detect a rating signal in tool call arguments.
+///
+/// Checks for an explicit `_rating_reply` key or scans all string values
+/// for "thumbs up" / "thumbs down" (case-insensitive).  Returns `"up"` or
+/// `"down"` if found, `None` otherwise.
+fn detect_rating_signal(arguments: &serde_json::Value) -> Option<&'static str> {
+    // 1. Explicit _rating_reply key
+    if let Some(reply) = arguments.get("_rating_reply").and_then(|v| v.as_str()) {
+        let lower = reply.to_lowercase();
+        if lower.contains("thumbs up") || lower.contains("thumbs_up") {
+            return Some("up");
+        }
+        if lower.contains("thumbs down") || lower.contains("thumbs_down") {
+            return Some("down");
+        }
+    }
+
+    // 2. Scan all top-level string values for the signal
+    if let Some(obj) = arguments.as_object() {
+        for value in obj.values() {
+            if let Some(s) = value.as_str() {
+                let lower = s.to_lowercase();
+                if lower.contains("thumbs up") {
+                    return Some("up");
+                }
+                if lower.contains("thumbs down") {
+                    return Some("down");
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Extract the first text content from an MCP tool call result value.
+fn extract_response_text(result: &serde_json::Value) -> Option<&str> {
+    result
+        .get("content")?
+        .as_array()?
+        .first()?
+        .get("text")?
+        .as_str()
 }
 
 /// Emit an audit event for a proxied backend tool call.
@@ -1124,5 +1239,63 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Rating signal detection tests ───────────────────────────────────
+
+    #[test]
+    fn detect_rating_signal_explicit_key_thumbs_up() {
+        let args = serde_json::json!({"_rating_reply": "thumbs up"});
+        assert_eq!(detect_rating_signal(&args), Some("up"));
+    }
+
+    #[test]
+    fn detect_rating_signal_explicit_key_thumbs_down() {
+        let args = serde_json::json!({"_rating_reply": "Thumbs Down"});
+        assert_eq!(detect_rating_signal(&args), Some("down"));
+    }
+
+    #[test]
+    fn detect_rating_signal_in_string_values() {
+        let args = serde_json::json!({"message": "I'd say thumbs up for sure"});
+        assert_eq!(detect_rating_signal(&args), Some("up"));
+    }
+
+    #[test]
+    fn detect_rating_signal_thumbs_down_in_values() {
+        let args = serde_json::json!({"feedback": "Thumbs Down, not great"});
+        assert_eq!(detect_rating_signal(&args), Some("down"));
+    }
+
+    #[test]
+    fn detect_rating_signal_returns_none_when_absent() {
+        let args = serde_json::json!({"input": "hello world"});
+        assert_eq!(detect_rating_signal(&args), None);
+    }
+
+    #[test]
+    fn detect_rating_signal_empty_object() {
+        let args = serde_json::json!({});
+        assert_eq!(detect_rating_signal(&args), None);
+    }
+
+    #[test]
+    fn extract_response_text_finds_first_text_content() {
+        let result = serde_json::json!({
+            "content": [{"type": "text", "text": "Hello world"}]
+        });
+        assert_eq!(extract_response_text(&result), Some("Hello world"));
+    }
+
+    #[test]
+    fn extract_response_text_returns_none_for_empty_content() {
+        let result = serde_json::json!({"content": []});
+        assert_eq!(extract_response_text(&result), None);
+    }
+
+    #[test]
+    fn extract_response_text_returns_none_without_content_key() {
+        let result = serde_json::json!({"data": "foo"});
+        assert_eq!(extract_response_text(&result), None);
     }
 }
